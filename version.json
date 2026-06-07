@@ -6,6 +6,6 @@
   "exe_name": "BV-Template-Smoke-Test.exe",
   "updater_name": "BV-Updater.exe",
   "latest_json_url": "https://raw.githubusercontent.com/ilohlove/BV-Template-Smoke-Test/main/latest.json",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "release_date": "2026-06-07"
 }

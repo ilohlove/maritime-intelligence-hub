@@ -17,6 +17,8 @@ Desktop smoke-test app created from the template to verify GUI startup, logging,
 - Simple CustomTkinter desktop shell.
 - App name and current version display.
 - Check Update action wired to remote raw `latest.json` metadata.
+- Automatic update check shortly after the GUI opens.
+- Update confirmation dialog with version and short changelog summary.
 - Short on-screen log area.
 
 ## GUI Requirements
@@ -25,6 +27,7 @@ Desktop smoke-test app created from the template to verify GUI startup, logging,
 - App name display.
 - Version display.
 - Check Update button.
+- Update confirmation dialog.
 - Short log area.
 
 ## Business Rules

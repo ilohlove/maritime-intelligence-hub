@@ -15,6 +15,8 @@ Desktop smoke-test app created from the Python desktop template. It verifies tha
 - Opens a simple CustomTkinter GUI.
 - Displays app name and current version from `version.json`.
 - Provides a Check Update button using the remote raw `latest.json` URL from `version.json`.
+- Automatically checks for updates after the GUI opens.
+- Shows the new version and a short changelog summary before asking the user to update.
 - Shows short log messages in the UI and writes through the template logger.
 
 ## Run From Source

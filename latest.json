@@ -1,9 +1,9 @@
 {
-  "version": "1.0.2",
+  "version": "1.0.3",
   "release_date": "2026-06-07",
   "download_url": "https://github.com/ilohlove/BV-Template-Smoke-Test/releases/download/v1.0.2/BV-Template-Smoke-Test.exe",
   "changelog": [
-    "Fixed update checks to read remote raw latest.json instead of bundled metadata."
+    "Added automatic update checks, update confirmation, and app download handoff to the updater."
   ],
   "force_update": false
 }

@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.3 - 2026-06-07
+
+- Added automatic update checks shortly after the GUI opens.
+- Added update confirmation with version and short changelog summary.
+- Added app executable download and updater launch flow after user confirmation.
+
 ## v1.0.2 - 2026-06-07
 
 - Fixed update checks to read the remote raw `latest.json` URL from `version.json`.

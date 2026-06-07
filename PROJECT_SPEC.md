@@ -167,6 +167,8 @@ The built app exe must be able to read `version.json` and `latest.json` from bun
 
 The app must check updates against the remote raw `latest.json` URL from `version.json` field `latest_json_url`. It must not decide update availability from the bundled local `latest.json`, because bundled metadata becomes stale after release.
 
+The app must automatically check for updates shortly after the GUI opens. If a newer version is available, show a confirmation dialog with the new version and a short changelog summary before downloading or launching the updater. The manual Check Update action must use the same dialog flow.
+
 If remote `latest.json` has no `download_url`, the app must skip the update, avoid crashing, and write a warning log.
 
 The updater must:

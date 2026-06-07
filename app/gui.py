@@ -1,9 +1,9 @@
 import customtkinter as ctk
 
-from app.config import load_latest, load_version
+from app.config import get_latest_json_url, load_version
 from app.logger import logger
 from app.services.business_logic import run_business_task
-from app.version_checker import is_newer_version
+from app.update_manager import get_update_status
 
 
 class AppGUI:
@@ -75,17 +75,14 @@ class AppGUI:
 
     def _check_update(self):
         current_version = self.metadata.get("version", "0.0.0")
-        latest_data = load_latest()
-        latest_version = latest_data.get("version", "0.0.0")
+        latest_json_url = get_latest_json_url(self.metadata)
 
-        if is_newer_version(current_version, latest_version):
-            if latest_data.get("download_url"):
-                message = f"Update available: {latest_version}"
-            else:
-                message = f"Update {latest_version} has no download URL"
-                logger.warning(message)
+        if not latest_json_url:
+            message = "Update check skipped: latest.json URL is not configured"
+            logger.warning(message)
         else:
-            message = f"Current version {current_version} is up to date"
+            result = get_update_status(current_version, latest_json_url)
+            message = result.get("message", "Update check finished")
 
         self.status_var.set(message)
         logger.info("Update check: %s", message)

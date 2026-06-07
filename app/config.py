@@ -32,3 +32,8 @@ def load_version():
 
 def load_latest():
     return load_json(LATEST_FILE)
+
+
+def get_latest_json_url(metadata=None):
+    data = metadata if metadata is not None else load_version()
+    return data.get("latest_json_url", "")

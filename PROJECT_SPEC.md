@@ -114,6 +114,7 @@ Codex must not:
 - `app_name`
 - `exe_name`
 - `updater_name`
+- `latest_json_url`
 - `version`
 - `release_date`
 
@@ -163,6 +164,8 @@ If `assets/icon.ico` exists, `build.bat` must include it.
 The built app exe must be able to read `version.json` and `latest.json` from bundled resources.
 
 ## Update Rules
+
+The app must check updates against the remote raw `latest.json` URL from `version.json` field `latest_json_url`. It must not decide update availability from the bundled local `latest.json`, because bundled metadata becomes stale after release.
 
 If remote `latest.json` has no `download_url`, the app must skip the update, avoid crashing, and write a warning log.
 

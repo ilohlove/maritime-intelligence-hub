@@ -8,12 +8,13 @@ Desktop smoke-test app created from the Python desktop template. It verifies tha
 - Project slug: Template-Smoke-Test
 - App name: BV-Template-Smoke-Test
 - Exe name: BV-Template-Smoke-Test.exe
+- latest.json URL: https://raw.githubusercontent.com/ilohlove/BV-Template-Smoke-Test/main/latest.json
 
 ## Features
 
 - Opens a simple CustomTkinter GUI.
 - Displays app name and current version from `version.json`.
-- Provides a Check Update button using local `latest.json` metadata.
+- Provides a Check Update button using the remote raw `latest.json` URL from `version.json`.
 - Shows short log messages in the UI and writes through the template logger.
 
 ## Run From Source

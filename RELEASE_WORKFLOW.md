@@ -5,8 +5,9 @@
 1. Review changes with `git status` and `git diff`.
 2. Confirm `version.json`, `latest.json`, and `CHANGELOG.md` versions match.
 3. Confirm `version.json` has no `__PROJECT_NAME__`, `__PROJECT_SLUG__`, or `__RELEASE_DATE__` placeholders.
-4. Confirm `latest.json` has a non-empty `download_url` before publishing it for end users.
-5. Run the security check below.
+4. Confirm `version.json` has a non-empty remote raw `latest_json_url`.
+5. Confirm `latest.json` has a non-empty `download_url` before publishing it for end users.
+6. Run the security check below.
 
 ## Security Check
 
@@ -53,6 +54,7 @@ If any suspicious value is found, stop and report it. Do not push.
 11. Update `latest.json` with the app executable release asset URL.
 12. Commit and push `latest.json`.
 13. Verify the raw `latest.json` URL.
+14. Verify the released app checks the remote raw `latest.json`, not the bundled local file.
 
 ## Update Release
 
@@ -74,6 +76,7 @@ When the user says `Hoan thanh phien ban moi`:
 14. Update `latest.json` with the new release asset URL.
 15. Commit and push `latest.json`.
 16. Verify the raw `latest.json` URL.
+17. Verify the released app checks the remote raw `latest.json`, not the bundled local file.
 
 ## Error Classes
 

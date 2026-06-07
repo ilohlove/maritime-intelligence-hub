@@ -1,0 +1,8 @@
+{
+  "company": "BV",
+  "release_mode": "github_release",
+  "build_tool": "PyInstaller",
+  "gui_framework": "CustomTkinter",
+  "auto_update": true,
+  "upload_updater_to_release": false
+}

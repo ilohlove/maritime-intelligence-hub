@@ -1,0 +1,9 @@
+{
+  "version": "1.0.0",
+  "release_date": "2026-06-07",
+  "download_url": "",
+  "changelog": [
+    "Initial smoke-test desktop app metadata and GUI."
+  ],
+  "force_update": false
+}

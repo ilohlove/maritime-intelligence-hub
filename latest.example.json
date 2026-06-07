@@ -1,0 +1,9 @@
+{
+  "version": "1.0.0",
+  "release_date": "YYYY-MM-DD",
+  "download_url": "",
+  "changelog": [
+    "Initial project version"
+  ],
+  "force_update": false
+}

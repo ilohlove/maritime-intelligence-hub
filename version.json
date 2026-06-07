@@ -1,0 +1,10 @@
+{
+  "company": "BV",
+  "project_name": "Template Smoke Test",
+  "project_slug": "Template-Smoke-Test",
+  "app_name": "BV-Template-Smoke-Test",
+  "exe_name": "BV-Template-Smoke-Test.exe",
+  "updater_name": "BV-Updater.exe",
+  "version": "1.0.0",
+  "release_date": "2026-06-07"
+}

@@ -1,11 +1,11 @@
 {
   "company": "BV",
-  "project_name": "Template Smoke Test",
-  "project_slug": "Template-Smoke-Test",
-  "app_name": "BV-Template-Smoke-Test",
-  "exe_name": "BV-Template-Smoke-Test.exe",
+  "project_name": "Maritime Intelligence Hub",
+  "project_slug": "maritime-intelligence-hub",
+  "app_name": "BV-maritime-intelligence-hub",
+  "exe_name": "BV-maritime-intelligence-hub.exe",
   "updater_name": "BV-Updater.exe",
-  "latest_json_url": "https://raw.githubusercontent.com/ilohlove/BV-Template-Smoke-Test/main/latest.json",
-  "version": "1.0.3",
-  "release_date": "2026-06-07"
+  "latest_json_url": "https://raw.githubusercontent.com/ilohlove/maritime-intelligence-hub/main/latest.json",
+  "version": "1.0.0",
+  "release_date": "2026-06-13"
 }

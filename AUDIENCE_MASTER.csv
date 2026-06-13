@@ -1,0 +1,11 @@
+Audience ID,Audience Name,Primary Need,Brief Relevance,Description,Status
+AUD001,All,Fast maritime awareness,High,Important cross-audience maritime news,Active
+AUD002,Seafarer,Safety career and onboard relevance,High,Deck engine and crew readers needing practical maritime updates,Active
+AUD003,Officer,Operational leadership and compliance,High,Maritime officers responsible for shipboard decisions and compliance,Active
+AUD004,Shipowner,Market compliance and operating impact,High,Shipowners managers chartering and fleet decision makers,Active
+AUD005,Engineer,Technical and machinery relevance,Medium,Marine engineers and technical superintendents,Active
+AUD006,Logistics,Container port and cargo flow relevance,High,Forwarders logistics companies and supply chain operators,Active
+AUD007,Port,Terminal and port operation relevance,Medium,Port authorities terminal operators and port service teams,Active
+AUD008,ImportExport,Trade and customs relevance,Medium,Import export cargo owners and trade operations teams,Active
+AUD009,Business,Commercial and strategic relevance,Medium,Executives analysts investors and business readers,Active
+AUD010,Regulator,Policy safety and compliance relevance,Medium,Authorities associations and compliance stakeholders,Active

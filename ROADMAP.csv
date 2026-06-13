@@ -1,0 +1,8 @@
+Sprint,Phase,Objective,Key Deliverables,Done Criteria,Status
+0,Planning,Normalize planning and rules,Project metadata docs source schema legal policy scoring rules,Docs created and source gaps identified,In Progress
+1,Data Foundation,Import and validate source master,Source importer schema validator logging self-tests,Source master loads and invalid rows are reported,Planned
+2,RSS Collector,Collect RSS-ready P1 sources,RSS fetcher metadata storage URL/title dedup,At least one RSS source fetches repeatably without duplicates,Planned
+3,HTML Collector,Collect approved non-RSS P1 sources,HTML fetcher parser rules retry and error logs,One approved HTML source fetches without breaking full run,Planned
+4,AI Processing,Classify score and summarize selected articles,Category scoring Vietnamese summary impact note token tracking,AI runs only after dedup and threshold checks,Planned
+5,Brief Generator,Generate operational briefs,Morning Brief Evening Brief Markdown JSON output,Briefs include source names URLs and stable format,Planned
+6,Publishing Preparation,Prepare Telegram social and website outputs,Publisher-ready payloads safety checks operational logs,No publisher runs without approved brief output,Planned

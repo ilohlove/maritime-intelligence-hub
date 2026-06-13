@@ -1,0 +1,16 @@
+Category ID,Category Name,Brief Group,Priority Weight,Description,Status
+CAT001,Regulation,Safety and Regulation,10,Maritime regulation policy compliance and authority updates,Active
+CAT002,Safety,Safety and Regulation,10,Safety alerts guidance incidents and operational risk,Active
+CAT003,Accident Investigation,Safety and Regulation,9,Casualty investigation findings reports and safety lessons,Active
+CAT004,Shipping Market,Market and Shipping,8,Freight market vessel supply demand and shipping economics,Active
+CAT005,Shipping News,Market and Shipping,7,General maritime industry news and operating updates,Active
+CAT006,Container,Market and Shipping,8,Container carriers services rates schedules and network changes,Active
+CAT007,Port,Ports and Logistics,8,Port terminal congestion operation infrastructure and notices,Active
+CAT008,Logistics,Ports and Logistics,8,Logistics supply chain forwarding and inland movement,Active
+CAT009,Trade,Ports and Logistics,7,Customs trade import export and policy changes affecting cargo flow,Active
+CAT010,Technical,Technical and Seafarer,7,Ship technical operations equipment maintenance and engineering topics,Active
+CAT011,Engineering,Technical and Seafarer,7,Marine engineering systems machinery and practical engineering knowledge,Active
+CAT012,Merchant Marine,Technical and Seafarer,7,Professional merchant marine and seafarer industry updates,Active
+CAT013,Industry,Market and Shipping,7,Associations industry positions labor and institutional updates,Active
+CAT014,Transport,Ports and Logistics,6,Transport infrastructure and multimodal movement relevant to maritime logistics,Active
+CAT015,Professional Experience,Technical and Seafarer,5,Seafarer experience career lessons and professional practice,Active

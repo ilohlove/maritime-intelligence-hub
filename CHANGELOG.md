@@ -1,22 +1,11 @@
 # Changelog
 
-## v1.0.3 - 2026-06-07
+## v1.0.0 - 2026-06-13
 
-- Added automatic update checks shortly after the GUI opens.
-- Added update confirmation with version and short changelog summary.
-- Added app executable download and updater launch flow after user confirmation.
-
-## v1.0.2 - 2026-06-07
-
-- Fixed update checks to read the remote raw `latest.json` URL from `version.json`.
-- Added clearer update status handling for current, available, invalid, and failed checks.
-- Updated template release rules to prevent bundled `latest.json` from being used as the update source.
-
-## v1.0.1 - 2026-06-07
-
-- Ran the template update-release workflow for smoke testing.
-
-## v1.0.0 - 2026-06-07
-
-- Created Template Smoke Test from the desktop template.
-- Added simple GUI metadata display and update-check action.
+- Initialize Maritime Intelligence Hub as a real project from the desktop app template.
+- Define planning-first scope for source import, crawler pipeline, AI processing, and brief generation.
+- Defer complex GUI work until the core pipeline is validated.
+- Add CLI source validation, P1 fetch planning, readiness brief generation, and source master self-tests.
+- Add SQLite-backed MVP pipeline with RSS live fetch, HTML dry-run, scoring, mock AI summaries, and Markdown/JSON brief outputs.
+- Add approved HTML metadata fetch, configurable AI provider with mock fallback, trend-aware hotness scoring, Google Trends CSV/RSS ingestion, and sectioned hot maritime brief output.
+- Add visual brief cards, Telegram publishing controls, scheduled GUI operation, timezone selection, and bundled Playwright Chromium build support.

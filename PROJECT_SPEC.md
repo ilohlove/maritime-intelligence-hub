@@ -136,6 +136,8 @@ Replace these when creating a real project:
 
 Do not release while placeholders remain.
 
+When creating a real project, also configure `latest_json_url` in `version.json` to the raw GitHub URL for that project's `latest.json`.
+
 ## Build Rules
 
 `build.bat` must use `python` from PATH and must not depend on a hard-coded Python path or the `py` launcher.

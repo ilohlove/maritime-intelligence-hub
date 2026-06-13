@@ -1,9 +1,10 @@
 {
-  "version": "1.0.3",
-  "release_date": "2026-06-07",
-  "download_url": "https://github.com/ilohlove/BV-Template-Smoke-Test/releases/download/v1.0.3/BV-Template-Smoke-Test.exe",
+  "version": "1.0.0",
+  "release_date": "2026-06-13",
+  "download_url": "",
   "changelog": [
-    "Added automatic update checks, update confirmation, and app download handoff to the updater."
+    "Initialize Maritime Intelligence Hub as a real project from the desktop app template.",
+    "Add maritime source validation, RSS/HTML collection, scoring, AI summaries, visual brief cards, Telegram publishing, and scheduled GUI operation."
   ],
   "force_update": false
 }

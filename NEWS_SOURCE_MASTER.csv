@@ -1,0 +1,33 @@
+ID,Source Name,Website,Country,Language,Type,Category,Priority,RSS,API,Crawl Method,Frequency,Audience,Content Quality Score,Business Value Score,Crawl Difficulty,Copyright Risk,AI Summary Enabled,Status
+SRC001,IMO,https://www.imo.org,Global,EN,Organization,Regulation,P1,No,No,Scrapy,Daily,All,10,10,Medium,Low,Yes,Active
+SRC002,BIMCO,https://www.bimco.org,Global,EN,Organization,Shipping Market,P1,Partial,No,RSS+Scrapy,Daily,Shipowner,10,10,Medium,Low,Yes,Active
+SRC003,ICS,https://www.ics-shipping.org,Global,EN,Organization,Industry,P1,No,No,Scrapy,Daily,Shipowner,9,9,Easy,Low,Yes,Active
+SRC004,Safety4Sea,https://safety4sea.com,Global,EN,Media,Safety,P1,Yes,No,RSS,Hourly,Seafarer,10,10,Easy,Low,Yes,Active
+SRC005,Splash247,https://splash247.com,Global,EN,Media,Shipping Market,P1,Yes,No,RSS,Hourly,All,10,10,Easy,Medium,Yes,Active
+SRC006,Maritime Executive,https://www.maritime-executive.com,Global,EN,Media,Shipping Market,P1,Yes,No,RSS,Hourly,All,10,10,Easy,Medium,Yes,Active
+SRC007,gCaptain,https://gcaptain.com,Global,EN,Media,Shipping News,P1,Yes,No,RSS,Hourly,Seafarer,9,9,Easy,Medium,Yes,Active
+SRC008,Seatrade Maritime,https://www.seatrade-maritime.com,Global,EN,Media,Shipping News,P1,Partial,No,RSS+Scrapy,Daily,All,9,9,Medium,Medium,Yes,Active
+SRC009,Marine Insight,https://www.marineinsight.com,India,EN,Media,Technical,P1,Yes,No,RSS,Daily,Seafarer,10,8,Easy,Low,Yes,Active
+SRC010,Maersk News,https://www.maersk.com/news,Denmark,EN,Carrier,Container,P1,No,No,Scrapy,Daily,Logistics,9,10,Medium,Low,Yes,Active
+SRC011,MSC Newsroom,https://www.msc.com,Switzerland,EN,Carrier,Container,P1,No,No,Scrapy,Daily,Logistics,9,10,Medium,Low,Yes,Active
+SRC012,CMA CGM News,https://www.cma-cgm.com,France,EN,Carrier,Container,P1,No,No,Scrapy,Daily,Logistics,9,10,Medium,Low,Yes,Active
+SRC013,Hapag-Lloyd News,https://www.hapag-lloyd.com,Germany,EN,Carrier,Container,P1,No,No,Scrapy,Daily,Logistics,9,10,Medium,Low,Yes,Active
+SRC014,Vinamarine,https://vinamarine.gov.vn,Vietnam,VI,Authority,Regulation,P1,No,No,Scrapy,Daily,All,10,10,Easy,Low,Yes,Active
+SRC015,Vietnam Register,https://vr.org.vn,Vietnam,VI,Authority,Safety,P1,No,No,Scrapy,Daily,Seafarer,9,9,Easy,Low,Yes,Active
+SRC016,Saigon Newport,https://saigonnewport.com.vn,Vietnam,VI,Port,Port,P1,No,No,Scrapy,Daily,Logistics,9,10,Easy,Low,Yes,Active
+SRC017,VIMC,https://vimc.co,Vietnam,VI,Shipping Company,Shipping Market,P1,No,No,Scrapy,Daily,All,8,9,Easy,Low,Yes,Active
+SRC018,Hai Quan Online,https://haiquanonline.com.vn,Vietnam,VI,Media,Trade,P1,Yes,No,RSS+Scrapy,Daily,Logistics,9,9,Easy,Low,Yes,Active
+SRC019,Professional Mariner,https://professionalmariner.com,USA,EN,Media,Merchant Marine,P2,Unknown,No,Scrapy,Daily,Seafarer,8,8,Medium,Low,Yes,Active
+SRC020,Marine Engineers Knowledge,https://www.marineengineersknowledge.com,Global,EN,Technical,Engineering,P2,Unknown,No,Scrapy,Daily,Engineer,9,8,Medium,Low,Yes,Active
+SRC021,Gemadept,https://gemadept.com.vn,Vietnam,VI,Logistics,Port,P2,No,No,Scrapy,Daily,Logistics,8,9,Easy,Low,Yes,Active
+SRC022,Hai An Transport,https://haiants.vn,Vietnam,VI,Carrier,Container,P2,No,No,Scrapy,Daily,Logistics,8,9,Easy,Low,Yes,Active
+SRC023,Bao Giao Thong,https://www.baogiaothong.vn,Vietnam,VI,Media,Transport,P2,No,No,Scrapy,Daily,All,7,8,Easy,Low,Yes,Active
+SRC024,VnEconomy,https://vneconomy.vn,Vietnam,VI,Media,Logistics,P2,No,No,Scrapy,Daily,Business,8,9,Easy,Low,Yes,Active
+SRC025,Vietnam Logistics Review,https://vlr.vn,Vietnam,VI,Media,Logistics,P2,No,No,Scrapy,Daily,Logistics,8,8,Easy,Low,Yes,Active
+SRC026,Captain's Mode,https://captainsmode.com,Global,EN,Blog,Professional Experience,P3,Unknown,No,Manual,Weekly,Seafarer,8,7,Easy,Low,Yes,Active
+SRC027,MAIB,https://www.gov.uk/maib,UK,EN,Authority,Accident Investigation,P3,No,No,Scrapy,Weekly,Seafarer,10,8,Medium,Low,Yes,Future
+SRC028,USCG Marine Safety,https://www.dco.uscg.mil,USA,EN,Authority,Safety,P3,No,No,Scrapy,Weekly,Seafarer,9,8,Medium,Low,Yes,Future
+SRC029,NTSB Marine,https://www.ntsb.gov,USA,EN,Authority,Accident Investigation,P3,No,No,Scrapy,Weekly,Seafarer,9,8,Medium,Low,Yes,Future
+SRC030,Port of Singapore,https://www.mpa.gov.sg,Singapore,EN,Port,Port,P3,No,No,Scrapy,Daily,Logistics,9,9,Medium,Low,Yes,Future
+SRC031,Port of Rotterdam,https://www.portofrotterdam.com,Netherlands,EN,Port,Port,P3,No,No,Scrapy,Daily,Logistics,9,9,Medium,Low,Yes,Future
+SRC032,Port of Shanghai,https://www.portshanghai.com.cn,China,CN,Port,Port,P3,No,No,Scrapy,Daily,Logistics,9,9,Hard,Low,Yes,Future

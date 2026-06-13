@@ -29,6 +29,19 @@ if errorlevel 1 (
     exit /b 1
 )
 
+python -c "import playwright" >nul 2>nul
+if errorlevel 1 (
+    echo Build error: Playwright is not available. Run: python -m pip install -r requirements.txt
+    exit /b 1
+)
+
+set "PLAYWRIGHT_BROWSERS_PATH=0"
+python -m playwright install chromium
+if errorlevel 1 (
+    echo Build error: Playwright Chromium install failed.
+    exit /b 1
+)
+
 for /f "usebackq delims=" %%A in (`python -c "import json; data=json.load(open('version.json', encoding='utf-8')); print(data.get('app_name') or '%FALLBACK_APP_NAME%')" 2^>nul`) do set "APP_NAME=%%A"
 for /f "usebackq delims=" %%A in (`python -c "import json; data=json.load(open('version.json', encoding='utf-8')); print(data.get('updater_name') or '%FALLBACK_UPDATER_NAME%')" 2^>nul`) do set "UPDATER_NAME=%%A"
 
@@ -41,8 +54,13 @@ if /I "%UPDATER_BASE:~-4%"==".exe" set "UPDATER_BASE=%UPDATER_BASE:~0,-4%"
 set "ICON_ARGS="
 if exist "assets\icon.ico" set "ICON_ARGS=--icon assets\icon.ico"
 
+set "TRANSLATE_RULE_ARGS="
+if exist "translate-rule.xlsx" set "TRANSLATE_RULE_ARGS=--add-data translate-rule.xlsx;."
+
 if exist build rmdir /s /q build
-if exist dist rmdir /s /q dist
+if not exist dist mkdir dist
+if exist "dist\%APP_NAME%.exe" del /q "dist\%APP_NAME%.exe"
+if /I "%MODE%"=="first" if exist "dist\%UPDATER_NAME%" del /q "dist\%UPDATER_NAME%"
 
 echo Building app: %APP_NAME%
 python -m PyInstaller ^
@@ -50,7 +68,9 @@ python -m PyInstaller ^
 --windowed ^
 --add-data "version.json;." ^
 --add-data "latest.json;." ^
+%TRANSLATE_RULE_ARGS% ^
 --collect-all customtkinter ^
+--collect-all playwright ^
 --hidden-import tkinter ^
 --hidden-import tkinter.ttk ^
 %ICON_ARGS% ^

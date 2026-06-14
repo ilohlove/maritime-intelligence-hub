@@ -1,11 +1,11 @@
 {
-  "version": "1.0.4",
+  "version": "1.0.5",
   "release_date": "2026-06-14",
-  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.0.4/BV-maritime-intelligence-hub.exe",
+  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.0.5/BV-maritime-intelligence-hub.exe",
   "changelog": [
-    "Improve App mode empty-article diagnostics with explicit database, AI summary, freshness, published, and duplicate filter messages.",
-    "Show App mode database path and candidate counts in combined source output.",
-    "Use the active App mode database consistently when checking already-published items."
+    "Make the visual card generator use the selected source mode so Sheet mode reads from the configured Google Sheet link.",
+    "Show Google Sheet source URL, CSV export URL, and loaded row count in combined source output.",
+    "Add Sheet mode validation for empty or unusable Google Sheet links."
   ],
   "force_update": false
 }

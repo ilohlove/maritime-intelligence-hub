@@ -49,6 +49,7 @@ def build_combined_brief(
     use_sheet = source_mode in {"sheet", "combined"}
 
     app_diagnostics = get_brief_candidate_diagnostics(db_path=db_path, brief_type="morning") if use_app else {}
+    sheet_diagnostics = sheet_lookup(sheet_url) if use_sheet else {}
     app_items = load_app_items(limit=app_limit, db_path=db_path) if use_app else []
     sheet_items = load_sheet_items(sheet_url, limit=sheet_limit, session=session) if use_sheet else []
     raw_items = app_items + sheet_items
@@ -56,6 +57,9 @@ def build_combined_brief(
     stats["source_mode"] = source_mode
     if use_app:
         stats["app_db"] = app_diagnostics
+    if use_sheet:
+        sheet_diagnostics["loaded_items"] = len(sheet_items)
+        stats["sheet_source"] = sheet_diagnostics
     selected_items = filtered_items if card_limit is None else filtered_items[: max(1, int(card_limit))]
 
     payload = {
@@ -120,6 +124,15 @@ def load_sheet_items(sheet_url, limit=None, session=None):
         if limit is not None and len(items) >= max(1, int(limit)):
             break
     return items
+
+
+def sheet_lookup(sheet_url):
+    text = str(sheet_url or "").strip()
+    return {
+        "sheet_url": text,
+        "csv_url": sheet_csv_export_url(text) if text else "",
+        "loaded_items": 0,
+    }
 
 
 def sheet_row_to_item(row, index):
@@ -353,6 +366,17 @@ def format_combined_stats(stats, brief_path=None):
                 f"Published item records: {app_db.get('published_items_total', 0)}",
             ]
         )
+    sheet_source = stats.get("sheet_source") or {}
+    if sheet_source:
+        lines.extend(
+            [
+                "",
+                "Google Sheet source",
+                f"Sheet URL: {sheet_source.get('sheet_url', '')}",
+                f"CSV export URL: {sheet_source.get('csv_url', '')}",
+                f"Loaded sheet items: {sheet_source.get('loaded_items', 0)}",
+            ]
+        )
     if brief_path:
         lines.append(f"Brief JSON: {brief_path}")
     if stats.get("duplicate_groups"):
@@ -383,5 +407,11 @@ def format_empty_combined_message(stats, brief_path=None):
                 f"(published removed: {stats.get('already_published', 0)}, "
                 f"duplicate removed: {stats.get('duplicate_removed', 0)})."
             )
+    elif source_mode == "sheet":
+        sheet_source = stats.get("sheet_source") or {}
+        if not sheet_source.get("sheet_url"):
+            reason = "Google Sheet URL is empty. Select Sheet mode and paste the Google Sheet link."
+        elif int(sheet_source.get("loaded_items") or 0) == 0:
+            reason = "No usable rows loaded from the Google Sheet link."
 
     return "\n\n".join([reason, format_combined_stats(stats, brief_path)])

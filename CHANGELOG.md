@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.5 - 2026-06-14
+
+- Make the visual card generator use the selected source mode so Sheet mode reads from the configured Google Sheet link.
+- Show Google Sheet source URL, CSV export URL, and loaded row count in combined source output.
+- Add Sheet mode validation for empty or unusable Google Sheet links.
+
 ## v1.0.4 - 2026-06-14
 
 - Improve App mode empty-article diagnostics with explicit database, AI summary, freshness, published, and duplicate filter messages.

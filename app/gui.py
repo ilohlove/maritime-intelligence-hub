@@ -392,7 +392,12 @@ class AppGUI:
 
         actions = ctk.CTkFrame(form, fg_color="transparent")
         actions.grid(row=8, column=1, columnspan=3, sticky="w", padx=8, pady=(6, 8))
-        generate = ctk.CTkButton(actions, text="Generate Cards From Latest", width=190, command=self._generate_latest_cards)
+        generate = ctk.CTkButton(
+            actions,
+            text="Generate Cards From Selected Source",
+            width=240,
+            command=self._generate_combined_cards,
+        )
         generate.pack(side="left", padx=(0, 8))
         self.action_buttons.append(generate)
         ctk.CTkButton(actions, text="Save Image Settings", width=170, command=self._save_settings).pack(side="left", padx=(0, 8))

@@ -144,6 +144,49 @@ class CombinedBriefSourceTests(unittest.TestCase):
         self.assertEqual(len(result.payload["items"]), 1)
         self.assertEqual(result.stats["app_db"]["candidate_window_total"], 1)
 
+    def test_sheet_mode_records_sheet_urls_and_loads_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "mih.db"
+            brief_path = temp_path / "combined_brief.json"
+            sheet_url = "https://docs.google.com/spreadsheets/d/sheet123/edit?gid=456#gid=456"
+            session = _FakeSession(
+                "Date,Section,Topic,Headline,Vietnamese translation,Source,Source URL,Main summary,Main summary (Vietnamese),Why it matters,Why it matters (Vietnamese)\n"
+                "2026-06-14,Domestic,Port,English title,Tiêu đề tiếng Việt,Sheet Source,https://example.com/sheet-story,English summary,Tóm tắt tiếng Việt,English impact,Tác động tiếng Việt\n"
+            )
+
+            result = build_combined_brief(
+                source_mode="sheet",
+                sheet_url=sheet_url,
+                sheet_limit=None,
+                db_path=db_path,
+                brief_path=brief_path,
+                session=session,
+            )
+
+        self.assertEqual(len(result.payload["items"]), 1)
+        self.assertEqual(result.stats["source_mode"], "sheet")
+        self.assertEqual(result.stats["sheet_total"], 1)
+        self.assertEqual(result.stats["app_total"], 0)
+        self.assertEqual(result.stats["sheet_source"]["sheet_url"], sheet_url)
+        self.assertEqual(
+            result.stats["sheet_source"]["csv_url"],
+            "https://docs.google.com/spreadsheets/d/sheet123/export?format=csv&gid=456",
+        )
+
+    def test_sheet_mode_reports_empty_sheet_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "mih.db"
+            brief_path = temp_path / "combined_brief.json"
+
+            result = build_combined_brief(source_mode="sheet", sheet_url="", db_path=db_path, brief_path=brief_path)
+            message = format_empty_combined_message(result.stats, result.brief_path)
+
+        self.assertEqual(result.payload["items"], [])
+        self.assertIn("Google Sheet URL is empty", message)
+        self.assertIn("Source mode: sheet", message)
+
 
 def _item(source_type, source_name, url):
     item = {
@@ -200,6 +243,24 @@ def _summary(article_id):
         "model_name": "rule-based-mock",
         "token_usage": 0,
     }
+
+
+class _FakeSession:
+    def __init__(self, text):
+        self.text = text
+        self.requested_urls = []
+
+    def get(self, url, timeout):
+        self.requested_urls.append((url, timeout))
+        return _FakeResponse(self.text)
+
+
+class _FakeResponse:
+    def __init__(self, text):
+        self.content = text.encode("utf-8")
+
+    def raise_for_status(self):
+        return None
 
 
 def _write_fake_png(_html, output_path):

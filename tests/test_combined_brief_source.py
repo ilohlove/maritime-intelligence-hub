@@ -1,16 +1,21 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from app.services.combined_brief_source import (
+    build_combined_brief,
     canonicalize_url,
     filter_publishable_items,
+    format_empty_combined_message,
     item_key,
     sheet_row_to_item,
     title_hash,
 )
+from app.services.source_master import load_sources
+from app.services.storage import init_db, sync_sources, upsert_article, upsert_summary, utc_now
 from app.services.visual_brief_renderer import generate_image_cards
 
 
@@ -76,6 +81,69 @@ class CombinedBriefSourceTests(unittest.TestCase):
 
         self.assertEqual(result["items"], 2)
 
+    def test_app_mode_reports_empty_database(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "mih.db"
+            brief_path = temp_path / "combined_brief.json"
+            init_db(db_path)
+
+            result = build_combined_brief(source_mode="app", db_path=db_path, brief_path=brief_path)
+            message = format_empty_combined_message(result.stats, result.brief_path)
+
+        self.assertEqual(result.payload["items"], [])
+        self.assertIn("App database is empty. Run scan + AI summary first.", message)
+        self.assertIn(str(db_path), message)
+
+    def test_app_mode_reports_missing_ai_summaries(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "mih.db"
+            brief_path = temp_path / "combined_brief.json"
+            _seed_sources(db_path)
+            upsert_article(_article(), db_path=db_path)
+
+            result = build_combined_brief(source_mode="app", db_path=db_path, brief_path=brief_path)
+            message = format_empty_combined_message(result.stats, result.brief_path)
+
+        self.assertEqual(result.payload["items"], [])
+        self.assertIn("No AI summaries yet. Run AI summarization first.", message)
+        self.assertIn("Articles: 1", message)
+        self.assertIn("AI summaries: 0", message)
+
+    def test_app_mode_reports_no_fresh_summarized_articles(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "mih.db"
+            brief_path = temp_path / "combined_brief.json"
+            _seed_sources(db_path)
+            article_id, _ = upsert_article(
+                _article(published_at=(datetime.now(timezone.utc) - timedelta(days=10)).isoformat()),
+                db_path=db_path,
+            )
+            upsert_summary(_summary(article_id), db_path=db_path)
+
+            result = build_combined_brief(source_mode="app", db_path=db_path, brief_path=brief_path)
+            message = format_empty_combined_message(result.stats, result.brief_path)
+
+        self.assertEqual(result.payload["items"], [])
+        self.assertIn("No fresh summarized articles in the current brief window.", message)
+        self.assertIn("Fresh brief candidates: 0", message)
+
+    def test_app_mode_builds_items_from_fresh_summarized_articles(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "mih.db"
+            brief_path = temp_path / "combined_brief.json"
+            _seed_sources(db_path)
+            article_id, _ = upsert_article(_article(), db_path=db_path)
+            upsert_summary(_summary(article_id), db_path=db_path)
+
+            result = build_combined_brief(source_mode="app", db_path=db_path, brief_path=brief_path)
+
+        self.assertEqual(len(result.payload["items"]), 1)
+        self.assertEqual(result.stats["app_db"]["candidate_window_total"], 1)
+
 
 def _item(source_type, source_name, url):
     item = {
@@ -91,6 +159,47 @@ def _item(source_type, source_name, url):
     item["title_hash"] = title_hash(item["title"])
     item["item_key"] = item_key(item)
     return item
+
+
+def _seed_sources(db_path):
+    rows, _ = load_sources("NEWS_SOURCE_MASTER.csv")
+    init_db(db_path)
+    sync_sources(rows, db_path=db_path)
+
+
+def _article(published_at="auto"):
+    published = (
+        datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        if published_at == "auto"
+        else published_at
+    )
+    return {
+        "source_id": "SRC004",
+        "source_name": "Safety4Sea",
+        "title": "Safety4Sea test article",
+        "url": "https://safety4sea.com/test-app-mode",
+        "normalized_title": "safety4sea test article",
+        "title_hash": "test-app-mode-title-hash",
+        "published_at": published,
+        "fetched_at": utc_now(),
+        "language": "EN",
+        "category": "Safety",
+        "description": "Short safety description.",
+        "content_excerpt": "Short safety description.",
+        "importance_score": 8,
+    }
+
+
+def _summary(article_id):
+    return {
+        "article_id": article_id,
+        "headline": "Tin an toàn hàng hải",
+        "summary": "Tóm tắt tin hàng hải có link gốc.",
+        "impact_note": "Tác động hàng hải cần theo dõi.",
+        "prompt_version": "mock-v1",
+        "model_name": "rule-based-mock",
+        "token_usage": 0,
+    }
 
 
 def _write_fake_png(_html, output_path):

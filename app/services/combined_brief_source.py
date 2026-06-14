@@ -13,7 +13,12 @@ import requests
 
 from app.config import ROOT_DIR
 from app.services.brief_writer import build_brief_item, validate_publish_items
-from app.services.storage import DEFAULT_DB_PATH, get_brief_candidates, list_published_item_keys
+from app.services.storage import (
+    DEFAULT_DB_PATH,
+    get_brief_candidate_diagnostics,
+    get_brief_candidates,
+    list_published_item_keys,
+)
 
 
 DEFAULT_COMBINED_BRIEF_PATH = ROOT_DIR / "output" / "briefs" / "combined_brief.json"
@@ -43,10 +48,14 @@ def build_combined_brief(
     use_app = source_mode in {"app", "combined"}
     use_sheet = source_mode in {"sheet", "combined"}
 
+    app_diagnostics = get_brief_candidate_diagnostics(db_path=db_path, brief_type="morning") if use_app else {}
     app_items = load_app_items(limit=app_limit, db_path=db_path) if use_app else []
     sheet_items = load_sheet_items(sheet_url, limit=sheet_limit, session=session) if use_sheet else []
     raw_items = app_items + sheet_items
-    filtered_items, stats = filter_publishable_items(raw_items)
+    filtered_items, stats = filter_publishable_items(raw_items, db_path=db_path)
+    stats["source_mode"] = source_mode
+    if use_app:
+        stats["app_db"] = app_diagnostics
     selected_items = filtered_items if card_limit is None else filtered_items[: max(1, int(card_limit))]
 
     payload = {
@@ -145,8 +154,8 @@ def sheet_row_to_item(row, index):
     return item
 
 
-def filter_publishable_items(items):
-    published = published_lookup()
+def filter_publishable_items(items, db_path=DEFAULT_DB_PATH):
+    published = published_lookup(db_path=db_path)
     stats = {
         "app_total": sum(1 for item in items if item.get("source_type") == "app"),
         "sheet_total": sum(1 for item in items if item.get("source_type") == "sheet"),
@@ -319,6 +328,7 @@ def has_vietnamese_marks(value):
 def format_combined_stats(stats, brief_path=None):
     lines = [
         "Combined source check",
+        f"Source mode: {stats.get('source_mode', 'combined')}",
         f"App items: {stats.get('app_total', 0)}",
         f"Sheet items: {stats.get('sheet_total', 0)}",
         f"Raw items: {stats.get('raw_total', 0)}",
@@ -327,6 +337,22 @@ def format_combined_stats(stats, brief_path=None):
         f"Eligible after published filter: {stats.get('eligible_total', 0)}",
         f"Selected after dedupe: {stats.get('selected_total', 0)}",
     ]
+    app_db = stats.get("app_db") or {}
+    if app_db:
+        lines.extend(
+            [
+                "",
+                "App database",
+                f"DB path: {app_db.get('db_path', '')}",
+                f"Articles: {app_db.get('articles_total', 0)}",
+                f"AI summaries: {app_db.get('summaries_total', 0)}",
+                f"Summarized new articles: {app_db.get('summarized_new_total', 0)}",
+                f"Summarized articles with published_at: {app_db.get('summarized_with_published_at_total', 0)}",
+                f"Fresh brief candidates: {app_db.get('candidate_window_total', 0)}",
+                f"Brief cutoff: {app_db.get('cutoff', '')}",
+                f"Published item records: {app_db.get('published_items_total', 0)}",
+            ]
+        )
     if brief_path:
         lines.append(f"Brief JSON: {brief_path}")
     if stats.get("duplicate_groups"):
@@ -337,3 +363,25 @@ def format_combined_stats(stats, brief_path=None):
             for title in group.get("removed") or []:
                 lines.append(f"  Remove: {title}")
     return "\n".join(lines)
+
+
+def format_empty_combined_message(stats, brief_path=None):
+    source_mode = str(stats.get("source_mode") or "combined").lower()
+    app_db = stats.get("app_db") or {}
+    reason = "No new articles after published and duplicate filters."
+
+    if source_mode == "app":
+        if int(app_db.get("articles_total") or 0) == 0:
+            reason = "App database is empty. Run scan + AI summary first."
+        elif int(app_db.get("summaries_total") or 0) == 0:
+            reason = "No AI summaries yet. Run AI summarization first."
+        elif int(app_db.get("candidate_window_total") or 0) == 0:
+            reason = "No fresh summarized articles in the current brief window."
+        elif int(stats.get("already_published") or 0) or int(stats.get("duplicate_removed") or 0):
+            reason = (
+                "No new articles remain after published and duplicate filters "
+                f"(published removed: {stats.get('already_published', 0)}, "
+                f"duplicate removed: {stats.get('duplicate_removed', 0)})."
+            )
+
+    return "\n\n".join([reason, format_combined_stats(stats, brief_path)])

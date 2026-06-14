@@ -453,6 +453,53 @@ def get_brief_candidates(db_path=DEFAULT_DB_PATH, limit=20, brief_type="morning"
     return _balance_brief_candidates([dict(row) for row in rows], effective_limit)
 
 
+def get_brief_candidate_diagnostics(db_path=DEFAULT_DB_PATH, brief_type="morning"):
+    init_db(db_path)
+    cutoff = _brief_cutoff(brief_type)
+    with connect_db(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM articles) AS articles_total,
+                (SELECT COUNT(*) FROM article_summaries) AS summaries_total,
+                (
+                    SELECT COUNT(*)
+                    FROM articles a
+                    JOIN article_summaries sm ON sm.article_id = a.id
+                ) AS summarized_articles_total,
+                (
+                    SELECT COUNT(*)
+                    FROM articles a
+                    JOIN article_summaries sm ON sm.article_id = a.id
+                    WHERE a.status = 'new'
+                ) AS summarized_new_total,
+                (
+                    SELECT COUNT(*)
+                    FROM articles a
+                    JOIN article_summaries sm ON sm.article_id = a.id
+                    WHERE a.status = 'new'
+                      AND a.published_at IS NOT NULL
+                ) AS summarized_with_published_at_total,
+                (
+                    SELECT COUNT(*)
+                    FROM articles a
+                    JOIN article_summaries sm ON sm.article_id = a.id
+                    JOIN sources s ON s.id = a.source_id
+                    WHERE a.status = 'new'
+                      AND a.published_at IS NOT NULL
+                      AND datetime(a.published_at) >= datetime(?)
+                ) AS candidate_window_total,
+                (SELECT COUNT(*) FROM published_items) AS published_items_total
+            """,
+            (cutoff,),
+        ).fetchone()
+    result = dict(row)
+    result["db_path"] = str(Path(db_path))
+    result["brief_type"] = brief_type
+    result["cutoff"] = cutoff
+    return result
+
+
 def list_published_item_keys(db_path=DEFAULT_DB_PATH):
     init_db(db_path)
     with connect_db(db_path) as conn:

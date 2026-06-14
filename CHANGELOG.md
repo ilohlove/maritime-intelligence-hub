@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.4 - 2026-06-14
+
+- Improve App mode empty-article diagnostics with explicit database, AI summary, freshness, published, and duplicate filter messages.
+- Show App mode database path and candidate counts in combined source output.
+- Use the active App mode database consistently when checking already-published items.
+
 ## v1.0.0 - 2026-06-13
 
 - Initialize Maritime Intelligence Hub as a real project from the desktop app template.

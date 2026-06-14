@@ -31,6 +31,7 @@ from app.services.runtime_settings import (
 from app.services.combined_brief_source import (
     DEFAULT_COMBINED_BRIEF_PATH,
     build_combined_brief,
+    format_empty_combined_message,
     format_combined_stats,
 )
 from app.services.source_master import ALLOWED_VALUES, append_manual_source
@@ -714,7 +715,7 @@ class AppGUI:
             brief_path=DEFAULT_COMBINED_BRIEF_PATH,
         )
         if not source_result.payload.get("items"):
-            raise RuntimeError("No new articles after published and duplicate filters.")
+            raise RuntimeError(format_empty_combined_message(source_result.stats, source_result.brief_path))
         cards_result = generate_image_cards(
             "combined",
             limit=self._optional_limit(self.card_limit_var, self.card_limit_max_var),

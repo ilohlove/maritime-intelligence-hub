@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.6 - 2026-06-15
+
+- Make loop mode image generation honor the selected visual source, including Google Sheets.
+- Send Telegram cards from the selected source instead of always using the latest app brief.
+- Rename send-card actions to make selected-source behavior clear.
+
 ## v1.0.5 - 2026-06-14
 
 - Make the visual card generator use the selected source mode so Sheet mode reads from the configured Google Sheet link.

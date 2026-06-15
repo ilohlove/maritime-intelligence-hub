@@ -1,11 +1,11 @@
 {
-  "version": "1.0.5",
-  "release_date": "2026-06-14",
-  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.0.5/BV-maritime-intelligence-hub.exe",
+  "version": "1.0.6",
+  "release_date": "2026-06-15",
+  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.0.6/BV-maritime-intelligence-hub.exe",
   "changelog": [
-    "Make the visual card generator use the selected source mode so Sheet mode reads from the configured Google Sheet link.",
-    "Show Google Sheet source URL, CSV export URL, and loaded row count in combined source output.",
-    "Add Sheet mode validation for empty or unusable Google Sheet links."
+    "Make loop mode image generation honor the selected visual source, including Google Sheets.",
+    "Send Telegram cards from the selected source instead of always using the latest app brief.",
+    "Rename send-card actions to make selected-source behavior clear."
   ],
   "force_update": false
 }

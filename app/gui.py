@@ -434,7 +434,7 @@ class AppGUI:
         ctk.CTkButton(panel, text="Save Publish Settings", width=180, command=self._save_settings).grid(
             row=6, column=1, sticky="w", padx=10, pady=12
         )
-        ctk.CTkButton(panel, text="Send Latest Cards", width=160, command=self._send_latest_cards).grid(
+        ctk.CTkButton(panel, text="Send Selected Source Cards", width=210, command=self._send_latest_cards).grid(
             row=6, column=1, sticky="w", padx=(210, 10), pady=12
         )
 
@@ -636,13 +636,19 @@ class AppGUI:
         card_result = None
         if self.create_image_cards_var.get() or self.send_telegram_var.get():
             self._checkpoint("generate image cards")
-            card_result = self._retry_gui_step("generate_image_cards", self._generate_latest_cards_result)
-            lines.extend(["", self._format_card_result(card_result)])
+            card_result = self._retry_gui_step(
+                "generate_selected_source_image_cards",
+                self._generate_selected_source_cards_result,
+            )
+            lines.extend(["", self._format_selected_source_cards_result(card_result)])
         if self.send_telegram_var.get():
             if not card_result:
                 return "\n".join(lines + ["Telegram skipped: no image cards generated"]), False
             self._checkpoint("send Telegram")
-            send_output, send_ok = self._retry_gui_step("send_telegram", lambda: self._task_send_cards(card_result["cards"]))
+            send_output, send_ok = self._retry_gui_step(
+                "send_telegram",
+                lambda: self._task_send_cards(card_result["cards_result"]["cards"]),
+            )
             lines.extend(["", send_output])
             if not send_ok:
                 return "\n".join(lines), False
@@ -664,6 +670,18 @@ class AppGUI:
             limit=self._int_var(self.visual_limit_var, 12),
             source_brief_path=LATEST_BRIEF_JSON,
             style_settings=self._visual_settings(),
+        )
+
+    def _generate_selected_source_cards_result(self):
+        return self._generate_combined_cards_result()
+
+    def _format_selected_source_cards_result(self, result):
+        return "\n".join(
+            [
+                format_combined_stats(result["source_stats"], result["brief_path"]),
+                "",
+                self._format_card_result(result["cards_result"]),
+            ]
         )
 
     def _check_combined_sources(self):
@@ -877,7 +895,9 @@ class AppGUI:
         actions.grid(row=4, column=0, columnspan=2, sticky="e", padx=16, pady=18)
         ctk.CTkButton(actions, text="Test Bot", width=100, command=self._test_telegram_bot).pack(side="left", padx=(0, 8))
         ctk.CTkButton(actions, text="Test Chat", width=100, command=self._test_telegram_chat).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(actions, text="Send Latest", width=110, command=self._send_latest_cards).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="Send Selected Source", width=150, command=self._send_latest_cards).pack(
+            side="left", padx=(0, 8)
+        )
         ctk.CTkButton(actions, text="Save", width=90, command=lambda: self._save_telegram_dialog(dialog)).pack(
             side="right"
         )
@@ -932,12 +952,18 @@ class AppGUI:
 
     def _send_latest_cards(self):
         self._save_settings()
-        self._run_background("Sending latest cards to Telegram", self._task_send_latest_cards)
+        self._run_background("Sending selected source cards to Telegram", self._task_send_latest_cards)
 
     def _task_send_latest_cards(self):
-        result = self._retry_gui_step("generate_image_cards", self._generate_latest_cards_result)
-        output, ok = self._retry_gui_step("send_telegram", lambda: self._task_send_cards(result["cards"]))
-        return f"{self._format_card_result(result)}\n\n{output}", ok
+        result = self._retry_gui_step(
+            "generate_selected_source_image_cards",
+            self._generate_selected_source_cards_result,
+        )
+        output, ok = self._retry_gui_step(
+            "send_telegram",
+            lambda: self._task_send_cards(result["cards_result"]["cards"]),
+        )
+        return f"{self._format_selected_source_cards_result(result)}\n\n{output}", ok
 
     def _task_send_cards(self, cards):
         token = self.telegram_bot_token_var.get().strip()

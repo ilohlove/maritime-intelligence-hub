@@ -11,6 +11,7 @@ from app.services.combined_brief_source import (
     filter_publishable_items,
     format_empty_combined_message,
     item_key,
+    sheet_run_label,
     sheet_row_to_item,
     title_hash,
 )
@@ -20,6 +21,16 @@ from app.services.visual_brief_renderer import generate_image_cards
 
 
 class CombinedBriefSourceTests(unittest.TestCase):
+    def test_sheet_run_label_parses_morning_and_evening(self):
+        self.assertEqual(sheet_run_label("07h15"), "morning")
+        self.assertEqual(sheet_run_label("08:00"), "morning")
+        self.assertEqual(sheet_run_label("19:15"), "evening")
+        self.assertEqual(sheet_run_label("23:29"), "evening")
+
+    def test_sheet_run_label_rejects_invalid_time(self):
+        with self.assertRaisesRegex(ValueError, "Sheet L1"):
+            sheet_run_label("ready")
+
     def test_sheet_row_maps_vietnamese_fields(self):
         item = sheet_row_to_item(
             {
@@ -173,6 +184,35 @@ class CombinedBriefSourceTests(unittest.TestCase):
             result.stats["sheet_source"]["csv_url"],
             "https://docs.google.com/spreadsheets/d/sheet123/export?format=csv&gid=456",
         )
+
+    def test_sheet_mode_uses_all_rows_without_limits_or_dedupe(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "mih.db"
+            brief_path = temp_path / "combined_brief.json"
+            sheet_url = "https://docs.google.com/spreadsheets/d/sheet123/edit?gid=456#gid=456"
+            session = _FakeSession(
+                "Date,Section,Topic,Headline,Vietnamese translation,Source,Source URL,Main summary,Main summary (Vietnamese),Why it matters,Why it matters (Vietnamese),19:15\n"
+                "2026-06-14,Domestic,Port,English A,TiÃªu Ä‘á» A,Sheet Source,https://example.com/same,English summary,TÃ³m táº¯t A,English impact,TÃ¡c Ä‘á»™ng A,\n"
+                "2026-06-14,Domestic,Port,English B,TiÃªu Ä‘á» B,Sheet Source,https://example.com/same,English summary,TÃ³m táº¯t B,English impact,TÃ¡c Ä‘á»™ng B,\n"
+            )
+
+            result = build_combined_brief(
+                source_mode="sheet",
+                sheet_url=sheet_url,
+                sheet_limit=1,
+                card_limit=1,
+                db_path=db_path,
+                brief_path=brief_path,
+                session=session,
+            )
+
+        self.assertEqual(len(result.payload["items"]), 2)
+        self.assertEqual(result.stats["sheet_total"], 2)
+        self.assertEqual(result.stats["duplicate_removed"], 0)
+        self.assertEqual(result.stats["selected_total"], 2)
+        self.assertEqual(result.stats["sheet_source"]["run_marker"], "19:15")
+        self.assertEqual(result.stats["sheet_source"]["run_label"], "evening")
 
     def test_sheet_mode_reports_empty_sheet_url(self):
         with tempfile.TemporaryDirectory() as temp_dir:

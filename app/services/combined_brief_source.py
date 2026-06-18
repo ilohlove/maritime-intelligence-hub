@@ -24,6 +24,7 @@ from app.services.storage import (
 DEFAULT_COMBINED_BRIEF_PATH = ROOT_DIR / "output" / "briefs" / "combined_brief.json"
 REQUEST_TIMEOUT = 30
 FUZZY_TITLE_THRESHOLD = 0.88
+SHEET_RUN_MARKER_COLUMN_INDEX = 11
 
 
 @dataclass
@@ -51,16 +52,24 @@ def build_combined_brief(
     app_diagnostics = get_brief_candidate_diagnostics(db_path=db_path, brief_type="morning") if use_app else {}
     sheet_diagnostics = sheet_lookup(sheet_url) if use_sheet else {}
     app_items = load_app_items(limit=app_limit, db_path=db_path) if use_app else []
-    sheet_items = load_sheet_items(sheet_url, limit=sheet_limit, session=session) if use_sheet else []
+    effective_sheet_limit = None if source_mode == "sheet" else sheet_limit
+    sheet_data = load_sheet_data(sheet_url, limit=effective_sheet_limit, session=session) if use_sheet else {}
+    sheet_items = sheet_data.get("items", []) if use_sheet else []
     raw_items = app_items + sheet_items
-    filtered_items, stats = filter_publishable_items(raw_items, db_path=db_path)
+    if source_mode == "sheet":
+        filtered_items, stats = select_all_sheet_items(raw_items)
+    else:
+        filtered_items, stats = filter_publishable_items(raw_items, db_path=db_path)
     stats["source_mode"] = source_mode
     if use_app:
         stats["app_db"] = app_diagnostics
     if use_sheet:
         sheet_diagnostics["loaded_items"] = len(sheet_items)
+        sheet_diagnostics["run_marker"] = sheet_data.get("run_marker", "")
+        sheet_diagnostics["run_label"] = sheet_data.get("run_label", "")
         stats["sheet_source"] = sheet_diagnostics
-    selected_items = filtered_items if card_limit is None else filtered_items[: max(1, int(card_limit))]
+    effective_card_limit = None if source_mode == "sheet" else card_limit
+    selected_items = filtered_items if effective_card_limit is None else filtered_items[: max(1, int(effective_card_limit))]
 
     payload = {
         "brief_type": "combined",
@@ -107,14 +116,15 @@ def load_app_items(limit=None, db_path=DEFAULT_DB_PATH):
 
 
 def load_sheet_items(sheet_url, limit=None, session=None):
+    return load_sheet_data(sheet_url, limit=limit, session=session).get("items", [])
+
+
+def load_sheet_data(sheet_url, limit=None, session=None):
     if not str(sheet_url or "").strip():
-        return []
+        return {"items": [], "run_marker": "", "run_label": ""}
     session = session or requests.Session()
-    csv_url = sheet_csv_export_url(sheet_url)
-    response = session.get(csv_url, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    csv_text = response.content.decode("utf-8-sig")
-    rows = list(csv.DictReader(StringIO(csv_text)))
+    csv_text = fetch_sheet_csv_text(sheet_url, session=session)
+    run_marker, rows = parse_sheet_csv(csv_text)
     items = []
     for index, row in enumerate(rows, start=1):
         item = sheet_row_to_item(row, index)
@@ -123,7 +133,48 @@ def load_sheet_items(sheet_url, limit=None, session=None):
         items.append(item)
         if limit is not None and len(items) >= max(1, int(limit)):
             break
-    return items
+    return {
+        "items": items,
+        "run_marker": run_marker,
+        "run_label": sheet_run_label(run_marker) if str(run_marker or "").strip() else "",
+    }
+
+
+def fetch_sheet_csv_text(sheet_url, session=None):
+    session = session or requests.Session()
+    csv_url = sheet_csv_export_url(sheet_url)
+    response = session.get(csv_url, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    return response.content.decode("utf-8-sig")
+
+
+def parse_sheet_csv(csv_text):
+    text = csv_text or ""
+    raw_rows = list(csv.reader(StringIO(text)))
+    run_marker = ""
+    if raw_rows and len(raw_rows[0]) > SHEET_RUN_MARKER_COLUMN_INDEX:
+        run_marker = str(raw_rows[0][SHEET_RUN_MARKER_COLUMN_INDEX] or "").strip()
+    rows = list(csv.DictReader(StringIO(text)))
+    return run_marker, rows
+
+
+def get_sheet_run_status(sheet_url, session=None):
+    csv_text = fetch_sheet_csv_text(sheet_url, session=session)
+    run_marker, _rows = parse_sheet_csv(csv_text)
+    run_label = sheet_run_label(run_marker)
+    return {"run_marker": run_marker, "run_label": run_label}
+
+
+def sheet_run_label(value):
+    text = str(value or "").strip()
+    match = re.search(r"(?P<hour>\d{1,2})\s*(?::|h|H)\s*(?P<minute>\d{1,2})", text)
+    if not match:
+        raise ValueError("Sheet L1 must contain a valid HH:MM run time.")
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute"))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("Sheet L1 must contain a valid HH:MM run time.")
+    return "morning" if hour < 12 else "evening"
 
 
 def sheet_lookup(sheet_url):
@@ -204,6 +255,21 @@ def filter_publishable_items(items, db_path=DEFAULT_DB_PATH):
 
     stats["eligible_total"] = len(fresh)
     stats["selected_total"] = len(selected)
+    return selected, stats
+
+
+def select_all_sheet_items(items):
+    selected = list(items)
+    stats = {
+        "app_total": sum(1 for item in selected if item.get("source_type") == "app"),
+        "sheet_total": sum(1 for item in selected if item.get("source_type") == "sheet"),
+        "raw_total": len(selected),
+        "already_published": 0,
+        "duplicate_removed": 0,
+        "eligible_total": len(selected),
+        "selected_total": len(selected),
+        "duplicate_groups": [],
+    }
     return selected, stats
 
 
@@ -375,6 +441,8 @@ def format_combined_stats(stats, brief_path=None):
                 f"Sheet URL: {sheet_source.get('sheet_url', '')}",
                 f"CSV export URL: {sheet_source.get('csv_url', '')}",
                 f"Loaded sheet items: {sheet_source.get('loaded_items', 0)}",
+                f"Sheet L1: {sheet_source.get('run_marker', '')}",
+                f"Sheet run label: {sheet_source.get('run_label', '')}",
             ]
         )
     if brief_path:

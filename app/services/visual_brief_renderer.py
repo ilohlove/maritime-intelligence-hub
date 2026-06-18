@@ -6,7 +6,7 @@ import re
 import webbrowser
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 
@@ -22,13 +22,14 @@ DEFAULT_VISUAL_BRIEF_DIR = ROOT_DIR / "output" / "visual_briefs"
 DEFAULT_IMAGE_CACHE_DIR = ROOT_DIR / "temp" / "visual_assets"
 BRIEF_TYPES = {"morning", "evening", "weekly", "combined", "sheet", "app"}
 
-META_IMAGE_PATTERN = re.compile(
-    r"<meta\b(?P<attrs>[^>]*(?:property|name)=['\"](?P<name>og:image|twitter:image)['\"][^>]*)>",
+META_PATTERN = re.compile(r"<meta\b(?P<attrs>[^>]*)>", re.IGNORECASE)
+IMG_PATTERN = re.compile(r"<img\b(?P<attrs>[^>]*)>", re.IGNORECASE)
+ATTR_PATTERN = re.compile(r"(?P<name>[\w:-]+)\s*=\s*(['\"])(?P<value>.*?)\2", re.IGNORECASE)
+IMAGE_URL_PATTERN = re.compile(
+    r"https?://[^\s\"'<>]+?\.(?:jpe?g|png|webp|gif)(?:\?[^\s\"'<>]*)?",
     re.IGNORECASE,
 )
-CONTENT_PATTERN = re.compile(r"content=['\"](?P<content>[^'\"]+)['\"]", re.IGNORECASE)
-IMG_PATTERN = re.compile(r"<img\b(?P<attrs>[^>]*\bsrc=['\"][^'\"]+['\"][^>]*)>", re.IGNORECASE)
-SRC_PATTERN = re.compile(r"\bsrc=['\"](?P<src>[^'\"]+)['\"]", re.IGNORECASE)
+IMAGE_SRC_ATTRS = ("src", "data-src", "data-lazy-src")
 
 
 def generate_image_cards(
@@ -80,6 +81,7 @@ def generate_image_cards(
                 "item_key": item.get("item_key"),
                 "image_status": image["status"],
                 "image_url": image.get("image_url"),
+                "image_reason": image.get("reason"),
                 "card_path": str(card_path),
             }
         )
@@ -117,53 +119,80 @@ def resolve_card_image(article_url, session=None, cache_dir=DEFAULT_IMAGE_CACHE_
     except Exception as exc:
         return _fallback_image(f"article_fetch_error: {exc}")
 
-    image_url = extract_image_url(response.text, article_url)
-    if not image_url:
+    image_urls = extract_image_candidates(response.text, article_url)
+    if not image_urls:
         return _fallback_image("image_not_found")
 
-    try:
-        local_path, mime_type = download_image(
-            image_url,
-            session=session,
-            cache_dir=cache_dir,
-            force_refresh=force_refresh,
-        )
-    except Exception as exc:
-        return _fallback_image(f"image_fetch_error: {exc}", image_url=image_url)
+    last_error = None
+    last_image_url = None
+    for image_url in image_urls:
+        last_image_url = image_url
+        try:
+            local_path, mime_type = download_image(
+                image_url,
+                session=session,
+                cache_dir=cache_dir,
+                force_refresh=force_refresh,
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
 
-    return {
-        "status": "ok",
-        "image_url": image_url,
-        "local_path": local_path,
-        "mime_type": mime_type,
-        "data_uri": image_to_data_uri(local_path, mime_type),
-    }
+        return {
+            "status": "ok",
+            "image_url": image_url,
+            "local_path": local_path,
+            "mime_type": mime_type,
+            "data_uri": image_to_data_uri(local_path, mime_type),
+        }
+
+    return _fallback_image(f"image_fetch_error: {last_error}", image_url=last_image_url)
 
 
 def extract_image_url(html_text, base_url):
+    candidates = extract_image_candidates(html_text, base_url)
+    return candidates[0] if candidates else None
+
+
+def extract_image_candidates(html_text, base_url):
+    raw_candidates = []
     og_candidates = []
     twitter_candidates = []
-    for match in META_IMAGE_PATTERN.finditer(html_text or ""):
-        content_match = CONTENT_PATTERN.search(match.group("attrs"))
-        if content_match:
-            name = (match.group("name") or "").lower()
-            if name == "og:image":
-                og_candidates.append(content_match.group("content"))
-            else:
-                twitter_candidates.append(content_match.group("content"))
+    text = html_text or ""
 
-    candidates = og_candidates + twitter_candidates
-    if not candidates:
-        for match in IMG_PATTERN.finditer(html_text or ""):
-            src_match = SRC_PATTERN.search(match.group("attrs"))
-            if src_match:
-                candidates.append(src_match.group("src"))
+    for match in META_PATTERN.finditer(text):
+        attrs = _attrs_to_dict(match.group("attrs"))
+        name = (attrs.get("property") or attrs.get("name") or "").lower()
+        content = attrs.get("content")
+        if name in {"og:image", "og:image:secure_url"} and content:
+            og_candidates.append(content)
+        elif name == "twitter:image" and content:
+            twitter_candidates.append(content)
+    raw_candidates.extend(og_candidates + twitter_candidates)
 
-    for candidate in candidates:
+    for match in IMG_PATTERN.finditer(text):
+        attrs = _attrs_to_dict(match.group("attrs"))
+        if _is_small_declared_image(attrs):
+            continue
+        for attr_name in IMAGE_SRC_ATTRS:
+            if attrs.get(attr_name):
+                raw_candidates.append(attrs[attr_name])
+        if attrs.get("srcset"):
+            raw_candidates.extend(_srcset_candidates(attrs["srcset"]))
+
+    raw_candidates.extend(match.group(0) for match in IMAGE_URL_PATTERN.finditer(text))
+
+    candidates = []
+    seen = set()
+    for candidate in raw_candidates:
         normalized = html.unescape(candidate or "").strip()
-        if _usable_image_candidate(normalized):
-            return urljoin(base_url, normalized)
-    return None
+        if not _usable_image_candidate(normalized):
+            continue
+        absolute = urljoin(base_url, normalized)
+        if absolute not in seen:
+            candidates.append(absolute)
+            seen.add(absolute)
+    return candidates
 
 
 def download_image(image_url, session=None, cache_dir=DEFAULT_IMAGE_CACHE_DIR, force_refresh=False):
@@ -535,14 +564,77 @@ def _css_font(value):
     return re.sub(r"[^a-zA-Z0-9 ,_-]", "", str(value or "Arial")).strip() or "Arial"
 
 
+def _attrs_to_dict(attrs_text):
+    attrs = {}
+    for match in ATTR_PATTERN.finditer(attrs_text or ""):
+        name = match.group("name").lower()
+        attrs[name] = html.unescape(match.group("value") or "").strip()
+    return attrs
+
+
+def _srcset_candidates(srcset):
+    candidates = []
+    for part in str(srcset or "").split(","):
+        values = part.strip().split()
+        if values:
+            candidates.append((values[0], _srcset_score(values[1] if len(values) > 1 else "")))
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return [url for url, _score in candidates]
+
+
+def _srcset_score(descriptor):
+    text = str(descriptor or "").strip().lower()
+    try:
+        if text.endswith("w"):
+            return float(text[:-1])
+        if text.endswith("x"):
+            return float(text[:-1]) * 1000
+    except ValueError:
+        return 0
+    return 0
+
+
+def _is_small_declared_image(attrs):
+    width = _declared_image_size(attrs.get("width"))
+    height = _declared_image_size(attrs.get("height"))
+    if width is None or height is None:
+        return False
+    return width < 160 or height < 100
+
+
+def _declared_image_size(value):
+    match = re.search(r"\d+", str(value or ""))
+    if not match:
+        return None
+    return int(match.group(0))
+
+
 def _usable_image_candidate(value):
     if not value:
         return False
-    lowered = value.lower()
+    text = str(value).strip()
+    lowered = text.lower()
     if lowered.startswith("data:"):
         return False
-    blocked = [".svg", "logo", "avatar", "icon", "spacer", "tracking"]
-    return not any(marker in lowered for marker in blocked)
+
+    parsed = urlparse(html.unescape(text))
+    path = unquote(parsed.path or text).lower()
+    filename = Path(path).name
+    if filename.endswith(".svg"):
+        return False
+    if any(marker in path for marker in ("/wp-content/themes/", "/wp-content/plugins/", "/assets/modals/")):
+        return False
+
+    stem = Path(filename).stem
+    tokens = {token for token in re.split(r"[^a-z0-9]+", stem) if token}
+    if any(marker in stem for marker in ("spacer", "tracking", "announcement")):
+        return False
+    if tokens and tokens <= {"logo", "logos", "avatar", "icon", "site", "brand"}:
+        return False
+    if ("logo" in tokens or "logos" in tokens) and len(tokens) <= 2:
+        return False
+
+    return True
 
 
 def _extension_for_mime(mime_type):

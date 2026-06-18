@@ -1,11 +1,11 @@
 {
-  "version": "1.0.6",
-  "release_date": "2026-06-15",
-  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.0.6/BV-maritime-intelligence-hub.exe",
+  "version": "1.0.7",
+  "release_date": "2026-06-18",
+  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.0.7/BV-maritime-intelligence-hub.exe",
   "changelog": [
-    "Make loop mode image generation honor the selected visual source, including Google Sheets.",
-    "Send Telegram cards from the selected source instead of always using the latest app brief.",
-    "Rename send-card actions to make selected-source behavior clear."
+    "Wait for Google Sheet L1 to match the current Vietnam morning or evening brief before generating Sheet-mode cards.",
+    "Make Sheet mode include every valid Google Sheet item and ignore image-card limits, published filters, and duplicate removal.",
+    "Add Vietnamese morning/evening brief labels to Telegram intro text and improve article image extraction diagnostics."
   ],
   "force_update": false
 }

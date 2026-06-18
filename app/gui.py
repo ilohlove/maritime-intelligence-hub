@@ -33,6 +33,7 @@ from app.services.combined_brief_source import (
     build_combined_brief,
     format_empty_combined_message,
     format_combined_stats,
+    get_sheet_run_status,
 )
 from app.services.source_master import ALLOWED_VALUES, append_manual_source
 from app.services.storage import DEFAULT_DB_PATH, count_rows, init_db, mark_items_published
@@ -647,7 +648,7 @@ class AppGUI:
             self._checkpoint("send Telegram")
             send_output, send_ok = self._retry_gui_step(
                 "send_telegram",
-                lambda: self._task_send_cards(card_result["cards_result"]["cards"]),
+                lambda: self._task_send_cards(card_result["cards_result"]["cards"], card_result.get("brief_label", label)),
             )
             lines.extend(["", send_output])
             if not send_ok:
@@ -718,7 +719,10 @@ class AppGUI:
     def _task_generate_and_send_combined_cards(self):
         result = self._retry_gui_step("generate_combined_image_cards", self._generate_combined_cards_result)
         cards = result["cards_result"]["cards"]
-        send_output, send_ok = self._retry_gui_step("send_telegram", lambda: self._task_send_cards(cards))
+        send_output, send_ok = self._retry_gui_step(
+            "send_telegram",
+            lambda: self._task_send_cards(cards, result.get("brief_label")),
+        )
         lines = [
             format_combined_stats(result["source_stats"], result["brief_path"]),
             "",
@@ -729,26 +733,34 @@ class AppGUI:
         return "\n".join(lines), send_ok
 
     def _generate_combined_cards_result(self):
+        source_mode = self.visual_source_mode_var.get().strip().lower()
+        sheet_ready = self._wait_for_sheet_if_needed(source_mode)
+        sheet_limit = None if source_mode == "sheet" else self._optional_limit(self.sheet_limit_var, self.sheet_limit_max_var)
+        card_limit = None if source_mode == "sheet" else self._optional_limit(self.card_limit_var, self.card_limit_max_var)
         source_result = build_combined_brief(
-            source_mode=self.visual_source_mode_var.get(),
+            source_mode=source_mode,
             sheet_url=self.sheet_url_var.get().strip(),
-            sheet_limit=self._optional_limit(self.sheet_limit_var, self.sheet_limit_max_var),
+            sheet_limit=sheet_limit,
             app_limit=self._optional_limit(self.app_limit_var, self.app_limit_max_var),
-            card_limit=self._optional_limit(self.card_limit_var, self.card_limit_max_var),
+            card_limit=card_limit,
             brief_path=DEFAULT_COMBINED_BRIEF_PATH,
         )
+        if sheet_ready:
+            source_result.stats.setdefault("sheet_source", {}).update(sheet_ready)
         if not source_result.payload.get("items"):
             raise RuntimeError(format_empty_combined_message(source_result.stats, source_result.brief_path))
         cards_result = generate_image_cards(
             "combined",
-            limit=self._optional_limit(self.card_limit_var, self.card_limit_max_var),
+            limit=card_limit,
             source_brief_path=source_result.brief_path,
             style_settings=self._visual_settings(),
         )
+        brief_label = (source_result.stats.get("sheet_source") or {}).get("run_label") or self._current_scan_label()
         return {
             "brief_path": source_result.brief_path,
             "source_stats": source_result.stats,
             "cards_result": cards_result,
+            "brief_label": brief_label,
         }
 
     def _format_card_result(self, result):
@@ -961,11 +973,11 @@ class AppGUI:
         )
         output, ok = self._retry_gui_step(
             "send_telegram",
-            lambda: self._task_send_cards(result["cards_result"]["cards"]),
+            lambda: self._task_send_cards(result["cards_result"]["cards"], result.get("brief_label")),
         )
         return f"{self._format_selected_source_cards_result(result)}\n\n{output}", ok
 
-    def _task_send_cards(self, cards):
+    def _task_send_cards(self, cards, brief_label=None):
         token = self.telegram_bot_token_var.get().strip()
         chat_ids = self._telegram_chat_ids()
         if not token or not chat_ids:
@@ -974,7 +986,7 @@ class AppGUI:
         ok = True
         total_sent = 0
         successful_chat_ids = []
-        intro_text = self._telegram_intro_text()
+        intro_text = self._telegram_intro_text(brief_label)
         for chat_id in chat_ids:
             try:
                 if intro_text:
@@ -1044,6 +1056,43 @@ class AppGUI:
                 label = self._scan_label_for_time(scheduled)
                 return label, f"{scheduled.date()}-{time_text}"
         return None, None
+
+    def _wait_for_sheet_if_needed(self, source_mode):
+        if str(source_mode or "").strip().lower() != "sheet":
+            return {}
+        sheet_url = self.sheet_url_var.get().strip()
+        if not sheet_url:
+            return {}
+
+        expected_label = self._current_scan_label()
+        while True:
+            self._checkpoint("wait for Google Sheet L1")
+            now = self._vietnam_now()
+            status = get_sheet_run_status(sheet_url)
+            marker = status.get("run_marker", "")
+            sheet_label = status.get("run_label", "")
+            ready = sheet_label == expected_label
+            wait_status = {
+                "run_marker": marker,
+                "run_label": sheet_label,
+                "expected_run_label": expected_label,
+                "vietnam_now": now.strftime("%Y-%m-%d %H:%M:%S +07"),
+                "sheet_ready": ready,
+            }
+            if ready:
+                return wait_status
+
+            message = (
+                "Google Sheet is not ready for the current brief window.\n"
+                f"Vietnam time: {wait_status['vietnam_now']} ({expected_label})\n"
+                f"Sheet L1: {marker} ({sheet_label})\n"
+                "Waiting 60 seconds before checking again."
+            )
+            logger.info(message.replace("\n", " "))
+            if hasattr(self, "root") and hasattr(self, "output_box"):
+                self.root.after(0, self._set_text, self.output_box, message, True)
+                self.root.after(0, self.summary_var.set, "Waiting for Google Sheet L1")
+            self._sleep_with_controls(60)
 
     def _update_next_run_label(self):
         if hasattr(self, "auto_run_var") and not self.auto_run_var.get():
@@ -1259,6 +1308,9 @@ class AppGUI:
     def _schedule_now(self):
         return datetime.now(timezone.utc).astimezone(self._schedule_timezone())
 
+    def _vietnam_now(self):
+        return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=7)))
+
     def _scan_label_for_time(self, scheduled_time):
         return "morning" if scheduled_time.hour < 12 else "evening"
 
@@ -1307,8 +1359,7 @@ class AppGUI:
         return "rule-based-mock"
 
     def _current_scan_label(self):
-        now = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=7)))
-        return self._scan_label_for_time(now)
+        return self._scan_label_for_time(self._vietnam_now())
 
     def _int_var(self, variable, default):
         try:
@@ -1346,15 +1397,28 @@ class AppGUI:
                 chat_ids.append(value)
         return chat_ids
 
-    def _telegram_intro_text(self):
+    def _brief_label_text(self, brief_label=None):
+        label = (brief_label or self._current_scan_label() or "").strip().lower()
+        if label == "morning":
+            return "Bản tin buổi sáng"
+        if label == "evening":
+            return "Bản tin buổi tối"
+        return "Bản tin"
+
+    def _telegram_intro_text(self, brief_label=None):
         template = (self.telegram_intro_text_var.get() or "{date}").strip()
         if not template:
             return ""
-        now = datetime.now()
-        return (
+        now = self._vietnam_now()
+        brief_text = self._brief_label_text(brief_label)
+        rendered = (
             template.replace("{date}", now.strftime("%d/%m/%Y"))
             .replace("{datetime}", now.strftime("%d/%m/%Y %H:%M"))
+            .replace("{brief_label}", brief_text)
         )
+        if "{brief_label}" not in template and brief_text not in rendered:
+            rendered = f"{brief_text}\n{rendered}"
+        return rendered
 
     def _check_update_on_startup(self):
         self._start_update_check(is_manual=False)

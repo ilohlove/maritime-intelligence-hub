@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.7 - 2026-06-18
+
+- Wait for Google Sheet L1 to match the current Vietnam morning or evening brief before generating Sheet-mode cards.
+- Make Sheet mode include every valid Google Sheet item and ignore image-card limits, published filters, and duplicate removal.
+- Add Vietnamese morning/evening brief labels to Telegram intro text and improve article image extraction diagnostics.
+
 ## v1.0.6 - 2026-06-15
 
 - Make loop mode image generation honor the selected visual source, including Google Sheets.

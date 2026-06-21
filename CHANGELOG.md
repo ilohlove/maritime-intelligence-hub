@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.8 - 2026-06-21
+
+- Add Facebook Page publishing with dry-run preview, Page checks, multi-photo posting, and publish ledger metadata.
+- Replace the default Facebook caption with the Vietnamese Maritime Brief morning/evening format and hashtags.
+- Improve Facebook preview/post diagnostics so card generation, token, permission, and publish safety errors are shown without Python tracebacks.
+
 ## v1.0.7 - 2026-06-18
 
 - Wait for Google Sheet L1 to match the current Vietnam morning or evening brief before generating Sheet-mode cards.

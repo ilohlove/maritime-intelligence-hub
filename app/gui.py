@@ -23,8 +23,11 @@ from app.services.pipeline import (
     write_scan_brief,
 )
 from app.services.runtime_settings import (
+    DEFAULT_FACEBOOK_INTRO_TEXT,
+    facebook_brief_label_text,
     load_ai_env,
     load_runtime_settings,
+    render_facebook_intro_text,
     save_ai_env,
     save_runtime_settings,
 )
@@ -35,6 +38,7 @@ from app.services.combined_brief_source import (
     format_combined_stats,
     get_sheet_run_status,
 )
+from app.services.facebook_publisher import check_page, publish_photo_post, validate_cards_publish_safety
 from app.services.source_master import ALLOWED_VALUES, append_manual_source
 from app.services.storage import DEFAULT_DB_PATH, count_rows, init_db, mark_items_published
 from app.services.telegram_publisher import check_bot, check_chat, send_message, send_photos
@@ -139,6 +143,12 @@ class AppGUI:
         self.telegram_chat_id_var = ctk.StringVar(value=self._initial_telegram_chat_ids(publish))
         self.telegram_bot_token_var = ctk.StringVar(value=self.env.get("TELEGRAM_BOT_TOKEN", ""))
         self.telegram_intro_text_var = ctk.StringVar(value=publish.get("telegram_intro_text") or "{date}")
+        self.facebook_page_id_var = ctk.StringVar(value=self.env.get("FACEBOOK_PAGE_ID", ""))
+        self.facebook_page_access_token_var = ctk.StringVar(value=self.env.get("FACEBOOK_PAGE_ACCESS_TOKEN", ""))
+        self.facebook_intro_text_var = ctk.StringVar(
+            value=publish.get("facebook_intro_text") or DEFAULT_FACEBOOK_INTRO_TEXT
+        )
+        self.facebook_dry_run_var = ctk.BooleanVar(value=bool(publish.get("facebook_dry_run", True)))
 
     def _build_layout(self):
         self.root.grid_columnconfigure(0, weight=1)
@@ -429,14 +439,21 @@ class AppGUI:
         telegram_row.grid(row=3, column=1, sticky="w", padx=10, pady=6)
         ctk.CTkCheckBox(telegram_row, text="Gửi Telegram", variable=self.send_telegram_var).pack(side="left")
         ctk.CTkButton(telegram_row, text="⚙", width=44, command=self._open_telegram_dialog).pack(side="left", padx=(10, 0))
-        ctk.CTkCheckBox(panel, text="Đăng Facebook", variable=self.post_facebook_var).grid(
-            row=4, column=1, sticky="w", padx=10, pady=6
-        )
+        facebook_row = ctk.CTkFrame(panel, fg_color="transparent")
+        facebook_row.grid(row=4, column=1, sticky="w", padx=10, pady=6)
+        ctk.CTkCheckBox(facebook_row, text="Đăng Facebook", variable=self.post_facebook_var).pack(side="left")
+        ctk.CTkButton(facebook_row, text="FB", width=44, command=self._open_facebook_dialog).pack(side="left", padx=(10, 0))
         ctk.CTkButton(panel, text="Save Publish Settings", width=180, command=self._save_settings).grid(
             row=6, column=1, sticky="w", padx=10, pady=12
         )
         ctk.CTkButton(panel, text="Send Selected Source Cards", width=210, command=self._send_latest_cards).grid(
             row=6, column=1, sticky="w", padx=(210, 10), pady=12
+        )
+        ctk.CTkButton(panel, text="Preview Facebook", width=160, command=self._preview_facebook_post).grid(
+            row=7, column=1, sticky="w", padx=10, pady=(0, 12)
+        )
+        ctk.CTkButton(panel, text="Post Facebook", width=150, command=self._post_facebook_now).grid(
+            row=7, column=1, sticky="w", padx=(185, 10), pady=(0, 12)
         )
 
     def _build_logs_tab(self):
@@ -519,6 +536,8 @@ class AppGUI:
                 "telegram_chat_id": self._telegram_chat_ids()[0] if self._telegram_chat_ids() else "",
                 "telegram_chat_ids": self._telegram_chat_ids(),
                 "telegram_intro_text": self.telegram_intro_text_var.get().strip() or "{date}",
+                "facebook_intro_text": self.facebook_intro_text_var.get().strip() or DEFAULT_FACEBOOK_INTRO_TEXT,
+                "facebook_dry_run": self.facebook_dry_run_var.get(),
             },
         }
         save_runtime_settings(self.settings)
@@ -529,6 +548,8 @@ class AppGUI:
         elif provider == "gemini":
             env_values.update({"GEMINI_MODEL": self.model_var.get(), "GEMINI_API_KEY": self.api_key_var.get()})
         env_values["TELEGRAM_BOT_TOKEN"] = self.telegram_bot_token_var.get().strip()
+        env_values["FACEBOOK_PAGE_ID"] = self.facebook_page_id_var.get().strip()
+        env_values["FACEBOOK_PAGE_ACCESS_TOKEN"] = self.facebook_page_access_token_var.get().strip()
         env_values["AI_REQUEST_DELAY_SECONDS"] = str(self._float_var(self.ai_request_delay_var, 1.5))
         env_values["AI_RETRY_ATTEMPTS"] = str(self._int_var(self.ai_retry_attempts_var, 2))
         save_ai_env(env_values)
@@ -634,15 +655,17 @@ class AppGUI:
             f"Markdown: {brief['markdown_path']}",
             f"Latest: {brief['latest_markdown_path']}",
         ]
+        send_telegram = self._var_bool("send_telegram_var", False)
+        post_facebook = self._var_bool("post_facebook_var", False)
         card_result = None
-        if self.create_image_cards_var.get() or self.send_telegram_var.get():
+        if self.create_image_cards_var.get() or send_telegram or post_facebook:
             self._checkpoint("generate image cards")
             card_result = self._retry_gui_step(
                 "generate_selected_source_image_cards",
                 self._generate_selected_source_cards_result,
             )
             lines.extend(["", self._format_selected_source_cards_result(card_result)])
-        if self.send_telegram_var.get():
+        if send_telegram:
             if not card_result:
                 return "\n".join(lines + ["Telegram skipped: no image cards generated"]), False
             self._checkpoint("send Telegram")
@@ -652,6 +675,21 @@ class AppGUI:
             )
             lines.extend(["", send_output])
             if not send_ok:
+                return "\n".join(lines), False
+        if post_facebook:
+            if not card_result:
+                return "\n".join(lines + ["Facebook skipped: no image cards generated"]), False
+            self._checkpoint("post Facebook")
+            facebook_output, facebook_ok = self._retry_gui_step(
+                "post_facebook",
+                lambda: self._task_post_facebook_cards(
+                    card_result["cards_result"]["cards"],
+                    card_result.get("brief_label", label),
+                    dry_run=self._var_bool("facebook_dry_run_var", True),
+                ),
+            )
+            lines.extend(["", facebook_output])
+            if not facebook_ok:
                 return "\n".join(lines), False
         return "\n".join(lines), True
 
@@ -1005,6 +1043,150 @@ class AppGUI:
         lines.insert(0, f"Telegram total sent photos: {total_sent}")
         return "\n".join(lines), ok
 
+    def _open_facebook_dialog(self):
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Facebook Setup")
+        dialog.geometry("720x430")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.grid_columnconfigure(1, weight=1)
+
+        self._dialog_entry(dialog, "Page ID", self.facebook_page_id_var, 0, width=360)
+        self._dialog_entry(dialog, "Page access token", self.facebook_page_access_token_var, 1, width=420, show="*")
+        self._dialog_entry(dialog, "Caption template", self.facebook_intro_text_var, 2, width=520)
+        ctk.CTkCheckBox(dialog, text="Dry-run only", variable=self.facebook_dry_run_var).grid(
+            row=3, column=1, sticky="w", padx=10, pady=8
+        )
+
+        help_text = (
+            "Use a Facebook Page access token with publishing permission. "
+            "Dry-run creates cards and shows the payload without posting."
+        )
+        ctk.CTkLabel(dialog, text=help_text, text_color=("gray35", "gray75"), wraplength=620, justify="left").grid(
+            row=4, column=0, columnspan=2, sticky="ew", padx=16, pady=(12, 4)
+        )
+
+        actions = ctk.CTkFrame(dialog, fg_color="transparent")
+        actions.grid(row=5, column=0, columnspan=2, sticky="e", padx=16, pady=18)
+        ctk.CTkButton(actions, text="Test Page", width=100, command=self._test_facebook_page).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="Preview", width=100, command=self._preview_facebook_post).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="Post", width=90, command=self._post_facebook_now).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="Save", width=90, command=lambda: self._save_facebook_dialog(dialog)).pack(
+            side="right"
+        )
+        ctk.CTkButton(actions, text="Close", width=90, fg_color=("gray70", "gray30"), command=dialog.destroy).pack(
+            side="right", padx=(0, 8)
+        )
+
+    def _save_facebook_dialog(self, dialog):
+        self._save_settings()
+        dialog.destroy()
+
+    def _test_facebook_page(self):
+        page_id = self.facebook_page_id_var.get().strip()
+        token = self.facebook_page_access_token_var.get().strip()
+        if not page_id or not token:
+            messagebox.showwarning("Facebook", "Page ID or Page access token is empty.", parent=self.root)
+            return
+        self._run_background("Checking Facebook page", lambda: self._task_check_facebook_page(page_id, token))
+
+    def _task_check_facebook_page(self, page_id, token):
+        token_warning = self._facebook_token_warning(token)
+        try:
+            page = check_page(page_id, token)
+            lines = [f"Facebook page OK: {page.get('name') or page.get('id')}"]
+            if token_warning:
+                lines.append(token_warning)
+            return "\n".join(lines), True
+        except Exception as exc:
+            return "Facebook page check failed:\n" + self._format_facebook_error(exc, token), False
+
+    def _preview_facebook_post(self):
+        self._save_settings()
+        self._run_background("Previewing Facebook post", lambda: self._task_preview_facebook_post())
+
+    def _task_preview_facebook_post(self):
+        result, error = self._generate_facebook_cards_or_error()
+        if error:
+            return error, False
+        output, ok = self._task_post_facebook_cards(
+            result["cards_result"]["cards"],
+            result.get("brief_label"),
+            dry_run=True,
+        )
+        return f"{self._format_selected_source_cards_result(result)}\n\n{output}", ok
+
+    def _post_facebook_now(self):
+        self._save_settings()
+        self._run_background("Posting Facebook cards", lambda: self._task_post_facebook_now())
+
+    def _task_post_facebook_now(self):
+        result, error = self._generate_facebook_cards_or_error()
+        if error:
+            return error, False
+        output, ok = self._task_post_facebook_cards(
+            result["cards_result"]["cards"],
+            result.get("brief_label"),
+            dry_run=self.facebook_dry_run_var.get(),
+        )
+        return f"{self._format_selected_source_cards_result(result)}\n\n{output}", ok
+
+    def _generate_facebook_cards_or_error(self):
+        try:
+            result = self._retry_gui_step(
+                "generate_selected_source_image_cards",
+                self._generate_selected_source_cards_result,
+            )
+            return result, None
+        except Exception as exc:
+            return None, self._format_facebook_card_generation_error(exc)
+
+    def _format_facebook_card_generation_error(self, exc):
+        message = str(exc or "").strip() or exc.__class__.__name__
+        return "Facebook skipped: could not generate image cards.\n" + message
+
+    def _task_post_facebook_cards(self, cards, brief_label=None, dry_run=None):
+        page_id = self.facebook_page_id_var.get().strip()
+        token = self.facebook_page_access_token_var.get().strip()
+        if not page_id or not token:
+            return "Facebook skipped: Page ID or Page access token is empty.", False
+
+        safety = validate_cards_publish_safety(cards)
+        if not safety["ready"]:
+            return "Facebook skipped: publish safety failed.\n" + self._format_errors(safety["errors"]), False
+
+        effective_dry_run = self.facebook_dry_run_var.get() if dry_run is None else bool(dry_run)
+        message = self._facebook_intro_text(brief_label)
+        try:
+            result = publish_photo_post(page_id, token, cards, message, dry_run=effective_dry_run)
+        except Exception as exc:
+            uploaded = getattr(exc, "uploaded_photo_ids", None)
+            suffix = f"\nUploaded photo IDs before failure: {', '.join(uploaded)}" if uploaded else ""
+            return f"Facebook post failed:\n{self._format_facebook_error(exc, token)}{suffix}", False
+
+        if result.get("dry_run"):
+            lines = [
+                "Facebook dry-run: no post created",
+                f"Page ID: {result['page_id']}",
+                f"Photos: {len(result['image_paths'])}",
+                "Caption:",
+                result.get("message") or "",
+                "Images:",
+            ]
+            lines.extend(f"- {path}" for path in result["image_paths"])
+            return "\n".join(lines), True
+
+        post_id = result.get("post_id") or ""
+        saved = mark_items_published(cards, facebook_page_id=page_id, facebook_post_id=post_id)
+        mode = "fallback single-photo posts" if result.get("fallback") else "multi-photo post"
+        lines = [
+            f"Facebook published: {mode}",
+            f"Post ID: {post_id or 'unknown'}",
+            f"Uploaded photos: {len(result.get('uploaded_photo_ids') or [])}",
+            f"Published ledger updated: {saved} items",
+        ]
+        return "\n".join(lines), True
+
     def _check_api_key(self):
         self._save_settings()
         provider = self.provider_var.get()
@@ -1210,7 +1392,7 @@ class AppGUI:
         if "image cards" in title.lower() or "combined cards" in title.lower() or "combined sources" in title.lower():
             self._set_text(self.visual_box, output, disabled=True)
         if ok is False:
-            messagebox.showwarning("Task Failed", "The task did not complete successfully. See output for details.", parent=self.root)
+            messagebox.showwarning("Task Failed", self._task_failure_popup_message(title, output), parent=self.root)
 
     def _set_actions_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
@@ -1378,8 +1560,72 @@ class AppGUI:
         except (TypeError, ValueError):
             return default
 
+    def _var_bool(self, attr_name, default=False):
+        variable = getattr(self, attr_name, None)
+        if variable is None:
+            return default
+        try:
+            return bool(variable.get())
+        except AttributeError:
+            return bool(variable)
+
     def _format_errors(self, errors):
         return "\n".join(f"- {error}" for error in errors)
+
+    def _task_failure_popup_message(self, title, output):
+        if "facebook" in str(title or "").strip().lower():
+            text = self._facebook_popup_text(output)
+            if text:
+                return self._truncate_popup_text(text)
+        return "The task did not complete successfully. See output for details."
+
+    def _facebook_popup_text(self, output):
+        text = str(output or "").strip()
+        for marker in [
+            "Facebook page check failed:",
+            "Facebook post failed:",
+            "Facebook skipped:",
+        ]:
+            index = text.find(marker)
+            if index >= 0:
+                return text[index:].strip()
+        return text
+
+    def _truncate_popup_text(self, text, max_length=900):
+        text = str(text or "").strip()
+        if len(text) <= max_length:
+            return text
+        return text[: max_length - 3].rstrip() + "..."
+
+    def _format_facebook_error(self, exc, token=None):
+        lines = [str(exc)]
+        details = []
+        for label, attr in [
+            ("status_code", "status_code"),
+            ("error_type", "error_type"),
+            ("error_code", "error_code"),
+        ]:
+            value = getattr(exc, attr, None)
+            if value not in (None, ""):
+                details.append(f"{label}={value}")
+        if details:
+            lines.append("Facebook details: " + ", ".join(details))
+
+        warning = self._facebook_token_warning(token)
+        if warning:
+            lines.append(warning)
+        if getattr(exc, "error_code", None) == 190:
+            lines.append(
+                "Action: create a new Facebook Page access token for this Page, "
+                "then update FACEBOOK_PAGE_ACCESS_TOKEN in .env or Facebook Setup."
+            )
+        return "\n".join(lines)
+
+    def _facebook_token_warning(self, token):
+        token_text = str(token or "").strip()
+        if token_text and len(token_text) < 50:
+            return "Warning: Facebook Page access token looks too short to be valid."
+        return ""
 
     def _initial_telegram_chat_ids(self, publish):
         chat_ids = publish.get("telegram_chat_ids") or []
@@ -1398,12 +1644,7 @@ class AppGUI:
         return chat_ids
 
     def _brief_label_text(self, brief_label=None):
-        label = (brief_label or self._current_scan_label() or "").strip().lower()
-        if label == "morning":
-            return "Bản tin buổi sáng"
-        if label == "evening":
-            return "Bản tin buổi tối"
-        return "Bản tin"
+        return facebook_brief_label_text(brief_label or self._current_scan_label(), now=self._vietnam_now())
 
     def _telegram_intro_text(self, brief_label=None):
         template = (self.telegram_intro_text_var.get() or "{date}").strip()
@@ -1419,6 +1660,13 @@ class AppGUI:
         if "{brief_label}" not in template and brief_text not in rendered:
             rendered = f"{brief_text}\n{rendered}"
         return rendered
+
+    def _facebook_intro_text(self, brief_label=None):
+        return render_facebook_intro_text(
+            self.facebook_intro_text_var.get(),
+            brief_label=brief_label,
+            now=self._vietnam_now(),
+        )
 
     def _check_update_on_startup(self):
         self._start_update_check(is_manual=False)

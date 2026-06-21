@@ -2,7 +2,9 @@ import argparse
 import sys
 
 from app.logger import logger
+from app.services.combined_brief_source import DEFAULT_COMBINED_BRIEF_PATH, build_combined_brief, format_combined_stats
 from app.services.evernote_summarizer import summarize_article_id_with_evernote, summarize_candidates_with_evernote
+from app.services.facebook_publisher import publish_photo_post, validate_cards_publish_safety
 from app.services.pipeline import (
     DEFAULT_SOURCE_MASTER,
     build_fetch_plan,
@@ -18,6 +20,8 @@ from app.services.pipeline import (
     validate_sources,
     write_brief,
 )
+from app.services.runtime_settings import load_ai_env, load_runtime_settings, render_facebook_intro_text
+from app.services.storage import mark_items_published
 from app.services.visual_brief_renderer import generate_image_cards
 
 
@@ -85,6 +89,9 @@ def run_cli(argv=None):
     image_cards_parser.add_argument("--output-dir")
     image_cards_parser.add_argument("--force-refresh-images", action="store_true")
     image_cards_parser.add_argument("--open-preview", action="store_true")
+
+    facebook_parser = subparsers.add_parser("post-facebook")
+    facebook_parser.add_argument("--dry-run", action="store_true")
 
     pipeline_parser = subparsers.add_parser("run-pipeline")
     pipeline_parser.add_argument("--source-master", default=str(DEFAULT_SOURCE_MASTER))
@@ -265,6 +272,9 @@ def run_cli(argv=None):
         print(f"Preview: {result['preview_path']}")
         return 0
 
+    if args.command == "post-facebook":
+        return _post_facebook_from_cli(dry_run=args.dry_run)
+
     if args.command == "run-pipeline":
         result = _run_scan(args)
         return 0 if result else 1
@@ -318,6 +328,75 @@ def _run_scan(args):
 
 def format_errors(errors):
     return "\n".join(f"- {error}" for error in errors)
+
+
+def _post_facebook_from_cli(dry_run=False):
+    settings = load_runtime_settings()
+    env = load_ai_env()
+    page_id = env.get("FACEBOOK_PAGE_ID", "").strip()
+    token = env.get("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
+    if not page_id or not token:
+        print("Facebook skipped: FACEBOOK_PAGE_ID or FACEBOOK_PAGE_ACCESS_TOKEN is empty.")
+        return 1
+
+    visual = settings.get("visual", {})
+    source_mode = str(visual.get("source_mode") or "combined").strip().lower()
+    result = build_combined_brief(
+        source_mode=source_mode,
+        sheet_url=visual.get("sheet_url", ""),
+        sheet_limit=None if source_mode == "sheet" or visual.get("sheet_limit_max", True) else int(visual.get("sheet_limit") or 20),
+        app_limit=None if visual.get("app_limit_max", True) else int(visual.get("app_limit") or 20),
+        card_limit=None if source_mode == "sheet" or visual.get("card_limit_max", True) else int(visual.get("card_limit") or 12),
+        brief_path=DEFAULT_COMBINED_BRIEF_PATH,
+    )
+    if not result.payload.get("items"):
+        print(format_combined_stats(result.stats, result.brief_path))
+        print("Facebook skipped: no image cards to publish.")
+        return 1
+
+    card_limit = None if source_mode == "sheet" or visual.get("card_limit_max", True) else int(visual.get("card_limit") or 12)
+    cards_result = generate_image_cards(
+        "combined",
+        limit=card_limit,
+        source_brief_path=result.brief_path,
+        style_settings=visual,
+    )
+    cards = cards_result["cards"]
+    safety = validate_cards_publish_safety(cards)
+    if not safety["ready"]:
+        print("Facebook skipped: publish safety failed.")
+        print(format_errors(safety["errors"]))
+        return 1
+
+    publish = settings.get("publish", {})
+    message = _render_facebook_intro_text(publish.get("facebook_intro_text"), result.payload.get("scan_label"))
+    try:
+        publish_result = publish_photo_post(page_id, token, cards, message, dry_run=dry_run)
+    except Exception as exc:
+        uploaded = getattr(exc, "uploaded_photo_ids", None)
+        print(f"Facebook post failed: {exc}")
+        if uploaded:
+            print(f"Uploaded photo IDs before failure: {', '.join(uploaded)}")
+        return 1
+
+    print(format_combined_stats(result.stats, result.brief_path))
+    print("")
+    print(f"Generated image cards: {cards_result['items']}")
+    print(f"Output: {cards_result['output_dir']}")
+    if publish_result.get("dry_run"):
+        print("Facebook dry-run: no post created")
+        print(f"Photos: {len(publish_result['image_paths'])}")
+        return 0
+
+    post_id = publish_result.get("post_id") or ""
+    saved = mark_items_published(cards, facebook_page_id=page_id, facebook_post_id=post_id)
+    print(f"Facebook published: {post_id or 'unknown post id'}")
+    print(f"Published ledger updated: {saved} items")
+    return 0
+
+
+def _render_facebook_intro_text(template, brief_label=None):
+    return render_facebook_intro_text(template, brief_label=brief_label)
 
 
 def _configure_console_encoding():

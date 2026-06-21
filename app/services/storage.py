@@ -145,6 +145,8 @@ def init_db(db_path=DEFAULT_DB_PATH):
                 published_at TEXT,
                 sent_at TEXT NOT NULL,
                 telegram_chat_id TEXT,
+                facebook_page_id TEXT,
+                facebook_post_id TEXT,
                 payload_json TEXT NOT NULL
             );
 
@@ -161,6 +163,8 @@ def init_db(db_path=DEFAULT_DB_PATH):
         _ensure_column(conn, "article_summaries", "source_name", "TEXT")
         _ensure_column(conn, "article_summaries", "original_url", "TEXT")
         _ensure_column(conn, "published_items", "telegram_chat_id", "TEXT")
+        _ensure_column(conn, "published_items", "facebook_page_id", "TEXT")
+        _ensure_column(conn, "published_items", "facebook_post_id", "TEXT")
 
 
 def _ensure_column(conn, table, column, column_type):
@@ -512,7 +516,7 @@ def list_published_item_keys(db_path=DEFAULT_DB_PATH):
     return [dict(row) for row in rows]
 
 
-def mark_items_published(items, telegram_chat_id="", db_path=DEFAULT_DB_PATH):
+def mark_items_published(items, telegram_chat_id="", facebook_page_id="", facebook_post_id="", db_path=DEFAULT_DB_PATH):
     init_db(db_path)
     now = utc_now()
     saved = 0
@@ -525,12 +529,24 @@ def mark_items_published(items, telegram_chat_id="", db_path=DEFAULT_DB_PATH):
                 """
                 INSERT INTO published_items (
                     item_key, canonical_url, title_hash, title, source_name,
-                    source_type, published_at, sent_at, telegram_chat_id, payload_json
+                    source_type, published_at, sent_at, telegram_chat_id,
+                    facebook_page_id, facebook_post_id, payload_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(item_key) DO UPDATE SET
                     sent_at=excluded.sent_at,
-                    telegram_chat_id=excluded.telegram_chat_id,
+                    telegram_chat_id=CASE
+                        WHEN excluded.telegram_chat_id != '' THEN excluded.telegram_chat_id
+                        ELSE published_items.telegram_chat_id
+                    END,
+                    facebook_page_id=CASE
+                        WHEN excluded.facebook_page_id != '' THEN excluded.facebook_page_id
+                        ELSE published_items.facebook_page_id
+                    END,
+                    facebook_post_id=CASE
+                        WHEN excluded.facebook_post_id != '' THEN excluded.facebook_post_id
+                        ELSE published_items.facebook_post_id
+                    END,
                     payload_json=excluded.payload_json
                 """,
                 (
@@ -543,6 +559,8 @@ def mark_items_published(items, telegram_chat_id="", db_path=DEFAULT_DB_PATH):
                     item.get("published_at"),
                     now,
                     str(telegram_chat_id or ""),
+                    str(facebook_page_id or ""),
+                    str(facebook_post_id or ""),
                     json.dumps(item, ensure_ascii=False),
                 ),
             )

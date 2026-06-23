@@ -25,7 +25,7 @@ FACEBOOK_HASHTAGS = [
     "#ChiefOfficer",
     "#MerchantNavy",
 ]
-DEFAULT_FACEBOOK_INTRO_TEXT = "\n".join(
+PREVIOUS_DEFAULT_FACEBOOK_INTRO_TEXT = "\n".join(
     [
         "{facebook_title}",
         "",
@@ -37,6 +37,15 @@ DEFAULT_FACEBOOK_INTRO_TEXT = "\n".join(
         "Để không bỏ lỡ bài Điểm tin nào, bạn có thể Theo dõi tớ và chọn Xem trước.",
         "",
         *FACEBOOK_HASHTAGS,
+    ]
+)
+DEFAULT_FACEBOOK_INTRO_TEXT = "\n".join(
+    [
+        "Tóm tắt nhanh cho anh em những chuyển động đáng chú ý nhất của ngành trong nửa ngày qua.",
+        "",
+        "Khung giờ phát sóng: 7:30 và 19:30 mỗi ngày.",
+        "",
+        "Nhớ ấn Follow và thêm trang vào Yêu thích để không bỏ sót bất kỳ bản tin quan trọng nào nha!",
     ]
 )
 
@@ -209,7 +218,10 @@ def _facebook_template_or_default(template):
 
 
 def _is_legacy_facebook_template(template):
-    return str(template or "").strip() == LEGACY_FACEBOOK_INTRO_TEXT
+    return str(template or "").strip() in {
+        LEGACY_FACEBOOK_INTRO_TEXT,
+        PREVIOUS_DEFAULT_FACEBOOK_INTRO_TEXT,
+    }
 
 
 def _facebook_period(brief_label=None, now=None):

@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import html
 import json
 import re
 from dataclasses import dataclass
@@ -25,6 +26,9 @@ DEFAULT_COMBINED_BRIEF_PATH = ROOT_DIR / "output" / "briefs" / "combined_brief.j
 REQUEST_TIMEOUT = 30
 FUZZY_TITLE_THRESHOLD = 0.88
 SHEET_RUN_MARKER_COLUMN_INDEX = 11
+HTML_HREF_PATTERN = re.compile(r"""href\s*=\s*["'](?P<url>https?://[^"']+)["']""", re.IGNORECASE)
+MARKDOWN_LINK_PATTERN = re.compile(r"\[[^\]]*\]\((?P<url>https?://[^)\s]+)\)")
+PLAIN_URL_PATTERN = re.compile(r"https?://[^\s<>()\]\[\"']+")
 
 
 @dataclass
@@ -190,7 +194,7 @@ def sheet_row_to_item(row, index):
     title = first_value(row, "Vietnamese translation", "Headline")
     summary = first_value(row, "Main summary (Vietnamese)", "Main summary")
     impact_note = first_value(row, "Why it matters (Vietnamese)", "Why it matters")
-    original_url = first_value(row, "Source URL")
+    original_url = normalize_source_url(first_value(row, "Source URL"))
     source_name = first_value(row, "Source")
     if not title or not original_url:
         return None
@@ -350,7 +354,7 @@ def sheet_csv_export_url(sheet_url):
 
 
 def canonicalize_url(value):
-    text = str(value or "").strip()
+    text = normalize_source_url(value)
     if not text:
         return ""
     parsed = urlparse(text)
@@ -370,6 +374,26 @@ def canonicalize_url(value):
             "",
         )
     )
+
+
+def normalize_source_url(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    html_match = HTML_HREF_PATTERN.search(text)
+    if html_match:
+        return html.unescape(html_match.group("url")).strip()
+
+    markdown_match = MARKDOWN_LINK_PATTERN.search(text)
+    if markdown_match:
+        return markdown_match.group("url").strip()
+
+    plain_match = PLAIN_URL_PATTERN.search(text)
+    if plain_match:
+        return plain_match.group(0).rstrip(".,;")
+
+    return text
 
 
 def normalize_title(value):

@@ -13,6 +13,8 @@ from app.services.storage import log_fetch, upsert_article, utc_now
 
 USER_AGENT = "MaritimeIntelligenceHub/1.0 (+source-metadata-only MVP)"
 REQUEST_TIMEOUT = 15
+LINK_PATTERN = re.compile(r"<link\b(?P<attrs>[^>]*)>", re.IGNORECASE)
+ATTR_PATTERN = re.compile(r"(?P<name>[\w:-]+)\s*=\s*(['\"])(?P<value>.*?)\2", re.IGNORECASE)
 
 
 def fetch_rss_sources(sources, limit_per_source=10, db_path=None):
@@ -64,16 +66,20 @@ def discover_feed_url(website, session=None):
     response.raise_for_status()
     html_text = response.text
 
-    link_pattern = re.compile(
-        r"<link[^>]+(?:type=[\"']application/(?:rss|atom)\+xml[\"'][^>]*|rel=[\"']alternate[\"'][^>]*)>",
-        re.IGNORECASE,
-    )
-    href_pattern = re.compile(r"href=[\"']([^\"']+)[\"']", re.IGNORECASE)
+    candidates = []
+    for attrs in _link_attrs(html_text):
+        content_type = attrs.get("type", "").lower()
+        href = attrs.get("href", "")
+        if href and content_type in {"application/rss+xml", "application/atom+xml"}:
+            candidates.append(urljoin(website, href))
 
-    for match in link_pattern.finditer(html_text):
-        href_match = href_pattern.search(match.group(0))
-        if href_match:
-            return urljoin(website, html.unescape(href_match.group(1)))
+    for candidate in candidates:
+        try:
+            candidate_response = session.get(candidate, timeout=REQUEST_TIMEOUT, headers=_headers())
+            if candidate_response.ok and _looks_like_feed(candidate_response.text):
+                return candidate
+        except requests.RequestException:
+            continue
 
     common_paths = ["/feed", "/rss", "/rss.xml", "/feed.xml"]
     for path in common_paths:
@@ -86,6 +92,14 @@ def discover_feed_url(website, session=None):
             continue
 
     return None
+
+
+def _link_attrs(html_text):
+    for match in LINK_PATTERN.finditer(html_text or ""):
+        attrs = {}
+        for attr_match in ATTR_PATTERN.finditer(match.group("attrs") or ""):
+            attrs[attr_match.group("name").lower()] = html.unescape(attr_match.group("value") or "").strip()
+        yield attrs
 
 
 def parse_rss_items(xml_text, source, feed_url=None):

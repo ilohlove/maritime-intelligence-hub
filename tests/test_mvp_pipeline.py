@@ -20,7 +20,7 @@ from app.services.evernote_summarizer import (
     summarize_article_with_evernote,
 )
 from app.services.html_collector import fetch_html_source, parse_html_articles
-from app.services.rss_collector import fetch_rss_source, parse_rss_items
+from app.services.rss_collector import discover_feed_url, fetch_rss_source, parse_rss_items
 from app.services.scoring import calculate_importance_score
 from app.services.source_master import load_sources
 from app.services.storage import (
@@ -133,6 +133,28 @@ class MvpPipelineTests(unittest.TestCase):
             result = fetch_rss_source(source, db_path=db_path, session=session)
 
             self.assertEqual(result["status"], "error")
+
+    def test_discover_feed_url_ignores_calendar_alternate_links(self):
+        homepage = _response(
+            """
+            <html><head>
+              <link rel="alternate" type="text/calendar" href="https://safety4sea.com/events/?ical=1">
+              <link rel="alternate" type="application/rss+xml" href="https://safety4sea.com/web-stories/feed/">
+            </head></html>
+            """
+        )
+        web_stories_feed = _response("<html>not a feed</html>")
+        common_feed = _response(SAMPLE_RSS)
+        common_feed.ok = True
+        web_stories_feed.ok = True
+        session = Mock()
+        session.get.side_effect = [homepage, web_stories_feed, common_feed]
+
+        feed_url = discover_feed_url("https://safety4sea.com", session=session)
+
+        self.assertEqual(feed_url, "https://safety4sea.com/feed")
+        requested_urls = [call.args[0] for call in session.get.call_args_list]
+        self.assertNotIn("https://safety4sea.com/events/?ical=1", requested_urls)
 
     def test_article_dedup_by_url(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -504,6 +526,15 @@ def _article(source_id="SRC004", source_name="Safety4Sea", title="Safety4Sea tes
         "content_excerpt": "Short safety description.",
         "importance_score": 8,
     }
+
+
+def _response(text="", content_type="text/html", ok=True):
+    response = Mock()
+    response.text = text
+    response.headers = {"Content-Type": content_type}
+    response.ok = ok
+    response.raise_for_status.return_value = None
+    return response
 
 
 if __name__ == "__main__":

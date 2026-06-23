@@ -69,6 +69,23 @@ class VisualBriefRendererTests(unittest.TestCase):
             self.assertTrue(Path(image["local_path"]).exists())
             self.assertTrue(image["data_uri"].startswith("data:image/png;base64,"))
 
+    def test_resolve_card_image_normalizes_markdown_article_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = Mock()
+            session.get.side_effect = [
+                _response(text='<meta property="og:image" content="/story.png">'),
+                _response(content=b"fake-png", content_type="image/png"),
+            ]
+
+            image = resolve_card_image(
+                "[https://example.com/news/story](https://example.com/news/story)",
+                session=session,
+                cache_dir=Path(temp_dir),
+            )
+
+            self.assertEqual(image["status"], "ok")
+            self.assertEqual(session.get.call_args_list[0].args[0], "https://example.com/news/story")
+
     def test_generate_image_cards_writes_manifest_preview_and_cards(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

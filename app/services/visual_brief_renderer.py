@@ -11,6 +11,7 @@ from urllib.parse import unquote, urljoin, urlparse
 import requests
 
 from app.config import ROOT_DIR
+from app.services.combined_brief_source import normalize_source_url
 from app.services.rss_collector import REQUEST_TIMEOUT, USER_AGENT
 
 
@@ -58,8 +59,11 @@ def generate_image_cards(
     rendered_paths = []
 
     for index, item in enumerate(items, start=1):
+        original_url = normalize_source_url(item.get("original_url"))
+        item = dict(item)
+        item["original_url"] = original_url
         image = resolve_card_image(
-            item.get("original_url"),
+            original_url,
             session=session,
             cache_dir=DEFAULT_IMAGE_CACHE_DIR,
             force_refresh=force_refresh_images,
@@ -109,6 +113,7 @@ def load_brief_payload(path):
 
 
 def resolve_card_image(article_url, session=None, cache_dir=DEFAULT_IMAGE_CACHE_DIR, force_refresh=False):
+    article_url = normalize_source_url(article_url)
     if not article_url:
         return _fallback_image("missing_article_url")
 

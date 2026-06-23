@@ -11,6 +11,7 @@ from app.services.combined_brief_source import (
     filter_publishable_items,
     format_empty_combined_message,
     item_key,
+    normalize_source_url,
     sheet_run_label,
     sheet_row_to_item,
     title_hash,
@@ -54,6 +55,36 @@ class CombinedBriefSourceTests(unittest.TestCase):
         self.assertEqual(item["impact_note"], "Tác động đến logistics Việt Nam.")
         self.assertEqual(item["canonical_url"], "https://example.com/story")
         self.assertEqual(item["source_type"], "sheet")
+
+    def test_sheet_row_normalizes_markdown_source_url(self):
+        item = sheet_row_to_item(
+            {
+                "Date": "2026-06-22",
+                "Headline": "Trio of owners emerge behind 13-ship haul",
+                "Source": "Splash247",
+                "Source URL": (
+                    "[https://splash247.com/trio-of-owners-emerge-behind-13-ship-huangpu-wenchong-boxship-haul/]"
+                    "(https://splash247.com/trio-of-owners-emerge-behind-13-ship-huangpu-wenchong-boxship-haul/)"
+                ),
+                "Main summary": "Summary",
+                "Why it matters": "Impact",
+            },
+            1,
+        )
+
+        self.assertEqual(
+            item["original_url"],
+            "https://splash247.com/trio-of-owners-emerge-behind-13-ship-huangpu-wenchong-boxship-haul/",
+        )
+        self.assertEqual(
+            item["canonical_url"],
+            "https://splash247.com/trio-of-owners-emerge-behind-13-ship-huangpu-wenchong-boxship-haul",
+        )
+
+    def test_normalize_source_url_supports_html_anchor(self):
+        url = normalize_source_url('<a href="https://safety4sea.com/story/">Safety4Sea</a>')
+
+        self.assertEqual(url, "https://safety4sea.com/story/")
 
     def test_dedupe_prefers_sheet_over_app(self):
         app_item = _item("app", "App Source", "https://example.com/story?utm_campaign=x")

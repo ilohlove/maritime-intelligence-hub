@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.9 - 2026-06-23
+
+- Sửa lỗi lấy ảnh khi Source URL từ Google Sheet hoặc brief đang ở dạng Markdown/HTML link.
+- Sửa RSS autodiscovery của Safety4Sea để không chọn nhầm iCal/event feed và chỉ nhận RSS/Atom hợp lệ.
+- Cập nhật caption Facebook mặc định bằng tiếng Việt thân thiện hơn và tự chuyển caption mặc định cũ sang mẫu mới.
+
 ## v1.0.8 - 2026-06-21
 
 - Add Facebook Page publishing with dry-run preview, Page checks, multi-photo posting, and publish ledger metadata.

@@ -1,10 +1,18 @@
+import json
+import tempfile
 import unittest
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app.cli import _render_facebook_intro_text
 from app.gui import AppGUI
-from app.services.runtime_settings import DEFAULT_FACEBOOK_INTRO_TEXT, FACEBOOK_HASHTAGS, LEGACY_FACEBOOK_INTRO_TEXT
+from app.services.runtime_settings import (
+    DEFAULT_FACEBOOK_INTRO_TEXT,
+    LEGACY_FACEBOOK_INTRO_TEXT,
+    PREVIOUS_DEFAULT_FACEBOOK_INTRO_TEXT,
+    load_runtime_settings,
+)
 from app.services.facebook_publisher import FacebookAPIError
 
 
@@ -299,9 +307,10 @@ class GuiSelectedSourceTests(unittest.TestCase):
 
         caption = AppGUI._facebook_intro_text(app, "morning")
 
-        self.assertIn("⚓ ĐIỂM TIN HÀNG HẢI BUỔI SÁNG", caption)
-        self.assertIn("Tổng hợp nhanh những tin tức đáng chú ý nhất trong 24 giờ qua", caption)
-        self.assertTrue(caption.strip().endswith("\n".join(FACEBOOK_HASHTAGS)))
+        self.assertIn("Tóm tắt nhanh cho anh em những chuyển động đáng chú ý nhất", caption)
+        self.assertIn("Khung giờ phát sóng: 7:30 và 19:30 mỗi ngày.", caption)
+        self.assertIn("Nhớ ấn Follow và thêm trang vào Yêu thích", caption)
+        self.assertNotIn("#MaritimeBrief", caption)
 
     def test_facebook_intro_text_uses_evening_caption(self):
         app = _gui_stub()
@@ -310,7 +319,7 @@ class GuiSelectedSourceTests(unittest.TestCase):
 
         caption = AppGUI._facebook_intro_text(app, "evening")
 
-        self.assertIn("⚓ ĐIỂM TIN HÀNG HẢI BUỔI TỐI", caption)
+        self.assertEqual(caption, DEFAULT_FACEBOOK_INTRO_TEXT)
 
     def test_facebook_intro_text_chooses_period_from_time_without_label(self):
         app = _gui_stub()
@@ -319,7 +328,7 @@ class GuiSelectedSourceTests(unittest.TestCase):
 
         caption = AppGUI._facebook_intro_text(app)
 
-        self.assertIn("⚓ ĐIỂM TIN HÀNG HẢI BUỔI TỐI", caption)
+        self.assertEqual(caption, DEFAULT_FACEBOOK_INTRO_TEXT)
 
     def test_facebook_intro_text_preserves_custom_template(self):
         app = _gui_stub()
@@ -333,14 +342,26 @@ class GuiSelectedSourceTests(unittest.TestCase):
     def test_cli_facebook_intro_text_matches_default_caption(self):
         caption = _render_facebook_intro_text(DEFAULT_FACEBOOK_INTRO_TEXT, "evening")
 
-        self.assertIn("⚓ ĐIỂM TIN HÀNG HẢI BUỔI TỐI", caption)
-        self.assertTrue(caption.strip().endswith("\n".join(FACEBOOK_HASHTAGS)))
+        self.assertEqual(caption, DEFAULT_FACEBOOK_INTRO_TEXT)
+        self.assertIn("Khung giờ phát sóng: 7:30 và 19:30 mỗi ngày.", caption)
 
     def test_cli_facebook_intro_text_migrates_legacy_default_caption(self):
         caption = _render_facebook_intro_text(LEGACY_FACEBOOK_INTRO_TEXT, "morning")
 
-        self.assertIn("⚓ ĐIỂM TIN HÀNG HẢI BUỔI SÁNG", caption)
+        self.assertEqual(caption, DEFAULT_FACEBOOK_INTRO_TEXT)
         self.assertNotIn("Nguon duoc ghi tren tung anh", caption)
+
+    def test_runtime_settings_migrates_previous_default_caption(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "runtime_settings.json"
+            settings_path.write_text(
+                json.dumps({"publish": {"facebook_intro_text": PREVIOUS_DEFAULT_FACEBOOK_INTRO_TEXT}}),
+                encoding="utf-8",
+            )
+
+            settings = load_runtime_settings(settings_path)
+
+        self.assertEqual(settings["publish"]["facebook_intro_text"], DEFAULT_FACEBOOK_INTRO_TEXT)
 
     def test_wait_for_sheet_l1_until_matching_current_brief(self):
         app = _gui_stub()

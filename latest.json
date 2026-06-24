@@ -1,12 +1,11 @@
 {
-  "version": "1.0.10",
-  "release_date": "2026-06-24",
-  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.0.10/BV-maritime-intelligence-hub.exe",
+  "version": "1.0.11",
+  "release_date": "2026-06-25",
+  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.0.11/BV-maritime-intelligence-hub.exe",
   "changelog": [
-    "Chỉ render Sheet mode khi ô L1 khớp đúng khung sáng/tối hiện tại.",
-    "Không render lại tin cũ: Sheet mode bỏ qua các item đã có trong published ledger.",
-    "Nếu Sheet đúng khung giờ nhưng chưa có tin mới, GUI sẽ chờ 60 giây rồi kiểm tra lại thay vì tạo ảnh cũ.",
-    "Cập nhật lịch mặc định sang 07:30 và 19:30."
+    "Khôi phục caption Facebook mặc định về mẫu cũ có tiêu đề buổi sáng/tối và hashtag.",
+    "Giữ cơ chế render {facebook_title}, {date}, {datetime}, {brief_label} cho caption tùy chỉnh.",
+    "Tự chuyển caption mặc định ngắn mới về mẫu caption cũ khi load runtime settings."
   ],
   "force_update": false
 }

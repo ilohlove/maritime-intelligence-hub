@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.11 - 2026-06-25
+
+- Khôi phục caption Facebook mặc định về mẫu cũ có tiêu đề buổi sáng/tối và hashtag.
+- Giữ cơ chế render `{facebook_title}`, `{date}`, `{datetime}`, `{brief_label}` cho caption tùy chỉnh.
+- Tự chuyển caption mặc định ngắn mới về mẫu caption cũ khi load runtime settings.
+
 ## v1.0.10 - 2026-06-24
 
 - Chỉ render Sheet mode khi ô L1 khớp đúng khung sáng/tối hiện tại.

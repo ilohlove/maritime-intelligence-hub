@@ -58,7 +58,7 @@ DEFAULT_SETTINGS = {
         "brief_limit": 12,
         "keywords": "port congestion, freight rate, vessel accident, Vietnam logistics",
         "runs_per_day": 2,
-        "times": ["07:15", "19:15"],
+        "times": ["07:30", "19:30"],
         "timezone_offset": "+7",
         "retry_attempts": 2,
         "preferred_sources": [],

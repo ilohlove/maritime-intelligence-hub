@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.10 - 2026-06-24
+
+- Chỉ render Sheet mode khi ô L1 khớp đúng khung sáng/tối hiện tại.
+- Không render lại tin cũ: Sheet mode bỏ qua các item đã có trong published ledger.
+- Nếu Sheet đúng khung giờ nhưng chưa có tin mới, GUI sẽ chờ 60 giây rồi kiểm tra lại thay vì tạo ảnh cũ.
+- Cập nhật lịch mặc định sang 07:30 và 19:30.
+
 ## v1.0.9 - 2026-06-23
 
 - Sửa lỗi lấy ảnh khi Source URL từ Google Sheet hoặc brief đang ở dạng Markdown/HTML link.

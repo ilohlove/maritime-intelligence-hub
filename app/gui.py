@@ -772,21 +772,37 @@ class AppGUI:
 
     def _generate_combined_cards_result(self):
         source_mode = self.visual_source_mode_var.get().strip().lower()
-        sheet_ready = self._wait_for_sheet_if_needed(source_mode)
+        sheet_url = self.sheet_url_var.get().strip()
+        if source_mode == "sheet" and not sheet_url:
+            source_result = build_combined_brief(
+                source_mode=source_mode,
+                sheet_url=sheet_url,
+                sheet_limit=None,
+                app_limit=self._optional_limit(self.app_limit_var, self.app_limit_max_var),
+                card_limit=None,
+                brief_path=DEFAULT_COMBINED_BRIEF_PATH,
+            )
+            raise RuntimeError(format_empty_combined_message(source_result.stats, source_result.brief_path))
         sheet_limit = None if source_mode == "sheet" else self._optional_limit(self.sheet_limit_var, self.sheet_limit_max_var)
         card_limit = None if source_mode == "sheet" else self._optional_limit(self.card_limit_var, self.card_limit_max_var)
-        source_result = build_combined_brief(
-            source_mode=source_mode,
-            sheet_url=self.sheet_url_var.get().strip(),
-            sheet_limit=sheet_limit,
-            app_limit=self._optional_limit(self.app_limit_var, self.app_limit_max_var),
-            card_limit=card_limit,
-            brief_path=DEFAULT_COMBINED_BRIEF_PATH,
-        )
-        if sheet_ready:
-            source_result.stats.setdefault("sheet_source", {}).update(sheet_ready)
-        if not source_result.payload.get("items"):
-            raise RuntimeError(format_empty_combined_message(source_result.stats, source_result.brief_path))
+        while True:
+            sheet_ready = self._wait_for_sheet_if_needed(source_mode)
+            source_result = build_combined_brief(
+                source_mode=source_mode,
+                sheet_url=sheet_url,
+                sheet_limit=sheet_limit,
+                app_limit=self._optional_limit(self.app_limit_var, self.app_limit_max_var),
+                card_limit=card_limit,
+                brief_path=DEFAULT_COMBINED_BRIEF_PATH,
+            )
+            if sheet_ready:
+                source_result.stats.setdefault("sheet_source", {}).update(sheet_ready)
+            if source_result.payload.get("items"):
+                break
+            if source_mode != "sheet":
+                raise RuntimeError(format_empty_combined_message(source_result.stats, source_result.brief_path))
+            self._wait_for_fresh_sheet_items(source_result)
+
         cards_result = generate_image_cards(
             "combined",
             limit=card_limit,
@@ -800,6 +816,24 @@ class AppGUI:
             "cards_result": cards_result,
             "brief_label": brief_label,
         }
+
+    def _wait_for_fresh_sheet_items(self, source_result):
+        self._checkpoint("wait for fresh Google Sheet items")
+        stats = source_result.stats
+        sheet_source = stats.get("sheet_source") or {}
+        message = (
+            "Google Sheet đã đúng khung giờ nhưng chưa có tin mới để render.\n"
+            f"Sheet L1: {sheet_source.get('run_marker', '')} ({sheet_source.get('run_label', '')})\n"
+            f"Dòng Sheet đã đọc: {stats.get('raw_total', 0)}\n"
+            f"Tin đã đăng bị bỏ qua: {stats.get('already_published', 0)}\n"
+            f"Tin mới đủ điều kiện render: {stats.get('selected_total', 0)}\n"
+            "Chờ 60 giây rồi kiểm tra lại."
+        )
+        logger.info(message.replace("\n", " "))
+        if hasattr(self, "root") and hasattr(self, "output_box"):
+            self.root.after(0, self._set_text, self.output_box, message, True)
+            self.root.after(0, self.summary_var.set, "Waiting for fresh Google Sheet items")
+        self._sleep_with_controls(60)
 
     def _format_card_result(self, result):
         return "\n".join([
@@ -1250,9 +1284,15 @@ class AppGUI:
         while True:
             self._checkpoint("wait for Google Sheet L1")
             now = self._vietnam_now()
-            status = get_sheet_run_status(sheet_url)
-            marker = status.get("run_marker", "")
-            sheet_label = status.get("run_label", "")
+            sheet_error = ""
+            try:
+                status = get_sheet_run_status(sheet_url)
+                marker = status.get("run_marker", "")
+                sheet_label = status.get("run_label", "")
+            except ValueError as exc:
+                marker = ""
+                sheet_label = "invalid"
+                sheet_error = str(exc)
             ready = sheet_label == expected_label
             wait_status = {
                 "run_marker": marker,
@@ -1261,14 +1301,17 @@ class AppGUI:
                 "vietnam_now": now.strftime("%Y-%m-%d %H:%M:%S +07"),
                 "sheet_ready": ready,
             }
+            if sheet_error:
+                wait_status["sheet_error"] = sheet_error
             if ready:
                 return wait_status
 
             message = (
-                "Google Sheet is not ready for the current brief window.\n"
-                f"Vietnam time: {wait_status['vietnam_now']} ({expected_label})\n"
+                "Google Sheet chưa sẵn sàng cho khung tin hiện tại.\n"
+                f"Giờ Việt Nam: {wait_status['vietnam_now']} ({expected_label})\n"
                 f"Sheet L1: {marker} ({sheet_label})\n"
-                "Waiting 60 seconds before checking again."
+                f"{'Lỗi L1: ' + sheet_error + chr(10) if sheet_error else ''}"
+                "Chờ 60 giây rồi kiểm tra lại."
             )
             logger.info(message.replace("\n", " "))
             if hasattr(self, "root") and hasattr(self, "output_box"):

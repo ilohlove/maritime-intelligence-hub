@@ -17,7 +17,7 @@ from app.services.combined_brief_source import (
     title_hash,
 )
 from app.services.source_master import load_sources
-from app.services.storage import init_db, sync_sources, upsert_article, upsert_summary, utc_now
+from app.services.storage import init_db, mark_items_published, sync_sources, upsert_article, upsert_summary, utc_now
 from app.services.visual_brief_renderer import generate_image_cards
 
 
@@ -216,7 +216,7 @@ class CombinedBriefSourceTests(unittest.TestCase):
             "https://docs.google.com/spreadsheets/d/sheet123/export?format=csv&gid=456",
         )
 
-    def test_sheet_mode_uses_all_rows_without_limits_or_dedupe(self):
+    def test_sheet_mode_uses_unpublished_rows_without_limits_or_dedupe(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             db_path = temp_path / "mih.db"
@@ -244,6 +244,48 @@ class CombinedBriefSourceTests(unittest.TestCase):
         self.assertEqual(result.stats["selected_total"], 2)
         self.assertEqual(result.stats["sheet_source"]["run_marker"], "19:15")
         self.assertEqual(result.stats["sheet_source"]["run_label"], "evening")
+
+    def test_sheet_mode_skips_already_published_rows(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "mih.db"
+            brief_path = temp_path / "combined_brief.json"
+            sheet_url = "https://docs.google.com/spreadsheets/d/sheet123/edit?gid=456#gid=456"
+            csv_text = (
+                "Date,Section,Topic,Headline,Vietnamese translation,Source,Source URL,Main summary,Main summary (Vietnamese),Why it matters,Why it matters (Vietnamese),07:30\n"
+                "2026-06-24,Global,Safety,English A,TiÃƒÂªu Ã„â€˜Ã¡Â»Â A,Sheet Source,https://example.com/published,English summary,TÃƒÂ³m tÃ¡ÂºÂ¯t A,English impact,TÃƒÂ¡c Ã„â€˜Ã¡Â»â„¢ng A,\n"
+                "2026-06-24,Global,Safety,English B,TiÃƒÂªu Ã„â€˜Ã¡Â»Â B,Sheet Source,https://example.com/fresh,English summary,TÃƒÂ³m tÃ¡ÂºÂ¯t B,English impact,TÃƒÂ¡c Ã„â€˜Ã¡Â»â„¢ng B,\n"
+            )
+            published_item = sheet_row_to_item(
+                {
+                    "Date": "2026-06-24",
+                    "Headline": "English A",
+                    "Vietnamese translation": "TiÃƒÂªu Ã„â€˜Ã¡Â»Â A",
+                    "Source": "Sheet Source",
+                    "Source URL": "https://example.com/published",
+                    "Main summary": "English summary",
+                    "Why it matters": "English impact",
+                },
+                1,
+            )
+            mark_items_published([published_item], facebook_page_id="page-1", db_path=db_path)
+
+            result = build_combined_brief(
+                source_mode="sheet",
+                sheet_url=sheet_url,
+                sheet_limit=None,
+                card_limit=None,
+                db_path=db_path,
+                brief_path=brief_path,
+                session=_FakeSession(csv_text),
+            )
+
+        self.assertEqual(len(result.payload["items"]), 1)
+        self.assertEqual(result.payload["items"][0]["canonical_url"], "https://example.com/fresh")
+        self.assertEqual(result.stats["raw_total"], 2)
+        self.assertEqual(result.stats["sheet_total"], 2)
+        self.assertEqual(result.stats["already_published"], 1)
+        self.assertEqual(result.stats["selected_total"], 1)
 
     def test_sheet_mode_reports_empty_sheet_url(self):
         with tempfile.TemporaryDirectory() as temp_dir:

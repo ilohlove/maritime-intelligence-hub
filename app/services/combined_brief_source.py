@@ -61,7 +61,7 @@ def build_combined_brief(
     sheet_items = sheet_data.get("items", []) if use_sheet else []
     raw_items = app_items + sheet_items
     if source_mode == "sheet":
-        filtered_items, stats = select_all_sheet_items(raw_items)
+        filtered_items, stats = select_unpublished_sheet_items(raw_items, db_path=db_path)
     else:
         filtered_items, stats = filter_publishable_items(raw_items, db_path=db_path)
     stats["source_mode"] = source_mode
@@ -262,13 +262,21 @@ def filter_publishable_items(items, db_path=DEFAULT_DB_PATH):
     return selected, stats
 
 
-def select_all_sheet_items(items):
-    selected = list(items)
+def select_unpublished_sheet_items(items, db_path=DEFAULT_DB_PATH):
+    published = published_lookup(db_path=db_path)
+    selected = []
+    already_published = 0
+    for item in items:
+        if is_published(item, published):
+            already_published += 1
+            continue
+        selected.append(item)
+
     stats = {
-        "app_total": sum(1 for item in selected if item.get("source_type") == "app"),
-        "sheet_total": sum(1 for item in selected if item.get("source_type") == "sheet"),
-        "raw_total": len(selected),
-        "already_published": 0,
+        "app_total": sum(1 for item in items if item.get("source_type") == "app"),
+        "sheet_total": sum(1 for item in items if item.get("source_type") == "sheet"),
+        "raw_total": len(items),
+        "already_published": already_published,
         "duplicate_removed": 0,
         "eligible_total": len(selected),
         "selected_total": len(selected),

@@ -1,11 +1,12 @@
 {
-  "version": "1.0.9",
-  "release_date": "2026-06-23",
-  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.0.9/BV-maritime-intelligence-hub.exe",
+  "version": "1.0.10",
+  "release_date": "2026-06-24",
+  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.0.10/BV-maritime-intelligence-hub.exe",
   "changelog": [
-    "Sửa lỗi lấy ảnh khi Source URL từ Google Sheet hoặc brief đang ở dạng Markdown/HTML link.",
-    "Sửa RSS autodiscovery của Safety4Sea để không chọn nhầm iCal/event feed và chỉ nhận RSS/Atom hợp lệ.",
-    "Cập nhật caption Facebook mặc định bằng tiếng Việt thân thiện hơn và tự chuyển caption mặc định cũ sang mẫu mới."
+    "Chỉ render Sheet mode khi ô L1 khớp đúng khung sáng/tối hiện tại.",
+    "Không render lại tin cũ: Sheet mode bỏ qua các item đã có trong published ledger.",
+    "Nếu Sheet đúng khung giờ nhưng chưa có tin mới, GUI sẽ chờ 60 giây rồi kiểm tra lại thay vì tạo ảnh cũ.",
+    "Cập nhật lịch mặc định sang 07:30 và 19:30."
   ],
   "force_update": false
 }

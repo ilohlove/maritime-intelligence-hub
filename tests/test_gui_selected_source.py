@@ -384,6 +384,64 @@ class GuiSelectedSourceTests(unittest.TestCase):
         self.assertTrue(result["sheet_ready"])
         self.assertEqual(result["run_label"], "evening")
 
+    def test_wait_for_sheet_l1_handles_invalid_marker(self):
+        app = _gui_stub()
+        app.sheet_url_var = _Var("https://docs.google.com/spreadsheets/d/sheet123/edit?gid=0#gid=0")
+        app._current_scan_label = Mock(return_value="morning")
+        app._vietnam_now = Mock(return_value=_FakeNow("2026-06-24 07:30:00 +07"))
+        app._sleep_with_controls = Mock()
+
+        with patch(
+            "app.gui.get_sheet_run_status",
+            side_effect=[
+                ValueError("Sheet L1 must contain a valid HH:MM run time."),
+                {"run_marker": "07:30", "run_label": "morning"},
+            ],
+        ):
+            result = AppGUI._wait_for_sheet_if_needed(app, "sheet")
+
+        app._sleep_with_controls.assert_called_once_with(60)
+        self.assertTrue(result["sheet_ready"])
+        self.assertEqual(result["run_label"], "morning")
+
+    def test_sheet_mode_waits_for_fresh_items_before_rendering(self):
+        app = _gui_stub()
+        app.visual_source_mode_var = _Var("sheet")
+        app.sheet_url_var = _Var("https://docs.google.com/spreadsheets/d/sheet123/edit?gid=0#gid=0")
+        app.sheet_limit_var = _Var("20")
+        app.sheet_limit_max_var = _Var(True)
+        app.app_limit_var = _Var("20")
+        app.app_limit_max_var = _Var(True)
+        app.card_limit_var = _Var("12")
+        app.card_limit_max_var = _Var(True)
+        app._optional_limit = Mock(return_value=None)
+        app._visual_settings = Mock(return_value={})
+        app._wait_for_sheet_if_needed = Mock(
+            return_value={"run_marker": "07:30", "run_label": "morning", "sheet_ready": True}
+        )
+        app._sleep_with_controls = Mock()
+        app._current_scan_label = Mock(return_value="morning")
+        empty_result = _combined_result([], already_published=10, selected_total=0)
+        fresh_result = _combined_result([{"title": "Tin mới", "original_url": "https://example.com/new"}], selected_total=1)
+
+        with patch("app.gui.build_combined_brief", side_effect=[empty_result, fresh_result]) as build:
+            with patch(
+                "app.gui.generate_image_cards",
+                return_value={
+                    "items": 1,
+                    "output_dir": "cards",
+                    "manifest_path": "cards/manifest.json",
+                    "preview_path": "cards/preview.html",
+                    "cards": ["card-1.png"],
+                },
+            ) as render:
+                result = AppGUI._generate_combined_cards_result(app)
+
+        self.assertEqual(build.call_count, 2)
+        app._sleep_with_controls.assert_called_once_with(60)
+        render.assert_called_once()
+        self.assertEqual(result["cards_result"]["items"], 1)
+
     def test_telegram_intro_text_prefixes_vietnamese_brief_label(self):
         app = _gui_stub()
         app.telegram_intro_text_var = _Var("{date}")
@@ -455,6 +513,34 @@ def _selected_result():
         },
         "brief_label": "evening",
     }
+
+
+def _combined_result(items, already_published=0, selected_total=1):
+    stats = {
+        "source_mode": "sheet",
+        "app_total": 0,
+        "sheet_total": 10,
+        "raw_total": 10,
+        "already_published": already_published,
+        "duplicate_removed": 0,
+        "eligible_total": selected_total,
+        "selected_total": selected_total,
+        "duplicate_groups": [],
+        "sheet_source": {
+            "run_marker": "07:30",
+            "run_label": "morning",
+            "loaded_items": 10,
+        },
+    }
+    return type(
+        "CombinedResult",
+        (),
+        {
+            "payload": {"items": items},
+            "stats": stats,
+            "brief_path": "combined_brief.json",
+        },
+    )()
 
 
 class _Var:

@@ -1,3 +1,4 @@
+import json
 import os
 import threading
 import time
@@ -714,14 +715,111 @@ class AppGUI:
     def _generate_selected_source_cards_result(self):
         return self._generate_combined_cards_result()
 
+    def _latest_rendered_cards_result(self):
+        manifest_path = self._latest_visual_manifest_path()
+        if not manifest_path:
+            raise RuntimeError("Chưa có bộ ảnh render gần nhất hợp lệ. Hãy bấm Generate Test trước.")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Chưa có bộ ảnh render gần nhất hợp lệ. Hãy bấm Generate Test trước.") from exc
+
+        cards = manifest.get("cards") or []
+        if not cards:
+            raise RuntimeError("Chưa có bộ ảnh render gần nhất hợp lệ. Hãy bấm Generate Test trước.")
+
+        normalized_cards = []
+        missing_paths = []
+        for card in cards:
+            card = dict(card or {})
+            raw_card_path = str(card.get("card_path") or "").strip()
+            if not raw_card_path:
+                missing_paths.append("<empty card_path>")
+            else:
+                card_path = Path(raw_card_path)
+                if not card_path.exists():
+                    missing_paths.append(str(card_path))
+            normalized_cards.append(card)
+        if missing_paths:
+            raise RuntimeError(
+                "Chưa có bộ ảnh render gần nhất hợp lệ. Hãy bấm Generate Test trước.\n"
+                + self._format_errors(f"Missing card image: {path}" for path in missing_paths)
+            )
+
+        output_dir = manifest_path.parent
+        source_brief = manifest.get("source_brief_json") or ""
+        brief_label = self._brief_label_from_render_manifest(manifest)
+        stats = {
+            "source_mode": "latest_rendered",
+            "app_total": 0,
+            "sheet_total": 0,
+            "raw_total": len(normalized_cards),
+            "already_published": 0,
+            "duplicate_removed": 0,
+            "eligible_total": len(normalized_cards),
+            "selected_total": len(normalized_cards),
+            "duplicate_groups": [],
+        }
+        return {
+            "brief_path": source_brief or str(manifest_path),
+            "source_stats": stats,
+            "cards_result": {
+                "brief_type": manifest.get("brief_type") or output_dir.parent.name,
+                "items": len(normalized_cards),
+                "output_dir": output_dir,
+                "manifest_path": manifest_path,
+                "preview_path": Path(manifest.get("preview_path") or output_dir / "preview.html"),
+                "cards": normalized_cards,
+            },
+            "brief_label": brief_label,
+            "latest_rendered": True,
+            "generated_at": manifest.get("generated_at"),
+        }
+
+    def _latest_visual_manifest_path(self):
+        root = Path(DEFAULT_VISUAL_BRIEF_DIR)
+        if not root.exists():
+            return None
+        manifests = [path for path in root.rglob("manifest.json") if path.is_file()]
+        if not manifests:
+            return None
+        return max(manifests, key=lambda path: path.stat().st_mtime)
+
+    def _brief_label_from_render_manifest(self, manifest):
+        brief_type = str(manifest.get("brief_type") or "").strip().lower()
+        if brief_type in {"morning", "evening"}:
+            return brief_type
+        source_brief = str(manifest.get("source_brief_json") or "").strip()
+        if source_brief:
+            try:
+                payload = json.loads(Path(source_brief).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            label = str(payload.get("scan_label") or payload.get("brief_label") or "").strip().lower()
+            if label in {"morning", "evening"}:
+                return label
+        return self._current_scan_label()
+
     def _format_selected_source_cards_result(self, result):
-        return "\n".join(
-            [
-                format_combined_stats(result["source_stats"], result["brief_path"]),
+        lines = []
+        if result.get("latest_rendered"):
+            lines.extend([
+                "Latest rendered image cards",
+                f"Generated at: {result.get('generated_at') or ''}",
+                f"Brief label: {result.get('brief_label') or ''}",
+                f"Brief JSON: {result.get('brief_path') or ''}",
                 "",
                 self._format_card_result(result["cards_result"]),
-            ]
-        )
+            ])
+        else:
+            lines.extend(
+                [
+                    format_combined_stats(result["source_stats"], result["brief_path"]),
+                    "",
+                    self._format_card_result(result["cards_result"]),
+                ]
+            )
+        return "\n".join(lines)
 
     def _check_combined_sources(self):
         self._save_settings()
@@ -1039,10 +1137,10 @@ class AppGUI:
         self._run_background("Sending selected source cards to Telegram", self._task_send_latest_cards)
 
     def _task_send_latest_cards(self):
-        result = self._retry_gui_step(
-            "generate_selected_source_image_cards",
-            self._generate_selected_source_cards_result,
-        )
+        try:
+            result = self._retry_gui_step("load_latest_rendered_image_cards", self._latest_rendered_cards_result)
+        except Exception as exc:
+            return self._format_latest_rendered_cards_error("Telegram", exc), False
         output, ok = self._retry_gui_step(
             "send_telegram",
             lambda: self._task_send_cards(result["cards_result"]["cards"], result.get("brief_label")),
@@ -1167,17 +1265,18 @@ class AppGUI:
 
     def _generate_facebook_cards_or_error(self):
         try:
-            result = self._retry_gui_step(
-                "generate_selected_source_image_cards",
-                self._generate_selected_source_cards_result,
-            )
+            result = self._retry_gui_step("load_latest_rendered_image_cards", self._latest_rendered_cards_result)
             return result, None
         except Exception as exc:
-            return None, self._format_facebook_card_generation_error(exc)
+            return None, self._format_latest_rendered_cards_error("Facebook", exc)
 
     def _format_facebook_card_generation_error(self, exc):
         message = str(exc or "").strip() or exc.__class__.__name__
         return "Facebook skipped: could not generate image cards.\n" + message
+
+    def _format_latest_rendered_cards_error(self, channel, exc):
+        message = str(exc or "").strip() or exc.__class__.__name__
+        return f"{channel} skipped: no valid latest rendered image cards.\n{message}"
 
     def _task_post_facebook_cards(self, cards, brief_label=None, dry_run=None):
         page_id = self.facebook_page_id_var.get().strip()

@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime
@@ -44,21 +45,81 @@ class GuiSelectedSourceTests(unittest.TestCase):
         self.assertIn("Source mode: sheet", output)
         self.assertIn("Loaded sheet items: 1", output)
 
-    def test_send_cards_uses_selected_source_cards(self):
+    def test_send_cards_uses_latest_rendered_cards(self):
         app = _gui_stub()
         selected_result = _selected_result()
-        app._generate_selected_source_cards_result = Mock(return_value=selected_result)
+        app._latest_rendered_cards_result = Mock(return_value=selected_result)
+        app._generate_selected_source_cards_result = Mock(side_effect=AssertionError("manual send should not render"))
         app._generate_latest_cards_result = Mock(side_effect=AssertionError("latest cards should not be used"))
         app._task_send_cards = Mock(return_value=("sent", True))
 
         output, ok = AppGUI._task_send_latest_cards(app)
 
         self.assertTrue(ok)
-        app._generate_selected_source_cards_result.assert_called_once()
+        app._latest_rendered_cards_result.assert_called_once()
+        app._generate_selected_source_cards_result.assert_not_called()
         app._generate_latest_cards_result.assert_not_called()
         app._task_send_cards.assert_called_once_with(["card-1.png"], "evening")
         self.assertIn("Source mode: sheet", output)
         self.assertIn("sent", output)
+
+    def test_latest_rendered_cards_result_reads_newest_manifest(self):
+        app = _gui_stub()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            older_card = root / "older" / "card_01.png"
+            newer_card = root / "newer" / "card_01.png"
+            older_card.parent.mkdir(parents=True)
+            newer_card.parent.mkdir(parents=True)
+            older_card.write_bytes(b"old")
+            newer_card.write_bytes(b"new")
+            brief_path = root / "combined_brief.json"
+            brief_path.write_text(json.dumps({"scan_label": "evening"}), encoding="utf-8")
+            older_manifest = older_card.parent / "manifest.json"
+            newer_manifest = newer_card.parent / "manifest.json"
+            older_manifest.write_text(json.dumps({
+                "brief_type": "combined",
+                "generated_at": "2026-06-24T07:30:00",
+                "source_brief_json": str(brief_path),
+                "preview_path": str(older_card.parent / "preview.html"),
+                "cards": [{"card_path": str(older_card), "original_url": "https://example.com/old"}],
+            }), encoding="utf-8")
+            newer_manifest.write_text(json.dumps({
+                "brief_type": "combined",
+                "generated_at": "2026-06-25T07:30:00",
+                "source_brief_json": str(brief_path),
+                "preview_path": str(newer_card.parent / "preview.html"),
+                "cards": [{"card_path": str(newer_card), "original_url": "https://example.com/new"}],
+            }), encoding="utf-8")
+            os.utime(older_manifest, (1000, 1000))
+            os.utime(newer_manifest, (2000, 2000))
+
+            with patch("app.gui.DEFAULT_VISUAL_BRIEF_DIR", root):
+                result = AppGUI._latest_rendered_cards_result(app)
+
+        self.assertTrue(result["latest_rendered"])
+        self.assertEqual(result["brief_label"], "evening")
+        self.assertEqual(result["cards_result"]["manifest_path"], newer_manifest)
+        self.assertEqual(result["cards_result"]["cards"][0]["original_url"], "https://example.com/new")
+
+    def test_latest_rendered_cards_result_rejects_missing_card_file(self):
+        app = _gui_stub()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir = root / "combined" / "run"
+            run_dir.mkdir(parents=True)
+            manifest = run_dir / "manifest.json"
+            manifest.write_text(json.dumps({
+                "brief_type": "combined",
+                "generated_at": "2026-06-25T07:30:00",
+                "source_brief_json": "combined_brief.json",
+                "preview_path": str(run_dir / "preview.html"),
+                "cards": [{"card_path": str(run_dir / "missing.png"), "original_url": "https://example.com/story"}],
+            }), encoding="utf-8")
+
+            with patch("app.gui.DEFAULT_VISUAL_BRIEF_DIR", root):
+                with self.assertRaisesRegex(RuntimeError, "Generate Test"):
+                    AppGUI._latest_rendered_cards_result(app)
 
     def test_loop_scan_sends_selected_source_cards(self):
         app = _gui_stub()
@@ -242,30 +303,65 @@ class GuiSelectedSourceTests(unittest.TestCase):
         self.assertIn("Source link comment warnings", output)
         self.assertIn("400: Comment blocked", output)
 
+    def test_facebook_preview_uses_latest_rendered_cards_without_rendering(self):
+        app = _gui_stub()
+        selected_result = _selected_result()
+        app._latest_rendered_cards_result = Mock(return_value=selected_result)
+        app._generate_selected_source_cards_result = Mock(side_effect=AssertionError("manual preview should not render"))
+        app._task_post_facebook_cards = Mock(return_value=("facebook preview", True))
+
+        output, ok = AppGUI._task_preview_facebook_post(app)
+
+        self.assertTrue(ok)
+        app._latest_rendered_cards_result.assert_called_once()
+        app._generate_selected_source_cards_result.assert_not_called()
+        app._task_post_facebook_cards.assert_called_once_with(["card-1.png"], "evening", dry_run=True)
+        self.assertIn("facebook preview", output)
+
+    def test_facebook_post_uses_latest_rendered_cards_without_rendering(self):
+        app = _gui_stub()
+        app.facebook_dry_run_var = _Var(False)
+        selected_result = _selected_result()
+        app._latest_rendered_cards_result = Mock(return_value=selected_result)
+        app._generate_selected_source_cards_result = Mock(side_effect=AssertionError("manual post should not render"))
+        app._task_post_facebook_cards = Mock(return_value=("facebook post", True))
+
+        output, ok = AppGUI._task_post_facebook_now(app)
+
+        self.assertTrue(ok)
+        app._latest_rendered_cards_result.assert_called_once()
+        app._generate_selected_source_cards_result.assert_not_called()
+        app._task_post_facebook_cards.assert_called_once_with(["card-1.png"], "evening", dry_run=False)
+        self.assertIn("facebook post", output)
+
     def test_facebook_preview_card_generation_error_is_user_friendly(self):
         app = _gui_stub()
-        app._generate_selected_source_cards_result = Mock(side_effect=RuntimeError("No image cards available"))
+        app._latest_rendered_cards_result = Mock(side_effect=RuntimeError("No image cards available"))
+        app._generate_selected_source_cards_result = Mock(side_effect=AssertionError("manual preview should not render"))
         app._task_post_facebook_cards = Mock()
 
         output, ok = AppGUI._task_preview_facebook_post(app)
 
         self.assertFalse(ok)
-        self.assertTrue(output.startswith("Facebook skipped: could not generate image cards."))
+        self.assertTrue(output.startswith("Facebook skipped: no valid latest rendered image cards."))
         self.assertIn("No image cards available", output)
         self.assertNotIn("Traceback", output)
+        app._generate_selected_source_cards_result.assert_not_called()
         app._task_post_facebook_cards.assert_not_called()
 
     def test_facebook_post_card_generation_error_is_user_friendly(self):
         app = _gui_stub()
-        app._generate_selected_source_cards_result = Mock(side_effect=RuntimeError("Playwright browser is missing"))
+        app._latest_rendered_cards_result = Mock(side_effect=RuntimeError("Playwright browser is missing"))
+        app._generate_selected_source_cards_result = Mock(side_effect=AssertionError("manual post should not render"))
         app._task_post_facebook_cards = Mock()
 
         output, ok = AppGUI._task_post_facebook_now(app)
 
         self.assertFalse(ok)
-        self.assertTrue(output.startswith("Facebook skipped: could not generate image cards."))
+        self.assertTrue(output.startswith("Facebook skipped: no valid latest rendered image cards."))
         self.assertIn("Playwright browser is missing", output)
         self.assertNotIn("Traceback", output)
+        app._generate_selected_source_cards_result.assert_not_called()
         app._task_post_facebook_cards.assert_not_called()
 
     def test_facebook_page_check_reports_oauth_diagnostics(self):
@@ -520,6 +616,7 @@ def _gui_stub():
     app._format_errors = AppGUI._format_errors.__get__(app, AppGUI)
     app._brief_label_text = AppGUI._brief_label_text.__get__(app, AppGUI)
     app._facebook_intro_text = AppGUI._facebook_intro_text.__get__(app, AppGUI)
+    app._current_scan_label = Mock(return_value="morning")
     return app
 
 

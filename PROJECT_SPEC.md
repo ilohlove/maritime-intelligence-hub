@@ -45,7 +45,7 @@ When creating the first real project release, Codex must:
 When the user says `Hoan thanh phien ban moi`, Codex must:
 
 1. Review changes.
-2. Increment version.
+2. Increment version using the project version rollover rule.
 3. Update `version.json`.
 4. Update `CHANGELOG.md`.
 5. Update `latest.json`.
@@ -62,6 +62,12 @@ When the user says `Hoan thanh phien ban moi`, Codex must:
 16. Update, commit, and push `latest.json`.
 17. Verify raw `latest.json`.
 18. Report results.
+
+Version rollover rule:
+
+- Increment the patch version by 1 until patch `15`.
+- After `x.y.15`, the next version is `x.(y+1).0`.
+- Example: `1.0.14` -> `1.0.15` -> `1.1.0` -> `1.1.1`.
 
 Codex must not:
 

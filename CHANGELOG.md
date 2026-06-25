@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.13 - 2026-06-25
+
+- Các nút gửi Telegram, Preview Facebook và Post Facebook dùng lại bộ ảnh render gần nhất.
+- Không render lại, không đọc Google Sheet và không fetch tin khi test publish thủ công.
+- Thêm quy tắc version rollover: sau `1.0.15` sẽ lên `1.1.0`, rồi tiếp tục `1.1.1`.
+
 ## v1.0.12 - 2026-06-25
 
 - Tự comment `Link nguồn: <URL gốc>` vào từng ảnh Facebook sau khi đăng thành công.

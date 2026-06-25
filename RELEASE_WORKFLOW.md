@@ -61,7 +61,7 @@ If any suspicious value is found, stop and report it. Do not push.
 When the user says `Hoan thanh phien ban moi`:
 
 1. Review changes.
-2. Increment the semantic version.
+2. Increment the semantic version using the project version rollover rule below.
 3. Update `version.json`.
 4. Update `CHANGELOG.md`.
 5. Update `latest.json`.
@@ -77,6 +77,12 @@ When the user says `Hoan thanh phien ban moi`:
 15. Commit and push `latest.json`.
 16. Verify the raw `latest.json` URL.
 17. Verify the released app checks the remote raw `latest.json`, not the bundled local file.
+
+## Version Rollover Rule
+
+Normal update releases increment the patch number by 1 until patch `15`.
+After `x.y.15`, the next update release must roll over to `x.(y+1).0`.
+After the rollover, continue incrementing patch normally: for example `1.0.14` -> `1.0.15` -> `1.1.0` -> `1.1.1`.
 
 ## Error Classes
 

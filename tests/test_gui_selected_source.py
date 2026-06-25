@@ -235,7 +235,7 @@ class GuiSelectedSourceTests(unittest.TestCase):
         self.assertTrue(ok)
         publish.assert_called_once()
         mark.assert_not_called()
-        self.assertIn("Facebook dry-run: no post created", output)
+        self.assertIn("Facebook dry-run: no post created, no comments created", output)
 
     def test_facebook_publish_marks_items_with_post_id(self):
         app = _gui_stub()
@@ -320,7 +320,7 @@ class GuiSelectedSourceTests(unittest.TestCase):
 
     def test_facebook_post_uses_latest_rendered_cards_without_rendering(self):
         app = _gui_stub()
-        app.facebook_dry_run_var = _Var(False)
+        app.facebook_dry_run_var = _Var(True)
         selected_result = _selected_result()
         app._latest_rendered_cards_result = Mock(return_value=selected_result)
         app._generate_selected_source_cards_result = Mock(side_effect=AssertionError("manual post should not render"))

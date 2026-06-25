@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.14 - 2026-06-25
+
+- Nút Post Facebook thủ công luôn đăng thật và tạo comment link nguồn cho từng ảnh.
+- Preview Facebook tiếp tục chỉ mô phỏng, không tạo bài đăng hoặc comment thật.
+- Làm rõ checkbox dry-run chỉ áp dụng cho auto publish.
+
 ## v1.0.13 - 2026-06-25
 
 - Các nút gửi Telegram, Preview Facebook và Post Facebook dùng lại bộ ảnh render gần nhất.

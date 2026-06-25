@@ -7,6 +7,7 @@ from app.services.facebook_publisher import (
     FacebookAPIError,
     check_page,
     publish_photo_post,
+    source_link_comment_message,
     validate_cards_publish_safety,
 )
 
@@ -50,6 +51,11 @@ class FacebookPublisherTests(unittest.TestCase):
         self.assertEqual(result["image_paths"][0], str(image_path))
         self.assertEqual(result["planned_comments"][0]["message"], "Link nguồn: https://example.com/story")
         session.post.assert_not_called()
+
+    def test_source_link_comment_message_uses_vietnamese_prefix(self):
+        message = source_link_comment_message({"original_url": "https://example.com/story"})
+
+        self.assertEqual(message, "Link nguồn: https://example.com/story")
 
     def test_multi_photo_post_uploads_each_photo_creates_feed_post_and_comments_links(self):
         with tempfile.TemporaryDirectory() as temp_dir:

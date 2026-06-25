@@ -1186,13 +1186,14 @@ class AppGUI:
         self._dialog_entry(dialog, "Page ID", self.facebook_page_id_var, 0, width=360)
         self._dialog_entry(dialog, "Page access token", self.facebook_page_access_token_var, 1, width=420, show="*")
         self._dialog_entry(dialog, "Caption template", self.facebook_intro_text_var, 2, width=520)
-        ctk.CTkCheckBox(dialog, text="Dry-run only", variable=self.facebook_dry_run_var).grid(
+        ctk.CTkCheckBox(dialog, text="Dry-run cho auto publish", variable=self.facebook_dry_run_var).grid(
             row=3, column=1, sticky="w", padx=10, pady=8
         )
 
         help_text = (
             "Use a Facebook Page access token with publishing permission. "
-            "Dry-run creates cards and shows the payload without posting."
+            "Preview only simulates the post. Post publishes for real and comments source links on each photo. "
+            "Dry-run only applies to auto publish."
         )
         ctk.CTkLabel(dialog, text=help_text, text_color=("gray35", "gray75"), wraplength=620, justify="left").grid(
             row=4, column=0, columnspan=2, sticky="ew", padx=16, pady=(12, 4)
@@ -1259,7 +1260,7 @@ class AppGUI:
         output, ok = self._task_post_facebook_cards(
             result["cards_result"]["cards"],
             result.get("brief_label"),
-            dry_run=self.facebook_dry_run_var.get(),
+            dry_run=False,
         )
         return f"{self._format_selected_source_cards_result(result)}\n\n{output}", ok
 
@@ -1299,7 +1300,7 @@ class AppGUI:
 
         if result.get("dry_run"):
             lines = [
-                "Facebook dry-run: no post created",
+                "Facebook dry-run: no post created, no comments created",
                 f"Page ID: {result['page_id']}",
                 f"Photos: {len(result['image_paths'])}",
                 f"Source link comments planned: {len(result.get('planned_comments') or [])}",

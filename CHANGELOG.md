@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.12 - 2026-06-25
+
+- Tự comment `Link nguồn: <URL gốc>` vào từng ảnh Facebook sau khi đăng thành công.
+- Dry-run hiển thị danh sách comment link nguồn dự kiến mà không gọi API comment.
+- Nếu comment link nguồn lỗi, app vẫn giữ bài đã đăng, cập nhật publish ledger và báo cảnh báo.
+
 ## v1.0.11 - 2026-06-25
 
 - Khôi phục caption Facebook mặc định về mẫu cũ có tiêu đề buổi sáng/tối và hashtag.

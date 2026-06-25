@@ -5,6 +5,7 @@ import requests
 
 
 FACEBOOK_GRAPH_API_BASE = "https://graph.facebook.com/v20.0"
+SOURCE_LINK_COMMENT_PREFIX = "Link nguồn: "
 
 
 class FacebookAPIError(RuntimeError):
@@ -42,6 +43,7 @@ def publish_photo_post(page_id, access_token, cards, message, dry_run=False, ses
 
     attached_media = [{"media_fbid": f"dry_run_photo_{index}"} for index, _ in enumerate(image_paths, start=1)]
     post_payload = _post_payload(access_token, message, attached_media)
+    planned_comments = _planned_source_link_comments(cards, [item["media_fbid"] for item in attached_media])
     if dry_run:
         return {
             "dry_run": True,
@@ -50,6 +52,9 @@ def publish_photo_post(page_id, access_token, cards, message, dry_run=False, ses
             "image_paths": [str(path) for path in image_paths],
             "post_payload": _redacted_payload(post_payload),
             "uploaded_photo_ids": [item["media_fbid"] for item in attached_media],
+            "planned_comments": planned_comments,
+            "source_link_comments": [],
+            "comment_errors": [],
             "post_id": None,
             "fallback": False,
         }
@@ -67,12 +72,20 @@ def publish_photo_post(page_id, access_token, cards, message, dry_run=False, ses
         attached_media = [{"media_fbid": photo_id} for photo_id in uploaded_photo_ids]
         try:
             post = create_photo_feed_post(page_id, access_token, message, attached_media, session=session)
+            comments, comment_errors = comment_source_links(
+                access_token,
+                cards,
+                uploaded_photo_ids,
+                session=session,
+            )
             return {
                 "dry_run": False,
                 "page_id": page_id,
                 "message": str(message or "").strip(),
                 "image_paths": [str(path) for path in image_paths],
                 "uploaded_photo_ids": uploaded_photo_ids,
+                "source_link_comments": comments,
+                "comment_errors": comment_errors,
                 "post_id": post.get("id"),
                 "fallback": False,
                 "post": post,
@@ -87,12 +100,21 @@ def publish_photo_post(page_id, access_token, cards, message, dry_run=False, ses
                     message,
                     session=session,
                 )
+                fallback_photo_ids = [str(item.get("id") or "").strip() for item in fallback_posts]
+                comments, comment_errors = comment_source_links(
+                    access_token,
+                    cards,
+                    fallback_photo_ids,
+                    session=session,
+                )
                 return {
                     "dry_run": False,
                     "page_id": page_id,
                     "message": str(message or "").strip(),
                     "image_paths": [str(path) for path in image_paths],
                     "uploaded_photo_ids": uploaded_photo_ids,
+                    "source_link_comments": comments,
+                    "comment_errors": comment_errors,
                     "post_id": fallback_posts[0].get("id") if fallback_posts else None,
                     "fallback": True,
                     "posts": fallback_posts,
@@ -128,6 +150,64 @@ def create_photo_feed_post(page_id, access_token, message, attached_media, sessi
     return _facebook_payload(response)
 
 
+def comment_on_object(object_id, access_token, message, session=None):
+    object_id = _required_text(object_id, "Facebook object ID")
+    access_token = _required_text(access_token, "Facebook Page access token")
+    message = _required_text(message, "Facebook comment message")
+    session = session or requests.Session()
+    response = session.post(
+        f"{FACEBOOK_GRAPH_API_BASE}/{object_id}/comments",
+        data={"access_token": access_token, "message": message},
+        timeout=30,
+    )
+    return _facebook_payload(response)
+
+
+def comment_source_links(access_token, cards, object_ids, session=None):
+    comments = []
+    errors = []
+    ids = list(object_ids or [])
+    for index, card in enumerate(cards or [], start=1):
+        object_id = ids[index - 1] if index <= len(ids) else ""
+        message = source_link_comment_message(card)
+        if not object_id:
+            errors.append({
+                "card_index": index,
+                "photo_id": "",
+                "message": message,
+                "error": "missing Facebook photo id",
+            })
+            continue
+        if not message:
+            errors.append({
+                "card_index": index,
+                "photo_id": object_id,
+                "message": "",
+                "error": "missing original_url",
+            })
+            continue
+        try:
+            comment = comment_on_object(object_id, access_token, message, session=session)
+            comments.append({
+                "card_index": index,
+                "photo_id": object_id,
+                "message": message,
+                "comment_id": comment.get("id"),
+                "comment": comment,
+            })
+        except FacebookAPIError as exc:
+            errors.append({
+                "card_index": index,
+                "photo_id": object_id,
+                "message": message,
+                "error": str(exc),
+                "status_code": exc.status_code,
+                "error_type": exc.error_type,
+                "error_code": exc.error_code,
+            })
+    return comments, errors
+
+
 def publish_single_photo_posts(page_id, access_token, image_paths, message, session=None):
     session = session or requests.Session()
     posts = []
@@ -148,6 +228,15 @@ def publish_single_photo_posts(page_id, access_token, image_paths, message, sess
     return posts
 
 
+def source_link_comment_message(card):
+    if not isinstance(card, dict):
+        return ""
+    url = str(card.get("original_url") or card.get("canonical_url") or "").strip()
+    if not url:
+        return ""
+    return f"{SOURCE_LINK_COMMENT_PREFIX}{url}"
+
+
 def validate_cards_publish_safety(cards):
     errors = []
     for index, card in enumerate(cards or [], start=1):
@@ -165,6 +254,18 @@ def _post_payload(access_token, message, attached_media):
     for index, media in enumerate(attached_media):
         data[f"attached_media[{index}]"] = json.dumps(media, ensure_ascii=False)
     return data
+
+
+def _planned_source_link_comments(cards, object_ids):
+    planned = []
+    ids = list(object_ids or [])
+    for index, card in enumerate(cards or [], start=1):
+        planned.append({
+            "card_index": index,
+            "photo_id": ids[index - 1] if index <= len(ids) else "",
+            "message": source_link_comment_message(card),
+        })
+    return planned
 
 
 def _facebook_payload(response):

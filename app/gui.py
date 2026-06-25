@@ -1203,22 +1203,36 @@ class AppGUI:
                 "Facebook dry-run: no post created",
                 f"Page ID: {result['page_id']}",
                 f"Photos: {len(result['image_paths'])}",
+                f"Source link comments planned: {len(result.get('planned_comments') or [])}",
                 "Caption:",
                 result.get("message") or "",
                 "Images:",
             ]
             lines.extend(f"- {path}" for path in result["image_paths"])
+            planned_comments = result.get("planned_comments") or []
+            if planned_comments:
+                lines.append("Planned source link comments:")
+                lines.extend(f"- Card {item.get('card_index')}: {item.get('message')}" for item in planned_comments)
             return "\n".join(lines), True
 
         post_id = result.get("post_id") or ""
         saved = mark_items_published(cards, facebook_page_id=page_id, facebook_post_id=post_id)
         mode = "fallback single-photo posts" if result.get("fallback") else "multi-photo post"
+        source_comments = result.get("source_link_comments") or []
+        comment_errors = result.get("comment_errors") or []
         lines = [
             f"Facebook published: {mode}",
             f"Post ID: {post_id or 'unknown'}",
             f"Uploaded photos: {len(result.get('uploaded_photo_ids') or [])}",
+            f"Source link comments: {len(source_comments)} created, {len(comment_errors)} failed",
             f"Published ledger updated: {saved} items",
         ]
+        if comment_errors:
+            lines.append("Source link comment warnings:")
+            lines.extend(
+                f"- Card {item.get('card_index')}: {item.get('error')}"
+                for item in comment_errors
+            )
         return "\n".join(lines), True
 
     def _check_api_key(self):

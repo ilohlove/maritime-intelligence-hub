@@ -1192,7 +1192,7 @@ class AppGUI:
 
         help_text = (
             "Use a Facebook Page access token with publishing permission. "
-            "Preview only simulates the post. Post publishes for real and comments source links on each photo. "
+            "Preview only simulates the post. Post publishes for real and adds source links to each photo description. "
             "Dry-run only applies to auto publish."
         )
         ctk.CTkLabel(dialog, text=help_text, text_color=("gray35", "gray75"), wraplength=620, justify="left").grid(
@@ -1299,40 +1299,33 @@ class AppGUI:
             return f"Facebook post failed:\n{self._format_facebook_error(exc, token)}{suffix}", False
 
         if result.get("dry_run"):
+            photo_descriptions = result.get("photo_descriptions") or []
             lines = [
-                "Facebook dry-run: no post created, no comments created",
+                "Facebook dry-run: no post created",
                 f"Page ID: {result['page_id']}",
                 f"Photos: {len(result['image_paths'])}",
-                f"Source link comments planned: {len(result.get('planned_comments') or [])}",
+                f"Photo descriptions planned: {len(photo_descriptions)}",
                 "Caption:",
                 result.get("message") or "",
                 "Images:",
             ]
             lines.extend(f"- {path}" for path in result["image_paths"])
-            planned_comments = result.get("planned_comments") or []
-            if planned_comments:
-                lines.append("Planned source link comments:")
-                lines.extend(f"- Card {item.get('card_index')}: {item.get('message')}" for item in planned_comments)
+            if photo_descriptions:
+                lines.append("Planned photo descriptions:")
+                lines.extend(f"- Card {index}: {description}" for index, description in enumerate(photo_descriptions, start=1))
             return "\n".join(lines), True
 
         post_id = result.get("post_id") or ""
         saved = mark_items_published(cards, facebook_page_id=page_id, facebook_post_id=post_id)
         mode = "fallback single-photo posts" if result.get("fallback") else "multi-photo post"
-        source_comments = result.get("source_link_comments") or []
-        comment_errors = result.get("comment_errors") or []
+        photo_descriptions = result.get("photo_descriptions") or []
         lines = [
             f"Facebook published: {mode}",
             f"Post ID: {post_id or 'unknown'}",
             f"Uploaded photos: {len(result.get('uploaded_photo_ids') or [])}",
-            f"Source link comments: {len(source_comments)} created, {len(comment_errors)} failed",
+            f"Photo descriptions with source links: {len(photo_descriptions)}",
             f"Published ledger updated: {saved} items",
         ]
-        if comment_errors:
-            lines.append("Source link comment warnings:")
-            lines.extend(
-                f"- Card {item.get('card_index')}: {item.get('error')}"
-                for item in comment_errors
-            )
         return "\n".join(lines), True
 
     def _check_api_key(self):

@@ -7,7 +7,7 @@ from app.services.facebook_publisher import (
     FacebookAPIError,
     check_page,
     publish_photo_post,
-    source_link_comment_message,
+    source_link_description,
     validate_cards_publish_safety,
 )
 
@@ -49,15 +49,15 @@ class FacebookPublisherTests(unittest.TestCase):
 
         self.assertTrue(result["dry_run"])
         self.assertEqual(result["image_paths"][0], str(image_path))
-        self.assertEqual(result["planned_comments"][0]["message"], "Link nguồn: https://example.com/story")
+        self.assertEqual(result["photo_descriptions"][0], "Link nguồn: https://example.com/story")
         session.post.assert_not_called()
 
-    def test_source_link_comment_message_uses_vietnamese_prefix(self):
-        message = source_link_comment_message({"original_url": "https://example.com/story"})
+    def test_source_link_description_uses_vietnamese_prefix(self):
+        message = source_link_description({"original_url": "https://example.com/story"})
 
         self.assertEqual(message, "Link nguồn: https://example.com/story")
 
-    def test_multi_photo_post_uploads_each_photo_creates_feed_post_and_comments_links(self):
+    def test_multi_photo_post_uploads_each_photo_with_source_description_and_creates_feed_post(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             first = Path(temp_dir) / "card-1.png"
             second = Path(temp_dir) / "card-2.png"
@@ -68,8 +68,6 @@ class FacebookPublisherTests(unittest.TestCase):
                 _response({"id": "photo-1"}),
                 _response({"id": "photo-2"}),
                 _response({"id": "page-1_post-1"}),
-                _response({"id": "comment-1"}),
-                _response({"id": "comment-2"}),
             ]
 
             result = publish_photo_post(
@@ -82,48 +80,20 @@ class FacebookPublisherTests(unittest.TestCase):
 
         self.assertEqual(result["post_id"], "page-1_post-1")
         self.assertEqual(result["uploaded_photo_ids"], ["photo-1", "photo-2"])
-        self.assertEqual([item["comment_id"] for item in result["source_link_comments"]], ["comment-1", "comment-2"])
-        self.assertEqual(result["comment_errors"], [])
-        self.assertEqual(session.post.call_count, 5)
+        self.assertEqual(
+            result["photo_descriptions"],
+            ["Link nguồn: https://example.com/first", "Link nguồn: https://example.com/second"],
+        )
+        self.assertEqual(session.post.call_count, 3)
+        _, first_upload_kwargs = session.post.call_args_list[0]
+        _, second_upload_kwargs = session.post.call_args_list[1]
+        self.assertEqual(first_upload_kwargs["data"]["caption"], "Link nguồn: https://example.com/first")
+        self.assertEqual(second_upload_kwargs["data"]["caption"], "Link nguồn: https://example.com/second")
         _, feed_kwargs = session.post.call_args_list[2]
         self.assertIn("attached_media[0]", feed_kwargs["data"])
         self.assertIn("attached_media[1]", feed_kwargs["data"])
-        first_comment_url, first_comment_kwargs = session.post.call_args_list[3]
-        second_comment_url, second_comment_kwargs = session.post.call_args_list[4]
-        self.assertTrue(first_comment_url[0].endswith("/photo-1/comments"))
-        self.assertEqual(first_comment_kwargs["data"]["message"], "Link nguồn: https://example.com/first")
-        self.assertTrue(second_comment_url[0].endswith("/photo-2/comments"))
-        self.assertEqual(second_comment_kwargs["data"]["message"], "Link nguồn: https://example.com/second")
 
-    def test_comment_failure_does_not_fail_successful_post(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            first = Path(temp_dir) / "card-1.png"
-            second = Path(temp_dir) / "card-2.png"
-            first.write_bytes(b"fake-png-1")
-            second.write_bytes(b"fake-png-2")
-            session = Mock()
-            session.post.side_effect = [
-                _response({"id": "photo-1"}),
-                _response({"id": "photo-2"}),
-                _response({"id": "page-1_post-1"}),
-                _response({"id": "comment-1"}),
-                _response({"error": {"message": "Comment blocked", "type": "OAuthException", "code": 200}}, status_code=400),
-            ]
-
-            result = publish_photo_post(
-                "page-1",
-                "token",
-                [_card(first, "https://example.com/first"), _card(second, "https://example.com/second")],
-                "Caption",
-                session=session,
-            )
-
-        self.assertEqual(result["post_id"], "page-1_post-1")
-        self.assertEqual(len(result["source_link_comments"]), 1)
-        self.assertEqual(len(result["comment_errors"]), 1)
-        self.assertIn("Comment blocked", result["comment_errors"][0]["error"])
-
-    def test_fallback_single_photo_posts_comment_each_returned_photo_id(self):
+    def test_fallback_single_photo_posts_include_source_link_in_each_photo_message(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             first = Path(temp_dir) / "card-1.png"
             second = Path(temp_dir) / "card-2.png"
@@ -139,8 +109,6 @@ class FacebookPublisherTests(unittest.TestCase):
                 ),
                 _response({"id": "fallback-photo-1"}),
                 _response({"id": "fallback-photo-2"}),
-                _response({"id": "comment-1"}),
-                _response({"id": "comment-2"}),
             ]
 
             result = publish_photo_post(
@@ -153,11 +121,12 @@ class FacebookPublisherTests(unittest.TestCase):
 
         self.assertTrue(result["fallback"])
         self.assertEqual(result["post_id"], "fallback-photo-1")
-        self.assertEqual(
-            [item["photo_id"] for item in result["source_link_comments"]],
-            ["fallback-photo-1", "fallback-photo-2"],
-        )
-        self.assertEqual(session.post.call_count, 7)
+        self.assertEqual(result["photo_descriptions"][0], "Link nguồn: https://example.com/first")
+        self.assertEqual(session.post.call_count, 5)
+        _, first_fallback_kwargs = session.post.call_args_list[3]
+        _, second_fallback_kwargs = session.post.call_args_list[4]
+        self.assertEqual(first_fallback_kwargs["data"]["message"], "Caption\n\nLink nguồn: https://example.com/first")
+        self.assertEqual(second_fallback_kwargs["data"]["message"], "Link nguồn: https://example.com/second")
 
     def test_missing_image_path_fails_before_api_call(self):
         session = Mock()

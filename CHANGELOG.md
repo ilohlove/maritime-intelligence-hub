@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.15 - 2026-06-27
+
+- Đưa link nguồn vào mô tả của từng ảnh Facebook thay vì tạo comment riêng.
+- Preview và CLI hiển thị số mô tả ảnh có link nguồn dự kiến.
+- Gỡ luồng comment link nguồn để giảm lỗi quyền comment khi đăng Facebook.
+
 ## v1.0.14 - 2026-06-25
 
 - Nút Post Facebook thủ công luôn đăng thật và tạo comment link nguồn cho từng ảnh.

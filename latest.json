@@ -1,11 +1,11 @@
 {
-  "version": "1.0.14",
-  "release_date": "2026-06-25",
-  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.0.14/BV-maritime-intelligence-hub.exe",
+  "version": "1.0.15",
+  "release_date": "2026-06-27",
+  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.0.15/BV-maritime-intelligence-hub.exe",
   "changelog": [
-    "Nút Post Facebook thủ công luôn đăng thật và tạo comment link nguồn cho từng ảnh.",
-    "Preview Facebook tiếp tục chỉ mô phỏng, không tạo bài đăng hoặc comment thật.",
-    "Làm rõ checkbox dry-run chỉ áp dụng cho auto publish."
+    "Đưa link nguồn vào mô tả của từng ảnh Facebook thay vì tạo comment riêng.",
+    "Preview và CLI hiển thị số mô tả ảnh có link nguồn dự kiến.",
+    "Gỡ luồng comment link nguồn để giảm lỗi quyền comment khi đăng Facebook."
   ],
   "force_update": false
 }

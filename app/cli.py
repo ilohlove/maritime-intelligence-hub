@@ -386,21 +386,13 @@ def _post_facebook_from_cli(dry_run=False):
     if publish_result.get("dry_run"):
         print("Facebook dry-run: no post created")
         print(f"Photos: {len(publish_result['image_paths'])}")
-        print(f"Source link comments planned: {len(publish_result.get('planned_comments') or [])}")
+        print(f"Photo descriptions planned: {len(publish_result.get('photo_descriptions') or [])}")
         return 0
 
     post_id = publish_result.get("post_id") or ""
     saved = mark_items_published(cards, facebook_page_id=page_id, facebook_post_id=post_id)
-    source_comments = publish_result.get("source_link_comments") or []
-    comment_errors = publish_result.get("comment_errors") or []
     print(f"Facebook published: {post_id or 'unknown post id'}")
-    print(f"Source link comments: {len(source_comments)} created, {len(comment_errors)} failed")
-    if comment_errors:
-        print("Source link comment warnings:")
-        print(format_errors(
-            f"Card {item.get('card_index')}: {item.get('error')}"
-            for item in comment_errors
-        ))
+    print(f"Photo descriptions with source links: {len(publish_result.get('photo_descriptions') or [])}")
     print(f"Published ledger updated: {saved} items")
     return 0
 

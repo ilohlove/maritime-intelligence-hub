@@ -228,6 +228,7 @@ class GuiSelectedSourceTests(unittest.TestCase):
             "page_id": "page-1",
             "message": "caption",
             "image_paths": ["card-1.png"],
+            "photo_descriptions": ["Link nguồn: https://example.com/story"],
         }) as publish:
             with patch("app.gui.mark_items_published") as mark:
                 output, ok = AppGUI._task_post_facebook_cards(app, cards, "morning", dry_run=True)
@@ -235,7 +236,8 @@ class GuiSelectedSourceTests(unittest.TestCase):
         self.assertTrue(ok)
         publish.assert_called_once()
         mark.assert_not_called()
-        self.assertIn("Facebook dry-run: no post created, no comments created", output)
+        self.assertIn("Facebook dry-run: no post created", output)
+        self.assertIn("Photo descriptions planned: 1", output)
 
     def test_facebook_publish_marks_items_with_post_id(self):
         app = _gui_stub()
@@ -258,8 +260,7 @@ class GuiSelectedSourceTests(unittest.TestCase):
             "page_id": "page-1",
             "post_id": "post-1",
             "uploaded_photo_ids": ["photo-1"],
-            "source_link_comments": [{"card_index": 1, "photo_id": "photo-1", "message": "Link nguồn: https://example.com/story"}],
-            "comment_errors": [],
+            "photo_descriptions": ["Link nguồn: https://example.com/story"],
             "fallback": False,
         }):
             with patch("app.gui.mark_items_published", return_value=1) as mark:
@@ -268,40 +269,7 @@ class GuiSelectedSourceTests(unittest.TestCase):
         self.assertTrue(ok)
         mark.assert_called_once_with(cards, facebook_page_id="page-1", facebook_post_id="post-1")
         self.assertIn("Facebook published", output)
-        self.assertIn("Source link comments: 1 created, 0 failed", output)
-
-    def test_facebook_publish_reports_source_link_comment_warnings(self):
-        app = _gui_stub()
-        app.facebook_page_id_var = _Var("page-1")
-        app.facebook_page_access_token_var = _Var("token")
-        app.facebook_dry_run_var = _Var(False)
-        app.facebook_intro_text_var = _Var("{date}")
-        app._vietnam_now = Mock(return_value=_FakeNow("2026-06-18 07:15"))
-        cards = [
-            {
-                "card_path": "card-1.png",
-                "source_name": "Source",
-                "original_url": "https://example.com/story",
-                "item_key": "url:test",
-            }
-        ]
-
-        with patch("app.gui.publish_photo_post", return_value={
-            "dry_run": False,
-            "page_id": "page-1",
-            "post_id": "post-1",
-            "uploaded_photo_ids": ["photo-1"],
-            "source_link_comments": [],
-            "comment_errors": [{"card_index": 1, "error": "400: Comment blocked"}],
-            "fallback": False,
-        }):
-            with patch("app.gui.mark_items_published", return_value=1):
-                output, ok = AppGUI._task_post_facebook_cards(app, cards, "morning", dry_run=False)
-
-        self.assertTrue(ok)
-        self.assertIn("Source link comments: 0 created, 1 failed", output)
-        self.assertIn("Source link comment warnings", output)
-        self.assertIn("400: Comment blocked", output)
+        self.assertIn("Photo descriptions with source links: 1", output)
 
     def test_facebook_preview_uses_latest_rendered_cards_without_rendering(self):
         app = _gui_stub()

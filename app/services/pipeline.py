@@ -8,6 +8,7 @@ from app.services.brief_writer import generate_brief, generate_scan_brief
 from app.services.html_collector import fetch_html_sources, run_html_dry_run
 from app.services.rss_collector import fetch_rss_sources
 from app.services.scoring import score_pending_articles
+from app.services.retention import cleanup_runtime_artifacts
 from app.services.source_master import (
     format_fetch_plan,
     format_validation_report,
@@ -124,7 +125,9 @@ def write_brief(brief_type, db_path=DEFAULT_DB_PATH):
 
 def write_scan_brief(scan_label="morning", db_path=DEFAULT_DB_PATH, limit=12):
     init_db(db_path)
-    return generate_scan_brief(scan_label=scan_label, db_path=db_path, limit=limit)
+    result = generate_scan_brief(scan_label=scan_label, db_path=db_path, limit=limit)
+    cleanup_runtime_artifacts()
+    return result
 
 
 def run_pipeline(

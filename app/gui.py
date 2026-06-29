@@ -40,6 +40,7 @@ from app.services.combined_brief_source import (
     get_sheet_run_status,
 )
 from app.services.facebook_publisher import check_page, publish_photo_post, validate_cards_publish_safety
+from app.services.retention import cleanup_runtime_artifacts, cleanup_update_artifacts
 from app.services.source_master import ALLOWED_VALUES, append_manual_source
 from app.services.storage import DEFAULT_DB_PATH, count_rows, init_db, mark_items_published
 from app.services.telegram_publisher import check_bot, check_chat, send_message, send_photos
@@ -82,6 +83,7 @@ class AppGUI:
         self._load_sources_view()
         self._load_log_file()
         self._append_output("GUI opened")
+        self._start_startup_cleanup()
         self.root.after(800, self._check_update_on_startup)
         self.root.after(30000, self._scheduler_tick)
 
@@ -1820,6 +1822,19 @@ class AppGUI:
 
     def _check_update_on_startup(self):
         self._start_update_check(is_manual=False)
+
+    def _start_startup_cleanup(self):
+        threading.Thread(target=self._run_startup_cleanup, daemon=True).start()
+
+    def _run_startup_cleanup(self):
+        try:
+            runtime_removed = cleanup_runtime_artifacts()
+            update_removed = cleanup_update_artifacts(exe_name=self.metadata.get("exe_name", "BV-App.exe"))
+            total_removed = sum(int(value or 0) for value in runtime_removed.values()) + len(update_removed)
+            if total_removed and hasattr(self, "root") and hasattr(self, "output_box"):
+                self.root.after(0, self._append_output, f"Startup cleanup removed {total_removed} old runtime item(s)")
+        except Exception as exc:
+            logger.warning("Startup cleanup failed: %s", exc)
 
     def _check_update(self):
         self._start_update_check(is_manual=True)

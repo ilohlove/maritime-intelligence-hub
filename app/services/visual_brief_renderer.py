@@ -12,6 +12,7 @@ import requests
 
 from app.config import ROOT_DIR
 from app.services.combined_brief_source import normalize_source_url
+from app.services.retention import cleanup_runtime_artifacts
 from app.services.rss_collector import REQUEST_TIMEOUT, USER_AGENT
 
 
@@ -94,6 +95,8 @@ def generate_image_cards(
     manifest_path = write_manifest(run_dir, payload, source_path, cards, preview_path)
     if open_preview:
         webbrowser.open(preview_path.resolve().as_uri())
+    if output_dir is None:
+        cleanup_runtime_artifacts()
 
     return {
         "brief_type": brief_type,

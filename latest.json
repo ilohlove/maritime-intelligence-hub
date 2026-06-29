@@ -1,11 +1,11 @@
 {
-  "version": "1.0.15",
-  "release_date": "2026-06-27",
-  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.0.15/BV-maritime-intelligence-hub.exe",
+  "version": "1.1.0",
+  "release_date": "2026-06-29",
+  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.1.0/BV-maritime-intelligence-hub.exe",
   "changelog": [
-    "Đưa link nguồn vào mô tả của từng ảnh Facebook thay vì tạo comment riêng.",
-    "Preview và CLI hiển thị số mô tả ảnh có link nguồn dự kiến.",
-    "Gỡ luồng comment link nguồn để giảm lỗi quyền comment khi đăng Facebook."
+    "Add 2-day runtime cleanup for output and temp artifacts.",
+    "Clean old update exe and backup exe after the new GUI opens successfully.",
+    "Preserve latest brief files and database history while reducing disk usage."
   ],
   "force_update": false
 }

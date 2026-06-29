@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.0 - 2026-06-29
+
+- Add 2-day runtime cleanup for output and temp artifacts.
+- Clean old update exe and backup exe after the new GUI opens successfully.
+- Preserve latest brief files and database history while reducing disk usage.
+
 ## v1.0.15 - 2026-06-27
 
 - Đưa link nguồn vào mô tả của từng ảnh Facebook thay vì tạo comment riêng.

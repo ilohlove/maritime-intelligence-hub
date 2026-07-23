@@ -38,6 +38,14 @@ Stores each source fetch attempt, status, error, and duration.
 
 Stores duplicate relationships and matching reason.
 
+### facebook_group_deliveries
+
+Stores one delivery per Facebook Group and content batch. The unique `(batch_id, group_id)` pair prevents duplicate submissions. Status values include `queued`, `published`, `pending`, `failed`, `needs_login`, `expired`, and `cancelled`. Scheduling time, expiry, group priority, attempt count, safety stop reason, saved publish payload, and an optional post URL support quota enforcement, rotation, selected retry, and queue recovery.
+
+### facebook_group_attempts
+
+Append-only log of real publish attempts used to enforce the Vietnam-calendar-day quota correctly, including repeated manual retries of the same delivery. Dry-runs, queued rows, and login-only failures do not consume quota.
+
 ## MVP Database Choice
 
 Use PostgreSQL for the real service. SQLite may be used only for quick local prototype work if it does not change the schema design.

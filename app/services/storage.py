@@ -152,6 +152,41 @@ def init_db(db_path=DEFAULT_DB_PATH):
 
             CREATE INDEX IF NOT EXISTS idx_published_items_url ON published_items(canonical_url);
             CREATE INDEX IF NOT EXISTS idx_published_items_title_hash ON published_items(title_hash);
+
+            CREATE TABLE IF NOT EXISTS facebook_group_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                group_name TEXT,
+                group_url TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempted_at TEXT NOT NULL,
+                completed_at TEXT,
+                post_url TEXT,
+                error_message TEXT,
+                scheduled_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                stop_reason TEXT,
+                expires_at TEXT,
+                priority INTEGER NOT NULL DEFAULT 100,
+                payload_json TEXT NOT NULL,
+                UNIQUE(batch_id, group_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_facebook_group_deliveries_status
+            ON facebook_group_deliveries(status);
+
+            CREATE TABLE IF NOT EXISTS facebook_group_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempted_at TEXT NOT NULL,
+                stop_reason TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_facebook_group_attempts_time
+            ON facebook_group_attempts(attempted_at);
             """
         )
         _ensure_column(conn, "articles", "hotness_score", "INTEGER")
@@ -165,6 +200,32 @@ def init_db(db_path=DEFAULT_DB_PATH):
         _ensure_column(conn, "published_items", "telegram_chat_id", "TEXT")
         _ensure_column(conn, "published_items", "facebook_page_id", "TEXT")
         _ensure_column(conn, "published_items", "facebook_post_id", "TEXT")
+        _ensure_column(conn, "facebook_group_deliveries", "scheduled_at", "TEXT")
+        _ensure_column(conn, "facebook_group_deliveries", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "facebook_group_deliveries", "stop_reason", "TEXT")
+        _ensure_column(conn, "facebook_group_deliveries", "expires_at", "TEXT")
+        _ensure_column(conn, "facebook_group_deliveries", "priority", "INTEGER NOT NULL DEFAULT 100")
+        conn.execute(
+            """
+            UPDATE facebook_group_deliveries
+            SET expires_at = strftime('%Y-%m-%dT%H:%M:%S+00:00', attempted_at, '+12 hours')
+            WHERE status IN ('queued', 'failed', 'needs_login') AND expires_at IS NULL
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO facebook_group_attempts (batch_id, group_id, status, attempted_at, stop_reason)
+            SELECT d.batch_id, d.group_id, d.status, d.attempted_at, d.stop_reason
+            FROM facebook_group_deliveries AS d
+            WHERE d.status IN ('published', 'pending', 'failed')
+              AND NOT EXISTS (
+                  SELECT 1 FROM facebook_group_attempts AS a
+                  WHERE a.batch_id = d.batch_id
+                    AND a.group_id = d.group_id
+                    AND a.attempted_at = d.attempted_at
+              )
+            """
+        )
 
 
 def _ensure_column(conn, table, column, column_type):
@@ -325,8 +386,6 @@ def update_article_score(article_id, score, db_path=DEFAULT_DB_PATH, hotness_sco
                 article_id,
             ),
         )
-
-
 def get_articles_for_scoring(db_path=DEFAULT_DB_PATH):
     init_db(db_path)
     with connect_db(db_path) as conn:
@@ -566,6 +625,203 @@ def mark_items_published(items, telegram_chat_id="", facebook_page_id="", facebo
             )
             saved += 1
     return saved
+
+
+def get_facebook_group_delivery(batch_id, group_id, db_path=DEFAULT_DB_PATH):
+    init_db(db_path)
+    with connect_db(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT id, batch_id, group_id, group_name, group_url, status,
+                   attempted_at, completed_at, post_url, error_message,
+                   scheduled_at, attempt_count, stop_reason, expires_at,
+                   priority, payload_json
+            FROM facebook_group_deliveries
+            WHERE batch_id = ? AND group_id = ?
+            """,
+            (str(batch_id), str(group_id)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def record_facebook_group_delivery(
+    batch_id,
+    group,
+    status,
+    post_url="",
+    error_message="",
+    scheduled_at=None,
+    stop_reason="",
+    expires_at=None,
+    payload=None,
+    db_path=DEFAULT_DB_PATH,
+):
+    init_db(db_path)
+    now = utc_now()
+    group = dict(group or {})
+    status = str(status or "failed").strip().lower()
+    completed_at = now if status in {"published", "pending"} else None
+    safe_error = str(error_message or "").strip()[:1000]
+    safe_stop_reason = str(stop_reason or "").strip()[:500]
+    attempt_increment = 0 if status == "queued" else 1
+    safe_payload = dict(payload or {})
+    safe_payload.pop("cookies", None)
+    safe_payload.pop("storage_state", None)
+    with connect_db(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO facebook_group_deliveries (
+                batch_id, group_id, group_name, group_url, status, attempted_at,
+                completed_at, post_url, error_message, scheduled_at,
+                attempt_count, stop_reason, expires_at, priority, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(batch_id, group_id) DO UPDATE SET
+                group_name=excluded.group_name,
+                group_url=excluded.group_url,
+                status=excluded.status,
+                attempted_at=excluded.attempted_at,
+                completed_at=excluded.completed_at,
+                post_url=excluded.post_url,
+                error_message=excluded.error_message,
+                scheduled_at=excluded.scheduled_at,
+                attempt_count=facebook_group_deliveries.attempt_count +
+                    CASE WHEN excluded.status != 'queued' THEN 1 ELSE 0 END,
+                stop_reason=excluded.stop_reason,
+                expires_at=CASE
+                    WHEN excluded.status IN ('queued', 'failed', 'needs_login')
+                        THEN COALESCE(excluded.expires_at, facebook_group_deliveries.expires_at)
+                    ELSE NULL
+                END,
+                priority=excluded.priority,
+                payload_json=excluded.payload_json
+            """,
+            (
+                str(batch_id),
+                str(group.get("id") or ""),
+                str(group.get("name") or ""),
+                str(group.get("url") or ""),
+                status,
+                now,
+                completed_at,
+                str(post_url or ""),
+                safe_error,
+                str(scheduled_at or "") or None,
+                attempt_increment,
+                safe_stop_reason,
+                str(expires_at or "") or None,
+                max(1, int(group.get("priority") or 100)),
+                json.dumps(safe_payload, ensure_ascii=False),
+            ),
+        )
+        if status in {"published", "pending", "failed"}:
+            conn.execute(
+                """
+                INSERT INTO facebook_group_attempts (
+                    batch_id, group_id, status, attempted_at, stop_reason
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(batch_id),
+                    str(group.get("id") or ""),
+                    status,
+                    now,
+                    safe_stop_reason,
+                ),
+            )
+    return get_facebook_group_delivery(batch_id, group.get("id"), db_path=db_path)
+
+
+def list_facebook_group_deliveries(batch_id=None, db_path=DEFAULT_DB_PATH):
+    init_db(db_path)
+    query = """
+        SELECT id, batch_id, group_id, group_name, group_url, status,
+               attempted_at, completed_at, post_url, error_message,
+               scheduled_at, attempt_count, stop_reason, expires_at,
+               priority, payload_json
+        FROM facebook_group_deliveries
+    """
+    params = ()
+    if batch_id is not None:
+        query += " WHERE batch_id = ?"
+        params = (str(batch_id),)
+    query += " ORDER BY attempted_at DESC, id DESC"
+    with connect_db(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_facebook_group_delivery_by_id(delivery_id, db_path=DEFAULT_DB_PATH):
+    init_db(db_path)
+    with connect_db(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT id, batch_id, group_id, group_name, group_url, status,
+                   attempted_at, completed_at, post_url, error_message,
+                   scheduled_at, attempt_count, stop_reason, expires_at,
+                   priority, payload_json
+            FROM facebook_group_deliveries
+            WHERE id = ?
+            """,
+            (int(delivery_id),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def cancel_facebook_group_delivery(delivery_id, db_path=DEFAULT_DB_PATH):
+    init_db(db_path)
+    with connect_db(db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE facebook_group_deliveries
+            SET status = 'cancelled', scheduled_at = NULL, stop_reason = 'Cancelled by user'
+            WHERE id = ? AND status IN ('queued', 'failed', 'needs_login')
+            """,
+            (int(delivery_id),),
+        )
+    return cursor.rowcount > 0
+
+
+def expire_facebook_group_deliveries(now_iso, db_path=DEFAULT_DB_PATH):
+    init_db(db_path)
+    with connect_db(db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE facebook_group_deliveries
+            SET status = 'expired', scheduled_at = NULL, stop_reason = 'Queue item expired'
+            WHERE status IN ('queued', 'failed', 'needs_login')
+              AND expires_at IS NOT NULL AND expires_at <= ?
+            """,
+            (str(now_iso),),
+        )
+    return cursor.rowcount
+
+
+def get_facebook_group_last_delivery_times(db_path=DEFAULT_DB_PATH):
+    init_db(db_path)
+    with connect_db(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT group_id, MAX(completed_at) AS last_delivered_at
+            FROM facebook_group_deliveries
+            WHERE status IN ('published', 'pending')
+            GROUP BY group_id
+            """
+        ).fetchall()
+    return {str(row["group_id"]): row["last_delivered_at"] for row in rows}
+
+
+def count_facebook_group_attempts_since(since_iso, db_path=DEFAULT_DB_PATH):
+    init_db(db_path)
+    with connect_db(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM facebook_group_attempts
+            WHERE attempted_at >= ?
+            """,
+            (str(since_iso),),
+        ).fetchone()
+    return int(row["total"] or 0)
 
 
 def upsert_trend_keyword(keyword, category, timeframe, source, search_volume=None, started_at=None, status=None, db_path=DEFAULT_DB_PATH):

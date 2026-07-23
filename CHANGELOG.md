@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.1 - 2026-07-23
+
+- Add safe Playwright publishing for Facebook Groups with reusable local login profiles.
+- Add per-brief and daily limits, randomized queue scheduling, duplicate protection, and safety stops.
+- Add a responsive Facebook Groups setup screen and queue manager with delivery status tracking.
+
 ## v1.1.0 - 2026-06-29
 
 - Add 2-day runtime cleanup for output and temp artifacts.

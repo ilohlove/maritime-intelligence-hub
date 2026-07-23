@@ -107,6 +107,15 @@ DEFAULT_SETTINGS = {
         "telegram_intro_text": "{date}",
         "facebook_intro_text": DEFAULT_FACEBOOK_INTRO_TEXT,
         "facebook_dry_run": True,
+        "post_facebook_groups": False,
+        "facebook_groups": [],
+        "facebook_group_delay_min_seconds": 900,
+        "facebook_group_delay_max_seconds": 1800,
+        "facebook_group_max_per_brief": 2,
+        "facebook_group_max_per_day": 4,
+        "facebook_group_queue_expiry_hours": 12,
+        "facebook_group_auto_resume_queue": True,
+        "facebook_group_dry_run": True,
     },
 }
 
@@ -210,6 +219,19 @@ def _normalize_runtime_settings(settings):
     publish = settings.setdefault("publish", {})
     if _is_legacy_facebook_template(publish.get("facebook_intro_text")):
         publish["facebook_intro_text"] = DEFAULT_FACEBOOK_INTRO_TEXT
+    groups = publish.get("facebook_groups")
+    publish["facebook_groups"] = [dict(group) for group in groups if isinstance(group, dict)] if isinstance(groups, list) else []
+    minimum = _non_negative_int(publish.get("facebook_group_delay_min_seconds"), 900)
+    maximum = _non_negative_int(publish.get("facebook_group_delay_max_seconds"), 1800)
+    if (minimum, maximum) == (60, 120):
+        minimum, maximum = 900, 1800
+    publish["facebook_group_delay_min_seconds"] = min(minimum, maximum)
+    publish["facebook_group_delay_max_seconds"] = max(minimum, maximum)
+    publish["facebook_group_max_per_brief"] = max(1, _non_negative_int(publish.get("facebook_group_max_per_brief"), 2))
+    publish["facebook_group_max_per_day"] = max(1, _non_negative_int(publish.get("facebook_group_max_per_day"), 4))
+    publish["facebook_group_queue_expiry_hours"] = max(
+        1, _non_negative_int(publish.get("facebook_group_queue_expiry_hours"), 12)
+    )
 
 
 def _facebook_template_or_default(template):
@@ -233,3 +255,10 @@ def _facebook_period(brief_label=None, now=None):
         return "evening"
     now = now or datetime.now(timezone.utc).astimezone(VIETNAM_TIMEZONE)
     return "morning" if now.hour < 12 else "evening"
+
+
+def _non_negative_int(value, default):
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default

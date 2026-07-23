@@ -40,6 +40,17 @@ from app.services.combined_brief_source import (
     get_sheet_run_status,
 )
 from app.services.facebook_publisher import check_page, publish_photo_post, validate_cards_publish_safety
+from app.services.facebook_group_publisher import (
+    cancel_group_queue_item,
+    get_due_queue_item,
+    get_group_queue_status,
+    list_group_queue,
+    open_login_session,
+    publish_queue_item,
+    publish_to_groups,
+    validate_group_caption_templates,
+    validate_group_config,
+)
 from app.services.retention import cleanup_runtime_artifacts, cleanup_update_artifacts
 from app.services.source_master import ALLOWED_VALUES, append_manual_source
 from app.services.storage import DEFAULT_DB_PATH, count_rows, init_db, mark_items_published
@@ -152,6 +163,32 @@ class AppGUI:
             value=publish.get("facebook_intro_text") or DEFAULT_FACEBOOK_INTRO_TEXT
         )
         self.facebook_dry_run_var = ctk.BooleanVar(value=bool(publish.get("facebook_dry_run", True)))
+        self.facebook_groups = [dict(group) for group in publish.get("facebook_groups", []) if isinstance(group, dict)]
+        captions_ready = validate_group_caption_templates(self.facebook_groups)["ready"]
+        self.post_facebook_groups_var = ctk.BooleanVar(
+            value=bool(publish.get("post_facebook_groups", False)) and captions_ready
+        )
+        self.facebook_group_dry_run_var = ctk.BooleanVar(value=bool(publish.get("facebook_group_dry_run", True)))
+        self.facebook_group_delay_min_var = ctk.StringVar(
+            value=str(publish.get("facebook_group_delay_min_seconds", 900))
+        )
+        self.facebook_group_delay_max_var = ctk.StringVar(
+            value=str(publish.get("facebook_group_delay_max_seconds", 1800))
+        )
+        self.facebook_group_max_per_brief_var = ctk.StringVar(
+            value=str(publish.get("facebook_group_max_per_brief", 2))
+        )
+        self.facebook_group_max_per_day_var = ctk.StringVar(
+            value=str(publish.get("facebook_group_max_per_day", 4))
+        )
+        self.facebook_group_queue_expiry_var = ctk.StringVar(
+            value=str(publish.get("facebook_group_queue_expiry_hours", 12))
+        )
+        self.facebook_group_auto_resume_var = ctk.BooleanVar(
+            value=bool(publish.get("facebook_group_auto_resume_queue", True))
+        )
+        self.facebook_group_status_var = ctk.StringVar(value=self._facebook_group_status_text())
+        self.facebook_group_rows = []
 
     def _build_layout(self):
         self.root.grid_columnconfigure(0, weight=1)
@@ -446,6 +483,23 @@ class AppGUI:
         facebook_row.grid(row=4, column=1, sticky="w", padx=10, pady=6)
         ctk.CTkCheckBox(facebook_row, text="Đăng Facebook", variable=self.post_facebook_var).pack(side="left")
         ctk.CTkButton(facebook_row, text="FB", width=44, command=self._open_facebook_dialog).pack(side="left", padx=(10, 0))
+        facebook_groups_row = ctk.CTkFrame(panel, fg_color="transparent")
+        facebook_groups_row.grid(row=5, column=1, sticky="ew", padx=10, pady=6)
+        facebook_groups_row.grid_columnconfigure(2, weight=1)
+        ctk.CTkCheckBox(
+            facebook_groups_row, text="Đăng Facebook Groups", variable=self.post_facebook_groups_var
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            facebook_groups_row, text="Groups", width=72, command=self._open_facebook_groups_dialog
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        ctk.CTkLabel(
+            facebook_groups_row,
+            textvariable=self.facebook_group_status_var,
+            text_color=("gray35", "gray75"),
+            anchor="w",
+            justify="left",
+            wraplength=720,
+        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         ctk.CTkButton(panel, text="Save Publish Settings", width=180, command=self._save_settings).grid(
             row=6, column=1, sticky="w", padx=10, pady=12
         )
@@ -457,6 +511,12 @@ class AppGUI:
         )
         ctk.CTkButton(panel, text="Post Facebook", width=150, command=self._post_facebook_now).grid(
             row=7, column=1, sticky="w", padx=(185, 10), pady=(0, 12)
+        )
+        ctk.CTkButton(panel, text="Preview Groups", width=160, command=self._preview_facebook_groups).grid(
+            row=8, column=1, sticky="w", padx=10, pady=(0, 12)
+        )
+        ctk.CTkButton(panel, text="Post 1 Queued Group", width=160, command=self._post_facebook_groups_now).grid(
+            row=8, column=1, sticky="w", padx=(185, 10), pady=(0, 12)
         )
 
     def _build_logs_tab(self):
@@ -508,6 +568,13 @@ class AppGUI:
             entry.configure(state="disabled" if max_variable.get() else "normal")
 
     def _save_settings(self):
+        caption_validation = validate_group_caption_templates(self.facebook_groups)
+        facebook_groups_enabled = self.post_facebook_groups_var.get()
+        facebook_groups_disabled_for_captions = False
+        if facebook_groups_enabled and not caption_validation["ready"]:
+            facebook_groups_enabled = False
+            facebook_groups_disabled_for_captions = True
+            self.post_facebook_groups_var.set(False)
         self.settings = {
             "scan": {
                 "auto_run_enabled": self.auto_run_var.get(),
@@ -541,6 +608,15 @@ class AppGUI:
                 "telegram_intro_text": self.telegram_intro_text_var.get().strip() or "{date}",
                 "facebook_intro_text": self.facebook_intro_text_var.get().strip() or DEFAULT_FACEBOOK_INTRO_TEXT,
                 "facebook_dry_run": self.facebook_dry_run_var.get(),
+                "post_facebook_groups": facebook_groups_enabled,
+                "facebook_groups": [dict(group) for group in self.facebook_groups],
+                "facebook_group_delay_min_seconds": self._int_var(self.facebook_group_delay_min_var, 900),
+                "facebook_group_delay_max_seconds": self._int_var(self.facebook_group_delay_max_var, 1800),
+                "facebook_group_max_per_brief": self._int_var(self.facebook_group_max_per_brief_var, 2),
+                "facebook_group_max_per_day": self._int_var(self.facebook_group_max_per_day_var, 4),
+                "facebook_group_queue_expiry_hours": self._int_var(self.facebook_group_queue_expiry_var, 12),
+                "facebook_group_auto_resume_queue": self.facebook_group_auto_resume_var.get(),
+                "facebook_group_dry_run": self.facebook_group_dry_run_var.get(),
             },
         }
         save_runtime_settings(self.settings)
@@ -556,7 +632,11 @@ class AppGUI:
         env_values["AI_REQUEST_DELAY_SECONDS"] = str(self._float_var(self.ai_request_delay_var, 1.5))
         env_values["AI_RETRY_ATTEMPTS"] = str(self._int_var(self.ai_retry_attempts_var, 2))
         save_ai_env(env_values)
-        self.status_var.set("Settings saved")
+        if facebook_groups_disabled_for_captions:
+            self.status_var.set("Facebook Groups auto-post disabled: each enabled group needs a unique caption")
+        else:
+            self.status_var.set("Settings saved")
+        self._refresh_facebook_group_status()
         self._update_next_run_label()
 
     def _run_scan_now(self):
@@ -660,8 +740,10 @@ class AppGUI:
         ]
         send_telegram = self._var_bool("send_telegram_var", False)
         post_facebook = self._var_bool("post_facebook_var", False)
+        post_facebook_groups = self._var_bool("post_facebook_groups_var", False)
+        publish_ok = True
         card_result = None
-        if self.create_image_cards_var.get() or send_telegram or post_facebook:
+        if self.create_image_cards_var.get() or send_telegram or post_facebook or post_facebook_groups:
             self._checkpoint("generate image cards")
             card_result = self._retry_gui_step(
                 "generate_selected_source_image_cards",
@@ -678,7 +760,7 @@ class AppGUI:
             )
             lines.extend(["", send_output])
             if not send_ok:
-                return "\n".join(lines), False
+                publish_ok = False
         if post_facebook:
             if not card_result:
                 return "\n".join(lines + ["Facebook skipped: no image cards generated"]), False
@@ -693,8 +775,20 @@ class AppGUI:
             )
             lines.extend(["", facebook_output])
             if not facebook_ok:
-                return "\n".join(lines), False
-        return "\n".join(lines), True
+                publish_ok = False
+        if post_facebook_groups:
+            if not card_result:
+                return "\n".join(lines + ["Facebook Groups skipped: no image cards generated"]), False
+            self._checkpoint("post Facebook Groups")
+            groups_output, groups_ok = self._task_post_facebook_groups_cards(
+                card_result["cards_result"]["cards"],
+                card_result.get("brief_label", label),
+                dry_run=self._var_bool("facebook_group_dry_run_var", True),
+            )
+            lines.extend(["", groups_output])
+            if not groups_ok:
+                publish_ok = False
+        return "\n".join(lines), publish_ok
 
     def _generate_latest_cards(self):
         self._save_settings()
@@ -1217,6 +1311,378 @@ class AppGUI:
         self._save_settings()
         dialog.destroy()
 
+    def _open_facebook_groups_dialog(self):
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Cấu hình Facebook Groups")
+        dialog.geometry("1120x760")
+        dialog.minsize(900, 620)
+        dialog.transient(self.root)
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(2, weight=1)
+
+        settings_frame = ctk.CTkFrame(dialog)
+        settings_frame.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 8))
+        settings_frame.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
+
+        settings = [
+            ("Chờ tối thiểu (giây)", self.facebook_group_delay_min_var),
+            ("Chờ tối đa (giây)", self.facebook_group_delay_max_var),
+            ("Tối đa / bản tin", self.facebook_group_max_per_brief_var),
+            ("Tối đa / ngày", self.facebook_group_max_per_day_var),
+            ("Hết hạn sau (giờ)", self.facebook_group_queue_expiry_var),
+        ]
+        for column, (label, variable) in enumerate(settings):
+            field = ctk.CTkFrame(settings_frame, fg_color="transparent")
+            field.grid(row=0, column=column, sticky="ew", padx=10, pady=(8, 4))
+            ctk.CTkLabel(field, text=label, anchor="w").pack(fill="x")
+            ctk.CTkEntry(field, textvariable=variable).pack(fill="x", pady=(3, 0))
+        ctk.CTkCheckBox(
+            settings_frame,
+            text="Chỉ kiểm tra khi chạy tự động (dry-run)",
+            variable=self.facebook_group_dry_run_var,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=12, pady=(4, 10))
+        ctk.CTkCheckBox(
+            settings_frame,
+            text="Tự tiếp tục xử lý hàng đợi",
+            variable=self.facebook_group_auto_resume_var,
+        ).grid(row=1, column=3, columnspan=2, sticky="w", padx=12, pady=(4, 10))
+
+        status_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        status_frame.grid(row=1, column=0, sticky="ew", padx=18)
+        status_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            status_frame,
+            textvariable=self.facebook_group_status_var,
+            anchor="w",
+            justify="left",
+            wraplength=850,
+            text_color=("gray35", "gray75"),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        ctk.CTkButton(status_frame, text="Làm mới", width=80, command=self._refresh_facebook_group_status).grid(
+            row=0, column=1, sticky="e"
+        )
+
+        rows_frame = ctk.CTkScrollableFrame(dialog)
+        rows_frame.grid(row=2, column=0, sticky="nsew", padx=14, pady=8)
+        self.facebook_group_rows = []
+        for group in self.facebook_groups:
+            self._add_facebook_group_row(rows_frame, group)
+        if not self.facebook_group_rows:
+            self._add_facebook_group_row(rows_frame)
+
+        actions = ctk.CTkFrame(dialog, fg_color="transparent")
+        actions.grid(row=3, column=0, sticky="ew", padx=14, pady=(4, 8))
+        actions.grid_columnconfigure(0, weight=1)
+        actions_left = ctk.CTkFrame(actions, fg_color="transparent")
+        actions_left.grid(row=0, column=0, sticky="w")
+        actions_right = ctk.CTkFrame(actions, fg_color="transparent")
+        actions_right.grid(row=1, column=0, sticky="e", pady=(8, 0))
+        ctk.CTkButton(actions_left, text="+ Thêm group", width=110, command=lambda: self._add_facebook_group_row(rows_frame)).pack(
+            side="left", padx=(0, 8)
+        )
+        ctk.CTkButton(actions_left, text="Kiểm tra", width=100, command=self._test_facebook_groups_config).pack(
+            side="left", padx=(0, 8)
+        )
+        ctk.CTkButton(actions_left, text="Hàng đợi", width=110, command=self._open_facebook_queue_manager).pack(
+            side="left", padx=(0, 8)
+        )
+        ctk.CTkButton(
+            actions_left, text="Đăng nhập / Xác thực lại", width=170,
+            command=lambda: self._start_groups_login_from_dialog(dialog)
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            actions_left, text="Kiểm tra thử", width=100, command=lambda: self._start_groups_publish_from_dialog(dialog, True)
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            actions_left, text="Đăng 1 group", width=110, command=lambda: self._start_groups_publish_from_dialog(dialog, False)
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions_right, text="Lưu", width=80, command=lambda: self._save_facebook_groups_dialog(dialog)).pack(
+            side="right"
+        )
+        ctk.CTkButton(actions_right, text="Đóng", width=80, fg_color=("gray70", "gray30"), command=dialog.destroy).pack(
+            side="right", padx=(0, 8)
+        )
+
+        help_text = (
+            "App không lưu mật khẩu. Hãy đăng nhập/2FA thủ công một lần trong cửa sổ Edge. "
+            "Nếu Facebook yêu cầu checkpoint hoặc CAPTCHA, lượt đăng sẽ dừng và yêu cầu xác thực lại."
+        )
+        ctk.CTkLabel(dialog, text=help_text, wraplength=1000, justify="left", text_color=("gray35", "gray75")).grid(
+            row=4, column=0, sticky="ew", padx=18, pady=(0, 12)
+        )
+
+    def _add_facebook_group_row(self, parent, group=None):
+        group = dict(group or {})
+        variables = {
+            "enabled": ctk.BooleanVar(value=bool(group.get("enabled", True))),
+            "priority": ctk.StringVar(value=str(group.get("priority") or 100)),
+            "name": ctk.StringVar(value=str(group.get("name") or "")),
+            "url": ctk.StringVar(value=str(group.get("url") or "")),
+            "id": str(group.get("id") or ""),
+            "original_url": str(group.get("url") or "").strip(),
+            "widgets": [],
+        }
+        card = ctk.CTkFrame(parent)
+        card.pack(fill="x", padx=2, pady=(2, 8))
+        card.grid_columnconfigure(1, weight=1)
+
+        enabled = ctk.CTkCheckBox(card, text="Tự động đăng", variable=variables["enabled"])
+        enabled.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 6))
+        name_frame = ctk.CTkFrame(card, fg_color="transparent")
+        name_frame.grid(row=0, column=1, sticky="ew", padx=8, pady=(8, 4))
+        name_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(name_frame, text="Tên group").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ctk.CTkEntry(name_frame, textvariable=variables["name"]).grid(row=0, column=1, sticky="ew")
+        ctk.CTkLabel(name_frame, text="Ưu tiên").grid(row=0, column=2, sticky="w", padx=(14, 8))
+        ctk.CTkEntry(name_frame, width=70, textvariable=variables["priority"]).grid(row=0, column=3, sticky="e")
+        remove_button = ctk.CTkButton(card, text="Xóa", width=60, fg_color=("gray65", "gray35"))
+        remove_button.configure(command=lambda: self._remove_facebook_group_row(variables))
+        remove_button.grid(row=0, column=2, sticky="e", padx=12, pady=(8, 4))
+
+        ctk.CTkLabel(card, text="URL Facebook Group", anchor="w").grid(
+            row=1, column=0, sticky="w", padx=12, pady=(5, 0)
+        )
+        url_entry = ctk.CTkEntry(card, textvariable=variables["url"])
+        url_entry.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(8, 12), pady=(5, 0))
+        ctk.CTkLabel(card, text="Caption riêng (bắt buộc khi tự động đăng)", anchor="nw").grid(
+            row=2, column=0, sticky="nw", padx=12, pady=(10, 12)
+        )
+        caption_widget = ctk.CTkTextbox(card, height=74, wrap="word")
+        caption_widget.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 12), pady=(10, 12))
+        caption_widget.insert("1.0", str(group.get("caption_template") or ""))
+        variables["caption_widget"] = caption_widget
+        variables["widgets"] = [card]
+        self.facebook_group_rows.append(variables)
+
+    def _remove_facebook_group_row(self, row):
+        for widget in row.get("widgets", []):
+            widget.destroy()
+        if row in self.facebook_group_rows:
+            self.facebook_group_rows.remove(row)
+
+    def _capture_facebook_group_rows(self, show_errors=True):
+        groups = []
+        for row in self.facebook_group_rows:
+            url = row["url"].get().strip()
+            name = row["name"].get().strip()
+            if not url and not name:
+                continue
+            groups.append(
+                {
+                    "id": (row.get("id") or "") if url == row.get("original_url") else "",
+                    "name": name,
+                    "url": url,
+                    "enabled": row["enabled"].get(),
+                    "priority": row["priority"].get().strip(),
+                    "caption_template": row["caption_widget"].get("1.0", "end").strip(),
+                }
+            )
+        validation = validate_group_config(groups, require_enabled=False)
+        if not validation["ready"]:
+            if show_errors:
+                messagebox.showwarning("Facebook Groups", self._format_errors(validation["errors"]), parent=self.root)
+            return False
+        self.facebook_groups = validation["groups"]
+        return True
+
+    def _test_facebook_groups_config(self):
+        if not self._capture_facebook_group_rows(show_errors=True):
+            return
+        validation = validate_group_config(self.facebook_groups)
+        if not validation["ready"]:
+            messagebox.showwarning("Facebook Groups", self._format_errors(validation["errors"]), parent=self.root)
+            return
+        caption_validation = validate_group_caption_templates(self.facebook_groups)
+        if not caption_validation["ready"]:
+            messagebox.showwarning(
+                "Facebook Groups", self._format_errors(caption_validation["errors"]), parent=self.root
+            )
+            return
+        enabled = sum(1 for group in self.facebook_groups if group["enabled"])
+        messagebox.showinfo("Facebook Groups", f"Cấu hình hợp lệ: {enabled} group đang bật.", parent=self.root)
+
+    def _save_facebook_groups_dialog(self, dialog):
+        if not self._capture_facebook_group_rows(show_errors=True):
+            return
+        self._save_settings()
+        dialog.destroy()
+
+    def _start_groups_login_from_dialog(self, dialog):
+        if not self._capture_facebook_group_rows(show_errors=True):
+            return
+        self._save_settings()
+        dialog.destroy()
+        self._login_facebook_groups()
+
+    def _start_groups_publish_from_dialog(self, dialog, dry_run):
+        if not self._capture_facebook_group_rows(show_errors=True):
+            return
+        validation = validate_group_config(self.facebook_groups)
+        if not validation["ready"]:
+            messagebox.showwarning("Facebook Groups", self._format_errors(validation["errors"]), parent=self.root)
+            return
+        caption_validation = validate_group_caption_templates(self.facebook_groups)
+        if not caption_validation["ready"]:
+            messagebox.showwarning(
+                "Facebook Groups", self._format_errors(caption_validation["errors"]), parent=self.root
+            )
+            return
+        self._save_settings()
+        dialog.destroy()
+        self._run_background(
+            "Previewing Facebook Groups" if dry_run else "Posting Facebook Groups",
+            lambda: self._task_post_facebook_groups_now(dry_run=dry_run),
+        )
+
+    def _login_facebook_groups(self):
+        self._run_background("Facebook Groups login", self._task_login_facebook_groups)
+
+    def _task_login_facebook_groups(self):
+        result = open_login_session(timeout_seconds=300)
+        if result["authenticated"]:
+            return "Facebook login saved. The browser profile is ready for scheduled group posts.", True
+        return "Facebook login was not completed within 5 minutes. Please try again.", False
+
+    def _open_facebook_queue_manager(self):
+        existing = getattr(self, "facebook_queue_dialog", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            self._refresh_facebook_queue_manager()
+            return
+        dialog = ctk.CTkToplevel(self.root)
+        self.facebook_queue_dialog = dialog
+        dialog.title("Hàng đợi Facebook Groups")
+        dialog.geometry("1040x720")
+        dialog.minsize(820, 560)
+        dialog.transient(self.root)
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(1, weight=1)
+        self.facebook_queue_selection_var = ctk.StringVar(value="")
+
+        ctk.CTkLabel(
+            dialog, textvariable=self.facebook_group_status_var, anchor="w", justify="left", wraplength=940
+        ).grid(
+            row=0, column=0, sticky="ew", padx=16, pady=(14, 6)
+        )
+
+        self.facebook_queue_rows_frame = ctk.CTkScrollableFrame(dialog)
+        self.facebook_queue_rows_frame.grid(row=1, column=0, sticky="nsew", padx=14, pady=8)
+        actions = ctk.CTkFrame(dialog, fg_color="transparent")
+        actions.grid(row=2, column=0, sticky="ew", padx=16, pady=(4, 14))
+        ctk.CTkButton(actions, text="Làm mới", width=90, command=self._refresh_facebook_queue_manager).pack(
+            side="left", padx=(0, 8)
+        )
+        ctk.CTkButton(actions, text="Đăng mục đã chọn", width=150, command=self._publish_selected_queue_item).pack(
+            side="left", padx=(0, 8)
+        )
+        ctk.CTkButton(actions, text="Hủy mục đã chọn", width=140, command=self._cancel_selected_queue_item).pack(
+            side="left", padx=(0, 8)
+        )
+        ctk.CTkButton(actions, text="Đóng", width=90, command=dialog.destroy).pack(side="right")
+        self._refresh_facebook_queue_manager()
+
+    def _refresh_facebook_queue_manager(self):
+        frame = getattr(self, "facebook_queue_rows_frame", None)
+        if frame is None or not frame.winfo_exists():
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        rows = list_group_queue()
+        if not rows:
+            ctk.CTkLabel(frame, text="Hàng đợi đang trống.").pack(anchor="w", padx=8, pady=12)
+        status_colors = {
+            "queued": ("#d97706", "#b45309"),
+            "published": ("#15803d", "#166534"),
+            "pending": ("#2563eb", "#1d4ed8"),
+            "failed": ("#b91c1c", "#991b1b"),
+            "needs_login": ("#b91c1c", "#991b1b"),
+        }
+        for delivery in rows:
+            card = ctk.CTkFrame(frame)
+            card.pack(fill="x", padx=2, pady=(2, 8))
+            card.grid_columnconfigure(1, weight=1)
+            delivery_id = str(delivery["id"])
+            ctk.CTkRadioButton(
+                card,
+                text="",
+                width=28,
+                variable=self.facebook_queue_selection_var,
+                value=delivery_id,
+            ).grid(row=0, column=0, rowspan=3, sticky="n", padx=(12, 4), pady=14)
+            group_name = delivery.get("group_name") or delivery.get("group_id") or "Group không xác định"
+            ctk.CTkLabel(card, text=group_name, anchor="w", font=ctk.CTkFont(size=14, weight="bold")).grid(
+                row=0, column=1, sticky="ew", padx=6, pady=(10, 3)
+            )
+            status = delivery.get("status") or "queued"
+            ctk.CTkLabel(
+                card,
+                text=status.upper(),
+                width=100,
+                corner_radius=6,
+                fg_color=status_colors.get(status, ("gray55", "gray35")),
+                text_color="white",
+            ).grid(row=0, column=2, sticky="e", padx=(8, 12), pady=(10, 3))
+            details = (
+                f"Ưu tiên: {delivery.get('priority') or 100}   •   "
+                f"Batch: {str(delivery.get('batch_id') or '')[:12]}   •   "
+                f"Lịch: {delivery.get('scheduled_at') or 'chờ thủ công'}   •   "
+                f"Hết hạn: {delivery.get('expires_at') or '—'}"
+            )
+            ctk.CTkLabel(card, text=details, anchor="w", justify="left", wraplength=820).grid(
+                row=1, column=1, columnspan=2, sticky="ew", padx=(6, 12), pady=3
+            )
+            reason = delivery.get("stop_reason") or delivery.get("error_message") or ""
+            if reason:
+                ctk.CTkLabel(
+                    card,
+                    text=f"Ghi chú: {reason}",
+                    anchor="w",
+                    justify="left",
+                    wraplength=820,
+                    text_color=("gray35", "gray75"),
+                ).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(6, 12), pady=(3, 10))
+        self._refresh_facebook_group_status()
+
+    def _publish_selected_queue_item(self):
+        delivery_id = self.facebook_queue_selection_var.get().strip()
+        if not delivery_id:
+            messagebox.showwarning("Queue Manager", "Hãy chọn một mục trong queue.", parent=self.facebook_queue_dialog)
+            return
+        self._run_background(
+            "Publishing selected Facebook Group queue item",
+            lambda: self._task_publish_queue_item(int(delivery_id)),
+        )
+
+    def _task_publish_queue_item(self, delivery_id):
+        try:
+            result = publish_queue_item(
+                delivery_id,
+                max_groups_per_day=self._int_var(self.facebook_group_max_per_day_var, 4),
+            )
+        except Exception as exc:
+            return f"Facebook Groups queue publish failed:\n{exc}", False
+        finally:
+            if hasattr(self, "root"):
+                self.root.after(0, self._refresh_facebook_queue_manager)
+        return (
+            f"Queue item {result['delivery_id']} | {result['group_name']} | {result['status']}\n"
+            f"{result.get('message') or ''}",
+            result["status"] in {"published", "pending"},
+        )
+
+    def _cancel_selected_queue_item(self):
+        delivery_id = self.facebook_queue_selection_var.get().strip()
+        if not delivery_id:
+            messagebox.showwarning("Queue Manager", "Hãy chọn một mục trong queue.", parent=self.facebook_queue_dialog)
+            return
+        if not messagebox.askyesno("Queue Manager", "Hủy mục queue đã chọn?", parent=self.facebook_queue_dialog):
+            return
+        if cancel_group_queue_item(int(delivery_id)):
+            self.facebook_queue_selection_var.set("")
+            self._refresh_facebook_queue_manager()
+        else:
+            messagebox.showwarning("Queue Manager", "Mục này không còn ở trạng thái có thể hủy.", parent=self.facebook_queue_dialog)
+
     def _test_facebook_page(self):
         page_id = self.facebook_page_id_var.get().strip()
         token = self.facebook_page_access_token_var.get().strip()
@@ -1330,6 +1796,79 @@ class AppGUI:
         ]
         return "\n".join(lines), True
 
+    def _preview_facebook_groups(self):
+        self._save_settings()
+        self._run_background("Previewing Facebook Groups", lambda: self._task_post_facebook_groups_now(dry_run=True))
+
+    def _post_facebook_groups_now(self):
+        self._save_settings()
+        self._run_background("Posting Facebook Groups", lambda: self._task_post_facebook_groups_now(dry_run=False))
+
+    def _task_post_facebook_groups_now(self, dry_run=False):
+        try:
+            result = self._retry_gui_step("load_latest_rendered_image_cards", self._latest_rendered_cards_result)
+        except Exception as exc:
+            return self._format_latest_rendered_cards_error("Facebook Groups", exc), False
+        output, ok = self._task_post_facebook_groups_cards(
+            result["cards_result"]["cards"],
+            result.get("brief_label"),
+            dry_run=dry_run,
+            manual=not dry_run,
+        )
+        return f"{self._format_selected_source_cards_result(result)}\n\n{output}", ok
+
+    def _task_post_facebook_groups_cards(self, cards, brief_label=None, dry_run=None, manual=False):
+        validation = validate_group_config(self.facebook_groups)
+        if not validation["ready"]:
+            return "Facebook Groups skipped: invalid configuration.\n" + self._format_errors(validation["errors"]), False
+        effective_dry_run = self.facebook_group_dry_run_var.get() if dry_run is None else bool(dry_run)
+        try:
+            result = publish_to_groups(
+                cards,
+                validation["groups"],
+                self.facebook_intro_text_var.get().strip() or DEFAULT_FACEBOOK_INTRO_TEXT,
+                caption_renderer=lambda template, label: render_facebook_intro_text(template, brief_label=label),
+                brief_label=brief_label,
+                dry_run=effective_dry_run,
+                delay_min_seconds=self._int_var(self.facebook_group_delay_min_var, 900),
+                delay_max_seconds=self._int_var(self.facebook_group_delay_max_var, 1800),
+                max_groups_per_brief=self._int_var(self.facebook_group_max_per_brief_var, 2),
+                max_groups_per_day=self._int_var(self.facebook_group_max_per_day_var, 4),
+                queue_expiry_hours=self._int_var(self.facebook_group_queue_expiry_var, 12),
+                manual=manual,
+                progress_callback=self._facebook_group_progress,
+                sleep_fn=self._sleep_with_controls,
+            )
+        except Exception as exc:
+            return f"Facebook Groups failed:\n{exc}", False
+
+        counts = result["counts"]
+        lines = [
+            "Facebook Groups dry-run completed" if effective_dry_run else "Facebook Groups publish completed",
+            f"Batch: {result['batch_id'][:12]}",
+            (
+                f"Published: {counts['published']} | Pending: {counts['pending']} | "
+                f"Failed: {counts['failed']} | Needs login: {counts['needs_login']} | "
+                f"Queued: {counts['queued']} | Skipped: {counts['skipped']} | Dry-run: {counts['dry_run']}"
+            ),
+        ]
+        safety = result.get("safety") or {}
+        lines.append(
+            f"Daily safety limit: {safety.get('used_today', 0)}/{safety.get('daily_limit', 4)} | "
+            f"Remaining: {safety.get('remaining_today', 0)} | Total queued: {safety.get('queued_total', 0)}"
+        )
+        if safety.get("next_scheduled_at"):
+            lines.append(f"Next scheduled group: {safety['next_scheduled_at']}")
+        for item in result["results"]:
+            detail = f" - {item['message']}" if item.get("message") else ""
+            lines.append(f"- {item['group_name']}: {item['status']}{detail}")
+        if not effective_dry_run and counts["published"] + counts["pending"] > 0:
+            saved = mark_items_published(cards)
+            lines.append(f"Published ledger updated: {saved} items")
+        self._refresh_facebook_group_status()
+        ok = counts["failed"] == 0 and counts["needs_login"] == 0
+        return "\n".join(lines), ok
+
     def _check_api_key(self):
         self._save_settings()
         provider = self.provider_var.get()
@@ -1368,6 +1907,17 @@ class AppGUI:
                 self.last_schedule_key = due_key
                 self.scan_label_var.set(due_label)
                 self._run_background(f"Scheduled {due_label} scan", lambda: self._task_run_scan(due_label))
+        if not self.task_running and self.facebook_group_auto_resume_var.get():
+            queue_status = get_group_queue_status(
+                max_groups_per_day=self._int_var(self.facebook_group_max_per_day_var, 4)
+            )
+            queue_item = get_due_queue_item() if queue_status["remaining_today"] > 0 else None
+            if queue_item:
+                delivery_id = int(queue_item["id"])
+                self._run_background(
+                    "Resuming scheduled Facebook Group queue",
+                    lambda: self._task_publish_queue_item(delivery_id),
+                )
         self._update_next_run_label()
         self.root.after(30000, self._scheduler_tick)
 
@@ -1556,6 +2106,7 @@ class AppGUI:
         self._load_latest_brief()
         self._load_log_file()
         self._update_next_run_label()
+        self._refresh_facebook_group_status()
 
     def _refresh_dashboard(self):
         try:
@@ -1720,6 +2271,34 @@ class AppGUI:
             return bool(variable.get())
         except AttributeError:
             return bool(variable)
+
+    def _facebook_group_status_text(self):
+        try:
+            limit_var = getattr(self, "facebook_group_max_per_day_var", None)
+            daily_limit = self._int_var(limit_var, 4) if limit_var is not None else 4
+            status = get_group_queue_status(max_groups_per_day=daily_limit)
+            return self._format_facebook_group_status(status)
+        except Exception as exc:
+            return f"Không đọc được trạng thái queue: {exc}"
+
+    def _format_facebook_group_status(self, status):
+        next_text = status.get("next_scheduled_at") or "chưa có lịch"
+        return (
+            f"Hôm nay: {status['used_today']}/{status['daily_limit']} | "
+            f"Còn lại: {status['remaining_today']} | Queue: {status['queued_total']} | "
+            f"Tiếp theo: {next_text}"
+        )
+
+    def _facebook_group_progress(self, status):
+        text = self._format_facebook_group_status(status)
+        if hasattr(self, "root"):
+            self.root.after(0, self.facebook_group_status_var.set, text)
+        elif hasattr(self, "facebook_group_status_var"):
+            self.facebook_group_status_var.set(text)
+
+    def _refresh_facebook_group_status(self):
+        if hasattr(self, "facebook_group_status_var"):
+            self.facebook_group_status_var.set(self._facebook_group_status_text())
 
     def _format_errors(self, errors):
         return "\n".join(f"- {error}" for error in errors)

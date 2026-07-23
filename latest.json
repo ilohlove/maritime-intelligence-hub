@@ -1,11 +1,11 @@
 {
-  "version": "1.1.0",
-  "release_date": "2026-06-29",
-  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.1.0/BV-maritime-intelligence-hub.exe",
+  "version": "1.1.1",
+  "release_date": "2026-07-23",
+  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.1.1/BV-maritime-intelligence-hub.exe",
   "changelog": [
-    "Add 2-day runtime cleanup for output and temp artifacts.",
-    "Clean old update exe and backup exe after the new GUI opens successfully.",
-    "Preserve latest brief files and database history while reducing disk usage."
+    "Add safe Playwright publishing for Facebook Groups with reusable local login profiles.",
+    "Add per-brief and daily limits, randomized queue scheduling, duplicate protection, and safety stops.",
+    "Add a responsive Facebook Groups setup screen and queue manager with delivery status tracking."
   ],
   "force_update": false
 }

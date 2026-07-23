@@ -97,6 +97,21 @@ The existing desktop shell remains available from the template:
 python -m app.main --gui
 ```
 
+### Facebook Groups publishing
+
+The **Hoàn thành** tab can publish the latest rendered card set to multiple Facebook Groups with Playwright.
+
+1. Open **Groups**, add each group name and `facebook.com/groups/...` URL, then optionally add a group-specific caption.
+2. Choose **Đăng nhập / Re-auth** and complete Facebook login or 2FA manually in the Edge window. The app never stores a Facebook password.
+3. Run **Dry-run** to verify the saved session and posting permission without creating a post.
+4. Enable **Đăng Facebook Groups** to include the groups in the normal in-app schedule.
+
+The browser profile is stored under `%LOCALAPPDATA%\Maritime Intelligence Hub\browser_profiles\facebook`, outside the repository. Safe defaults limit automatic publishing to two groups per brief and four real attempts per Vietnam calendar day, with a random 15–30 minute interval. Extra targets remain queued. **Post 1 Queued Group** handles one queued target per click and still respects the daily limit; dry-run does not consume quota.
+
+Every enabled group requires its own non-duplicate caption, and every rendered caption includes the source name and original URL for each card. The app does not rewrite captions to evade moderation. A pending-admin-approval result is recorded as delivered so the same batch is not submitted twice. Login checkpoints, CAPTCHA, rate-limit warnings, and temporary-block signals stop the active queue and require manual review or re-authentication.
+
+Use **Queue Manager** to review queued, failed, and login-blocked deliveries from any brief. It supports selecting one item for a quota-checked publish attempt, cancelling an item, and viewing schedule, expiry, priority, and stop reason. Queue items expire after 12 hours by default. Smaller priority numbers run first; groups with the same priority rotate by least-recent successful delivery so the same first groups are not selected for every brief. If the app closes during a scheduled delay, **Tự tiếp tục queue** resumes only that due item after restart; safety-stopped and unscheduled overflow items still require manual review.
+
 The project should prove the data pipeline before investing in a larger interface.
 
 ## MVP Runtime Outputs

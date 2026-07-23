@@ -178,6 +178,149 @@ class GuiSelectedSourceTests(unittest.TestCase):
         app._task_post_facebook_cards.assert_called_once_with(["card-1.png"], "evening", dry_run=True)
         self.assertIn("facebook dry-run", output)
 
+    def test_loop_scan_posts_facebook_groups_with_selected_source_cards(self):
+        app = _gui_stub()
+        app.post_facebook_groups_var = _Var(True)
+        app.facebook_group_dry_run_var = _Var(True)
+        selected_result = _selected_result()
+        app._generate_selected_source_cards_result = Mock(return_value=selected_result)
+        app._task_post_facebook_groups_cards = Mock(return_value=("groups dry-run", True))
+
+        with patch("app.gui.refresh_trends", return_value={"seeded": 0, "imported": 0, "fetched": 0}):
+            with patch("app.gui.fetch_rss", return_value={"ok": True, "results": [{"inserted": 1}]}):
+                with patch("app.gui.fetch_html", return_value={"results": [{"inserted": 0}]}):
+                    with patch("app.gui.score_articles", return_value=[{"id": 1}]):
+                        with patch("app.gui.summarize_articles", return_value=[{"article_id": 1}]):
+                            with patch(
+                                "app.gui.write_scan_brief",
+                                return_value={
+                                    "items": 1,
+                                    "markdown_path": "morning.md",
+                                    "latest_markdown_path": "latest.md",
+                                },
+                            ):
+                                output, ok = AppGUI._task_run_scan(app, "morning")
+
+        self.assertTrue(ok)
+        app._task_post_facebook_groups_cards.assert_called_once_with(
+            ["card-1.png"], "evening", dry_run=True
+        )
+        self.assertIn("groups dry-run", output)
+
+    def test_group_publish_marks_items_after_pending_delivery(self):
+        app = _gui_stub()
+        app.facebook_groups = [
+            {
+                "id": "group-1",
+                "name": "Group",
+                "url": "facebook.com/groups/group-1",
+                "enabled": True,
+                "caption_template": "Group caption",
+            }
+        ]
+        app.facebook_intro_text_var = _Var("{brief_label}")
+        app.facebook_group_delay_min_var = _Var("60")
+        app.facebook_group_delay_max_var = _Var("120")
+        app.facebook_group_dry_run_var = _Var(False)
+        cards = [
+            {
+                "card_path": "card.png",
+                "item_key": "item-1",
+                "source_name": "Source",
+                "original_url": "https://example.com/story",
+            }
+        ]
+        publish_result = {
+            "batch_id": "batch-1",
+            "counts": {
+                "published": 0,
+                "pending": 1,
+                "failed": 0,
+                "needs_login": 0,
+                "queued": 0,
+                "skipped": 0,
+                "dry_run": 0,
+            },
+            "results": [{"group_name": "Group", "status": "pending", "message": "Awaiting approval"}],
+            "safety": {"used_today": 1, "daily_limit": 4, "remaining_today": 3, "queued_total": 0},
+        }
+
+        with patch("app.gui.publish_to_groups", return_value=publish_result) as publish:
+            with patch("app.gui.mark_items_published", return_value=1) as mark:
+                output, ok = AppGUI._task_post_facebook_groups_cards(app, cards, "morning", dry_run=False)
+
+        self.assertTrue(ok)
+        publish.assert_called_once()
+        mark.assert_called_once_with(cards)
+        self.assertIn("Pending: 1", output)
+
+    def test_manual_group_button_processes_only_manual_queue_path(self):
+        app = _gui_stub()
+        app._latest_rendered_cards_result = Mock(return_value=_selected_result())
+        app._task_post_facebook_groups_cards = Mock(return_value=("one queued group", True))
+
+        output, ok = AppGUI._task_post_facebook_groups_now(app, dry_run=False)
+
+        self.assertTrue(ok)
+        app._task_post_facebook_groups_cards.assert_called_once_with(
+            ["card-1.png"], "evening", dry_run=False, manual=True
+        )
+        self.assertIn("one queued group", output)
+
+    def test_scheduler_auto_resumes_due_queue_item(self):
+        app = _gui_stub()
+        app.auto_run_var = _Var(False)
+        app.task_running = False
+        app.facebook_group_auto_resume_var = _Var(True)
+        app.root = Mock()
+        app._update_next_run_label = Mock()
+        app._run_background = Mock()
+
+        with patch("app.gui.get_group_queue_status", return_value={"remaining_today": 1}):
+            with patch("app.gui.get_due_queue_item", return_value={"id": 42}):
+                AppGUI._scheduler_tick(app)
+
+        app._run_background.assert_called_once()
+        self.assertIn("Resuming scheduled", app._run_background.call_args.args[0])
+        app.root.after.assert_called_once_with(30000, app._scheduler_tick)
+
+    def test_queue_manager_publishes_selected_delivery(self):
+        app = _gui_stub()
+        app.root = Mock()
+        result = {
+            "delivery_id": 7,
+            "group_name": "Maritime Group",
+            "status": "pending",
+            "message": "Awaiting approval",
+        }
+
+        with patch("app.gui.publish_queue_item", return_value=result) as publish:
+            output, ok = AppGUI._task_publish_queue_item(app, 7)
+
+        self.assertTrue(ok)
+        publish.assert_called_once_with(7, max_groups_per_day=4)
+        self.assertIn("Maritime Group", output)
+
+    def test_group_card_capture_reads_multiline_caption_widget(self):
+        app = _gui_stub()
+        app.facebook_group_rows = [
+            {
+                "id": "maritime-group",
+                "original_url": "https://www.facebook.com/groups/123456",
+                "enabled": _Var(True),
+                "priority": _Var("10"),
+                "name": _Var("Maritime Group"),
+                "url": _Var("https://www.facebook.com/groups/123456"),
+                "caption_widget": _Textbox("Dòng một\nDòng hai\n"),
+            }
+        ]
+
+        captured = AppGUI._capture_facebook_group_rows(app, show_errors=False)
+
+        self.assertTrue(captured)
+        self.assertEqual(app.facebook_groups[0]["caption_template"], "Dòng một\nDòng hai")
+        self.assertEqual(app.facebook_groups[0]["id"], "maritime-group")
+
     def test_loop_scan_reuses_cards_for_telegram_and_facebook(self):
         app = _gui_stub()
         app.send_telegram_var = _Var(True)
@@ -465,6 +608,30 @@ class GuiSelectedSourceTests(unittest.TestCase):
 
         self.assertEqual(settings["publish"]["facebook_intro_text"], DEFAULT_FACEBOOK_INTRO_TEXT)
 
+    def test_runtime_settings_migrates_old_group_delay_to_safe_defaults(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "runtime_settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "publish": {
+                            "facebook_group_delay_min_seconds": 60,
+                            "facebook_group_delay_max_seconds": 120,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            settings = load_runtime_settings(settings_path)
+
+        self.assertEqual(settings["publish"]["facebook_group_delay_min_seconds"], 900)
+        self.assertEqual(settings["publish"]["facebook_group_delay_max_seconds"], 1800)
+        self.assertEqual(settings["publish"]["facebook_group_max_per_brief"], 2)
+        self.assertEqual(settings["publish"]["facebook_group_max_per_day"], 4)
+        self.assertEqual(settings["publish"]["facebook_group_queue_expiry_hours"], 12)
+        self.assertTrue(settings["publish"]["facebook_group_auto_resume_queue"])
+
     def test_wait_for_sheet_l1_until_matching_current_brief(self):
         app = _gui_stub()
         app.sheet_url_var = _Var("https://docs.google.com/spreadsheets/d/sheet123/edit?gid=0#gid=0")
@@ -573,7 +740,15 @@ def _gui_stub():
     app.create_image_cards_var = _Var(True)
     app.send_telegram_var = _Var(False)
     app.post_facebook_var = _Var(False)
+    app.post_facebook_groups_var = _Var(False)
     app.facebook_dry_run_var = _Var(True)
+    app.facebook_group_dry_run_var = _Var(True)
+    app.facebook_group_delay_min_var = _Var("900")
+    app.facebook_group_delay_max_var = _Var("1800")
+    app.facebook_group_max_per_brief_var = _Var("2")
+    app.facebook_group_max_per_day_var = _Var("4")
+    app.facebook_group_queue_expiry_var = _Var("12")
+    app.facebook_group_auto_resume_var = _Var(True)
     app.retry_attempts_var = _Var("1")
     app._checkpoint = lambda _name: None
     app._int_var = lambda variable, default: int(variable.get() or default)
@@ -651,6 +826,14 @@ class _Var:
         self.value = value
 
     def get(self):
+        return self.value
+
+
+class _Textbox:
+    def __init__(self, value):
+        self.value = value
+
+    def get(self, _start, _end):
         return self.value
 
 

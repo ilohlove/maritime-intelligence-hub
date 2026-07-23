@@ -41,7 +41,9 @@ from app.services.combined_brief_source import (
 )
 from app.services.facebook_publisher import check_page, publish_photo_post, validate_cards_publish_safety
 from app.services.facebook_group_publisher import (
+    FacebookGroupPublisherError,
     cancel_group_queue_item,
+    check_login_session,
     get_due_queue_item,
     get_group_queue_status,
     list_group_queue,
@@ -188,6 +190,9 @@ class AppGUI:
             value=bool(publish.get("facebook_group_auto_resume_queue", True))
         )
         self.facebook_group_status_var = ctk.StringVar(value=self._facebook_group_status_text())
+        self.facebook_group_login_status_var = ctk.StringVar(
+            value="Đăng nhập Facebook: Chưa kiểm tra phiên"
+        )
         self.facebook_group_rows = []
 
     def _build_layout(self):
@@ -1361,6 +1366,19 @@ class AppGUI:
         ctk.CTkButton(status_frame, text="Làm mới", width=80, command=self._refresh_facebook_group_status).grid(
             row=0, column=1, sticky="e"
         )
+        ctk.CTkLabel(
+            status_frame,
+            textvariable=self.facebook_group_login_status_var,
+            anchor="w",
+            justify="left",
+            text_color=("gray35", "gray75"),
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(5, 0))
+        ctk.CTkButton(
+            status_frame,
+            text="Kiểm tra đăng nhập",
+            width=130,
+            command=lambda: self._start_groups_session_check_from_dialog(dialog),
+        ).grid(row=1, column=1, sticky="e", pady=(5, 0))
 
         rows_frame = ctk.CTkScrollableFrame(dialog)
         rows_frame.grid(row=2, column=0, sticky="nsew", padx=14, pady=8)
@@ -1404,7 +1422,7 @@ class AppGUI:
         )
 
         help_text = (
-            "App không lưu mật khẩu. Hãy đăng nhập/2FA thủ công một lần trong cửa sổ Edge. "
+            "App không lưu mật khẩu. Hãy đăng nhập/2FA thủ công một lần trong cửa sổ Google Chrome. "
             "Nếu Facebook yêu cầu checkpoint hoặc CAPTCHA, lượt đăng sẽ dừng và yêu cầu xác thực lại."
         )
         ctk.CTkLabel(dialog, text=help_text, wraplength=1000, justify="left", text_color=("gray35", "gray75")).grid(
@@ -1514,6 +1532,13 @@ class AppGUI:
         dialog.destroy()
         self._login_facebook_groups()
 
+    def _start_groups_session_check_from_dialog(self, dialog):
+        if not self._capture_facebook_group_rows(show_errors=True):
+            return
+        self._save_settings()
+        dialog.destroy()
+        self._check_facebook_groups_login()
+
     def _start_groups_publish_from_dialog(self, dialog, dry_run):
         if not self._capture_facebook_group_rows(show_errors=True):
             return
@@ -1535,13 +1560,91 @@ class AppGUI:
         )
 
     def _login_facebook_groups(self):
+        self.facebook_group_login_status_var.set("Đăng nhập Facebook: Đang chờ xác thực trong Chrome...")
+        messagebox.showinfo(
+            "Đăng nhập Facebook Groups",
+            "Google Chrome sẽ mở bằng profile riêng, mới của ứng dụng.\n\n"
+            "Hãy hoàn tất đăng nhập, checkpoint hoặc 2FA nếu Facebook yêu cầu. "
+            "Cửa sổ Chrome chỉ tự đóng sau khi ứng dụng xác nhận phiên đăng nhập thành công.",
+            parent=self.root,
+        )
         self._run_background("Facebook Groups login", self._task_login_facebook_groups)
 
     def _task_login_facebook_groups(self):
-        result = open_login_session(timeout_seconds=300)
+        try:
+            result = open_login_session(
+                timeout_seconds=300,
+                status_callback=self._facebook_login_progress,
+            )
+        except FacebookGroupPublisherError as exc:
+            status = "Đăng nhập Facebook: Không thể mở hoặc duy trì phiên Chrome"
+            self.root.after(0, self.facebook_group_login_status_var.set, status)
+            return (
+                "Không thể hoàn tất phiên đăng nhập Facebook.\n"
+                f"Lý do: {exc}\n"
+                "Hãy đóng các cửa sổ Chrome do ứng dụng mở rồi thử lại.",
+                False,
+            )
         if result["authenticated"]:
-            return "Facebook login saved. The browser profile is ready for scheduled group posts.", True
-        return "Facebook login was not completed within 5 minutes. Please try again.", False
+            status = "Đăng nhập Facebook: Đã xác thực thành công"
+            self.root.after(0, self.facebook_group_login_status_var.set, status)
+            return (
+                "Đã xác thực đăng nhập Facebook thành công.\n"
+                "Profile đã được lưu cục bộ và sẵn sàng đăng Facebook Groups.",
+                True,
+            )
+        status = "Đăng nhập Facebook: Chưa xác thực"
+        self.root.after(0, self.facebook_group_login_status_var.set, status)
+        reason = result.get("reason") or "Facebook chưa xác nhận phiên đăng nhập."
+        checkpoint_help = ""
+        if result.get("state") == "checkpoint":
+            checkpoint_help = (
+                "\nCheckpoint chưa hoàn tất. Nếu trang checkpoint cứ quay mãi, hãy mở Facebook "
+                "trong Chrome bình thường, hoàn tất xác minh tài khoản, rồi quay lại app và xác thực lại."
+            )
+        return (
+            "Chưa xác thực được đăng nhập Facebook trong 5 phút.\n"
+            f"Lý do: {reason}{checkpoint_help}\n"
+            "Hãy thử lại và hoàn tất mọi bước checkpoint/2FA trong Chrome.",
+            False,
+        )
+
+    def _facebook_login_progress(self, result):
+        state = result.get("state")
+        labels = {
+            "loading": "Đăng nhập Facebook: Đang tải Facebook...",
+            "login": "Đăng nhập Facebook: Đang chờ bạn đăng nhập trong Chrome...",
+            "checkpoint": "Đăng nhập Facebook: Facebook đang yêu cầu checkpoint/2FA...",
+            "authenticated": "Đăng nhập Facebook: Đã xác thực thành công",
+            "browser_closed": "Đăng nhập Facebook: Chrome đã đóng trước khi hoàn tất",
+        }
+        text = labels.get(state)
+        if text:
+            self.root.after(0, self.facebook_group_login_status_var.set, text)
+
+    def _check_facebook_groups_login(self):
+        self.facebook_group_login_status_var.set("Đăng nhập Facebook: Đang kiểm tra...")
+        self._run_background("Facebook Groups session check", self._task_check_facebook_groups_login)
+
+    def _task_check_facebook_groups_login(self):
+        try:
+            result = check_login_session()
+        except FacebookGroupPublisherError as exc:
+            status = "Đăng nhập Facebook: Không kiểm tra được phiên"
+            self.root.after(0, self.facebook_group_login_status_var.set, status)
+            return f"Không kiểm tra được phiên Facebook.\nLý do: {exc}", False
+        if result["authenticated"]:
+            status = "Đăng nhập Facebook: Đã xác thực thành công"
+            self.root.after(0, self.facebook_group_login_status_var.set, status)
+            return "Phiên đăng nhập Facebook đang hoạt động và sẵn sàng đăng group.", True
+        status = "Đăng nhập Facebook: Chưa xác thực"
+        self.root.after(0, self.facebook_group_login_status_var.set, status)
+        reason = result.get("reason") or "Không tìm thấy phiên đăng nhập Facebook."
+        return (
+            f"Phiên đăng nhập Facebook chưa sẵn sàng.\nLý do: {reason}\n"
+            "Hãy chọn Đăng nhập / Xác thực lại.",
+            False,
+        )
 
     def _open_facebook_queue_manager(self):
         existing = getattr(self, "facebook_queue_dialog", None)
@@ -1843,8 +1946,19 @@ class AppGUI:
             return f"Facebook Groups failed:\n{exc}", False
 
         counts = result["counts"]
+        if counts["needs_login"]:
+            heading = "Facebook Groups đã dừng: cần xác thực lại Facebook"
+            self.root.after(
+                0,
+                self.facebook_group_login_status_var.set,
+                "Đăng nhập Facebook: Phiên không hợp lệ, cần xác thực lại",
+            )
+        elif counts["failed"]:
+            heading = "Facebook Groups hoàn tất nhưng có lỗi"
+        else:
+            heading = "Facebook Groups dry-run completed" if effective_dry_run else "Facebook Groups publish completed"
         lines = [
-            "Facebook Groups dry-run completed" if effective_dry_run else "Facebook Groups publish completed",
+            heading,
             f"Batch: {result['batch_id'][:12]}",
             (
                 f"Published: {counts['published']} | Pending: {counts['pending']} | "
@@ -1862,6 +1976,14 @@ class AppGUI:
         for item in result["results"]:
             detail = f" - {item['message']}" if item.get("message") else ""
             lines.append(f"- {item['group_name']}: {item['status']}{detail}")
+        if counts["needs_login"]:
+            lines.extend(
+                [
+                    "",
+                    "Cách xử lý: mở cấu hình Facebook Groups → Đăng nhập / Xác thực lại.",
+                    "Chờ Chrome tự đóng sau khi app báo xác thực thành công, rồi bấm Đăng 1 group để thử lại.",
+                ]
+            )
         if not effective_dry_run and counts["published"] + counts["pending"] > 0:
             saved = mark_items_published(cards)
             lines.append(f"Published ledger updated: {saved} items")
@@ -2095,6 +2217,8 @@ class AppGUI:
             self._set_text(self.visual_box, output, disabled=True)
         if ok is False:
             messagebox.showwarning("Task Failed", self._task_failure_popup_message(title, output), parent=self.root)
+        elif title in {"Facebook Groups login", "Facebook Groups session check"}:
+            messagebox.showinfo("Facebook Groups", output, parent=self.root)
 
     def _set_actions_enabled(self, enabled):
         state = "normal" if enabled else "disabled"

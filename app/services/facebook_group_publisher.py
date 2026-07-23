@@ -5,7 +5,7 @@ import random
 import re
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -27,7 +27,12 @@ from app.services.storage import (
 
 FACEBOOK_HOME_URL = "https://www.facebook.com/"
 DELIVERED_STATUSES = {"published", "pending"}
-PROFILE_DIR = Path(os.getenv("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "Maritime Intelligence Hub" / "browser_profiles" / "facebook"
+PROFILE_DIR = (
+    Path(os.getenv("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+    / "Maritime Intelligence Hub"
+    / "browser_profiles"
+    / "facebook_chrome"
+)
 DIAGNOSTIC_DIR = ROOT_DIR / "logs" / "facebook_groups"
 _PUBLISH_LOCK = threading.Lock()
 VIETNAM_TIMEZONE = timezone(timedelta(hours=7))
@@ -578,16 +583,62 @@ def _vietnam_day_start_iso(now):
     return local_start.astimezone(timezone.utc).isoformat()
 
 
-def open_login_session(profile_dir=PROFILE_DIR, timeout_seconds=300, browser_factory=None):
+def open_login_session(
+    profile_dir=PROFILE_DIR,
+    timeout_seconds=300,
+    browser_factory=None,
+    status_callback=None,
+):
     browser_factory = browser_factory or facebook_browser_session
-    with browser_factory(profile_dir=profile_dir, headed=True) as browser:
-        browser.page.goto(FACEBOOK_HOME_URL, wait_until="domcontentloaded", timeout=60000)
-        deadline = time.time() + max(1, int(timeout_seconds))
-        while time.time() < deadline:
-            if browser.is_authenticated():
-                return {"authenticated": True, "profile_dir": str(Path(profile_dir))}
-            time.sleep(1)
-    return {"authenticated": False, "profile_dir": str(Path(profile_dir))}
+    if not _PUBLISH_LOCK.acquire(blocking=False):
+        raise FacebookGroupPublisherError("Facebook Groups browser is already running.")
+    last_status = {"authenticated": False, "reason": "Phiên Facebook chưa được xác thực."}
+    last_reported = None
+    try:
+        with browser_factory(profile_dir=profile_dir, headed=True) as browser:
+            browser.page.goto(FACEBOOK_HOME_URL, wait_until="domcontentloaded", timeout=60000)
+            deadline = time.time() + max(1, int(timeout_seconds))
+            while time.time() < deadline:
+                last_status = {
+                    **browser.authentication_status(),
+                    "browser_name": getattr(browser, "browser_name", "Google Chrome"),
+                }
+                report_key = (last_status.get("state"), last_status.get("reason"))
+                if status_callback is not None and report_key != last_reported:
+                    with suppress(Exception):
+                        status_callback(dict(last_status))
+                    last_reported = report_key
+                if last_status["authenticated"]:
+                    return {
+                        **last_status,
+                        "profile_dir": str(Path(profile_dir)),
+                    }
+                if last_status.get("state") == "browser_closed":
+                    break
+                time.sleep(1)
+    finally:
+        _PUBLISH_LOCK.release()
+    return {
+        **last_status,
+        "authenticated": False,
+        "profile_dir": str(Path(profile_dir)),
+    }
+
+
+def check_login_session(profile_dir=PROFILE_DIR, browser_factory=None):
+    browser_factory = browser_factory or facebook_browser_session
+    if not _PUBLISH_LOCK.acquire(blocking=False):
+        raise FacebookGroupPublisherError("Facebook Groups browser is already running.")
+    try:
+        with browser_factory(profile_dir=profile_dir, headed=True) as browser:
+            browser.page.goto(FACEBOOK_HOME_URL, wait_until="domcontentloaded", timeout=60000)
+            return {
+                **browser.authentication_status(),
+                "browser_name": getattr(browser, "browser_name", "Google Chrome"),
+                "profile_dir": str(Path(profile_dir)),
+            }
+    finally:
+        _PUBLISH_LOCK.release()
 
 
 @contextmanager
@@ -603,24 +654,43 @@ def facebook_browser_session(profile_dir=PROFILE_DIR, headed=True):
     playwright = sync_playwright().start()
     context = None
     try:
-        try:
-            context = playwright.chromium.launch_persistent_context(
-                str(profile_path), channel="msedge", headless=not headed, viewport={"width": 1365, "height": 900}
-            )
-        except PlaywrightError:
-            context = playwright.chromium.launch_persistent_context(
-                str(profile_path), headless=not headed, viewport={"width": 1365, "height": 900}
-            )
+        context, browser_name = _launch_persistent_facebook_context(
+            playwright.chromium,
+            profile_path,
+            headed,
+        )
         page = context.pages[0] if context.pages else context.new_page()
-        yield FacebookGroupBrowser(page)
+        yield FacebookGroupBrowser(page, browser_name=browser_name)
     except PlaywrightError as exc:
         raise FacebookGroupPublisherError(f"Playwright browser error: {_safe_error(exc)}") from exc
     finally:
-        try:
-            if context is not None:
+        if context is not None:
+            with suppress(Exception):
                 context.close()
-        finally:
+        with suppress(Exception):
             playwright.stop()
+
+
+def _launch_persistent_facebook_context(chromium, profile_path, headed):
+    attempts = [
+        ("chrome", "Google Chrome"),
+        ("msedge", "Microsoft Edge"),
+        (None, "Playwright Chromium"),
+    ]
+    last_error = None
+    for channel, browser_name in attempts:
+        options = {
+            "headless": not headed,
+            "viewport": {"width": 1365, "height": 900},
+        }
+        if channel:
+            options["channel"] = channel
+        try:
+            context = chromium.launch_persistent_context(str(profile_path), **options)
+            return context, browser_name
+        except Exception as exc:
+            last_error = exc
+    raise last_error
 
 
 class FacebookGroupBrowser:
@@ -635,15 +705,67 @@ class FacebookGroupBrowser:
         re.IGNORECASE,
     )
 
-    def __init__(self, page):
+    def __init__(self, page, browser_name="Browser"):
         self.page = page
+        self.browser_name = browser_name
 
     def is_authenticated(self):
+        return self.authentication_status()["authenticated"]
+
+    def authentication_status(self):
+        try:
+            if self.page.is_closed():
+                return {
+                    "authenticated": False,
+                    "state": "browser_closed",
+                    "reason": f"Cửa sổ {self.browser_name} đã bị đóng trước khi xác thực hoàn tất.",
+                }
+        except Exception:
+            pass
         url = str(self.page.url or "").lower()
-        if any(part in url for part in self.LOGIN_PATHS):
-            return False
-        email = self.page.locator('input[name="email"]')
-        return email.count() == 0
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        is_facebook = host == "facebook.com" or host.endswith(".facebook.com")
+        if not is_facebook:
+            if parsed.scheme in {"file", "data"}:
+                return {"authenticated": True, "reason": "Local browser fixture."}
+            return {
+                "authenticated": False,
+                "state": "loading",
+                "reason": "Facebook chưa tải xong.",
+            }
+        path = (parsed.path or "").lower()
+        if "/checkpoint" in path or "/two_step_verification" in path:
+            return {
+                "authenticated": False,
+                "state": "checkpoint",
+                "reason": "Facebook đang hiển thị trang đăng nhập, checkpoint hoặc 2FA.",
+            }
+        if "/login" in path:
+            return {
+                "authenticated": False,
+                "state": "login",
+                "reason": "Facebook đang chờ đăng nhập.",
+            }
+        try:
+            cookies = self.page.context.cookies([FACEBOOK_HOME_URL])
+        except Exception:
+            cookies = []
+        has_user_session = any(
+            cookie.get("name") == "c_user" and str(cookie.get("value") or "").strip()
+            for cookie in cookies
+        )
+        if has_user_session:
+            return {
+                "authenticated": True,
+                "state": "authenticated",
+                "reason": "Đã xác nhận cookie phiên Facebook.",
+            }
+        return {
+            "authenticated": False,
+            "state": "login",
+            "reason": "Thiếu cookie phiên Facebook. Hãy hoàn tất đăng nhập và mọi bước 2FA/checkpoint.",
+        }
 
     def check_group(self, group_url):
         self.page.goto(group_url, wait_until="domcontentloaded", timeout=60000)
@@ -697,7 +819,9 @@ class FacebookGroupBrowser:
 
     def _require_authenticated(self):
         if not self.is_authenticated():
-            raise FacebookLoginRequired("Facebook login, checkpoint, CAPTCHA, or 2FA confirmation is required.")
+            raise FacebookLoginRequired(
+                "Phiên Facebook chưa được xác thực; cần hoàn tất đăng nhập, checkpoint, CAPTCHA hoặc 2FA."
+            )
         try:
             page_text = self.page.locator("body").inner_text(timeout=2000)
         except Exception:

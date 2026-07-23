@@ -3,16 +3,19 @@ import unittest
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from app.services.facebook_group_publisher import (
     FacebookGroupBrowser,
     FacebookSafetyStop,
+    _launch_persistent_facebook_context,
     build_batch_id,
     build_group_caption,
     cancel_group_queue_item,
     get_due_queue_item,
     list_group_queue,
     normalize_group_url,
+    open_login_session,
     publish_to_groups,
     publish_queue_item,
     validate_group_config,
@@ -25,6 +28,87 @@ from app.services.storage import (
 
 
 class FacebookGroupPublisherTests(unittest.TestCase):
+    def test_browser_launch_prefers_google_chrome(self):
+        chromium = _FakeChromium()
+
+        context, browser_name = _launch_persistent_facebook_context(
+            chromium,
+            Path("profile"),
+            headed=True,
+        )
+
+        self.assertIs(context, chromium.context)
+        self.assertEqual(browser_name, "Google Chrome")
+        self.assertEqual(chromium.channels, ["chrome"])
+
+    def test_browser_launch_falls_back_to_edge_after_chrome_failure(self):
+        chromium = _FakeChromium(fail_channels={"chrome"})
+
+        _context, browser_name = _launch_persistent_facebook_context(
+            chromium,
+            Path("profile"),
+            headed=True,
+        )
+
+        self.assertEqual(browser_name, "Microsoft Edge")
+        self.assertEqual(chromium.channels, ["chrome", "msedge"])
+
+    def test_facebook_authentication_requires_positive_session_cookie(self):
+        page = _AuthPage("https://www.facebook.com/", cookies=[])
+
+        status = FacebookGroupBrowser(page).authentication_status()
+
+        self.assertFalse(status["authenticated"])
+        self.assertIn("cookie", status["reason"].lower())
+
+    def test_facebook_authentication_accepts_c_user_cookie(self):
+        page = _AuthPage(
+            "https://www.facebook.com/",
+            cookies=[{"name": "c_user", "value": "123456"}],
+        )
+
+        status = FacebookGroupBrowser(page).authentication_status()
+
+        self.assertTrue(status["authenticated"])
+
+    def test_facebook_checkpoint_rejects_existing_session_cookie(self):
+        page = _AuthPage(
+            "https://www.facebook.com/checkpoint/flow",
+            cookies=[{"name": "c_user", "value": "123456"}],
+        )
+
+        status = FacebookGroupBrowser(page).authentication_status()
+
+        self.assertFalse(status["authenticated"])
+        self.assertEqual(status["state"], "checkpoint")
+        self.assertIn("checkpoint", status["reason"].lower())
+
+    def test_closed_login_browser_returns_friendly_state(self):
+        page = _AuthPage("https://www.facebook.com/", cookies=[], closed=True)
+
+        status = FacebookGroupBrowser(page).authentication_status()
+
+        self.assertFalse(status["authenticated"])
+        self.assertEqual(status["state"], "browser_closed")
+
+    def test_login_window_closes_only_after_session_cookie_is_verified(self):
+        browser = _LoginBrowser(
+            [
+                {"authenticated": False, "reason": "missing"},
+                {"authenticated": True, "reason": "verified"},
+            ]
+        )
+
+        with patch("app.services.facebook_group_publisher.time.sleep"):
+            result = open_login_session(
+                profile_dir="profile",
+                timeout_seconds=3,
+                browser_factory=_factory(browser),
+            )
+
+        self.assertTrue(result["authenticated"])
+        self.assertEqual(browser.status_calls, 2)
+
     def test_normalize_group_url_removes_query_and_rejects_other_hosts(self):
         self.assertEqual(
             normalize_group_url("https://m.facebook.com/groups/maritime.vn/?ref=share"),
@@ -441,6 +525,61 @@ class _FakeBrowser:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+class _AuthContext:
+    def __init__(self, cookies):
+        self._cookies = cookies
+
+    def cookies(self, _urls):
+        return self._cookies
+
+
+class _FakeChromium:
+    def __init__(self, fail_channels=None):
+        self.context = object()
+        self.channels = []
+        self.fail_channels = set(fail_channels or [])
+
+    def launch_persistent_context(self, _profile_path, **options):
+        channel = options.get("channel")
+        self.channels.append(channel)
+        if channel in self.fail_channels:
+            raise RuntimeError(f"{channel} unavailable")
+        return self.context
+
+
+class _AuthPage:
+    def __init__(self, url, cookies, closed=False):
+        self.url = url
+        self.context = _AuthContext(cookies)
+        self._closed = closed
+
+    def is_closed(self):
+        return self._closed
+
+
+class _LoginPage:
+    def __init__(self):
+        self.url = "about:blank"
+
+    def goto(self, url, **_kwargs):
+        self.url = url
+
+    def is_closed(self):
+        return False
+
+
+class _LoginBrowser:
+    def __init__(self, statuses):
+        self.page = _LoginPage()
+        self.statuses = list(statuses)
+        self.status_calls = 0
+
+    def authentication_status(self):
+        index = min(self.status_calls, len(self.statuses) - 1)
+        self.status_calls += 1
+        return self.statuses[index]
 
 
 def _factory(browser):

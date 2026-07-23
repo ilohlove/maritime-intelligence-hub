@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.2 - 2026-07-23
+
+- Verify Facebook login using a positive session cookie and show clear login status in the Groups UI.
+- Handle checkpoint, closed-browser, and context cleanup states without exposing technical tracebacks.
+- Prefer Google Chrome with an isolated persistent profile, then fall back to Edge or Playwright Chromium.
+
 ## v1.1.1 - 2026-07-23
 
 - Add safe Playwright publishing for Facebook Groups with reusable local login profiles.

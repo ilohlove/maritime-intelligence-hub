@@ -102,11 +102,11 @@ python -m app.main --gui
 The **Hoàn thành** tab can publish the latest rendered card set to multiple Facebook Groups with Playwright.
 
 1. Open **Groups**, add each group name and `facebook.com/groups/...` URL, then optionally add a group-specific caption.
-2. Choose **Đăng nhập / Re-auth** and complete Facebook login or 2FA manually in the Edge window. The app never stores a Facebook password.
+2. Choose **Đăng nhập / Re-auth** and complete Facebook login or 2FA manually in the Google Chrome window. The app never stores a Facebook password.
 3. Run **Dry-run** to verify the saved session and posting permission without creating a post.
 4. Enable **Đăng Facebook Groups** to include the groups in the normal in-app schedule.
 
-The browser profile is stored under `%LOCALAPPDATA%\Maritime Intelligence Hub\browser_profiles\facebook`, outside the repository. Safe defaults limit automatic publishing to two groups per brief and four real attempts per Vietnam calendar day, with a random 15–30 minute interval. Extra targets remain queued. **Post 1 Queued Group** handles one queued target per click and still respects the daily limit; dry-run does not consume quota.
+The browser profile is stored under `%LOCALAPPDATA%\Maritime Intelligence Hub\browser_profiles\facebook_chrome`, outside the repository. Google Chrome is preferred, with Microsoft Edge and Playwright Chromium as fallbacks. Safe defaults limit automatic publishing to two groups per brief and four real attempts per Vietnam calendar day, with a random 15–30 minute interval. Extra targets remain queued. **Post 1 Queued Group** handles one queued target per click and still respects the daily limit; dry-run does not consume quota.
 
 Every enabled group requires its own non-duplicate caption, and every rendered caption includes the source name and original URL for each card. The app does not rewrite captions to evade moderation. A pending-admin-approval result is recorded as delivered so the same batch is not submitted twice. Login checkpoints, CAPTCHA, rate-limit warnings, and temporary-block signals stop the active queue and require manual review or re-authentication.
 

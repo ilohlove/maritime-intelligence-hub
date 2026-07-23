@@ -1,11 +1,11 @@
 {
-  "version": "1.1.1",
+  "version": "1.1.2",
   "release_date": "2026-07-23",
-  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.1.1/BV-maritime-intelligence-hub.exe",
+  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.1.2/BV-maritime-intelligence-hub.exe",
   "changelog": [
-    "Add safe Playwright publishing for Facebook Groups with reusable local login profiles.",
-    "Add per-brief and daily limits, randomized queue scheduling, duplicate protection, and safety stops.",
-    "Add a responsive Facebook Groups setup screen and queue manager with delivery status tracking."
+    "Verify Facebook login using a positive session cookie and show clear login status in the Groups UI.",
+    "Handle checkpoint, closed-browser, and context cleanup states without exposing technical tracebacks.",
+    "Prefer Google Chrome with an isolated persistent profile, then fall back to Edge or Playwright Chromium."
   ],
   "force_update": false
 }

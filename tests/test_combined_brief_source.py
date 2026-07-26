@@ -293,12 +293,12 @@ class CombinedBriefSourceTests(unittest.TestCase):
             db_path = temp_path / "mih.db"
             brief_path = temp_path / "combined_brief.json"
 
-            result = build_combined_brief(source_mode="sheet", sheet_url="", db_path=db_path, brief_path=brief_path)
-            message = format_empty_combined_message(result.stats, result.brief_path)
+            with patch("app.services.combined_brief_source.collect_backup_news", return_value=[]):
+                result = build_combined_brief(source_mode="sheet", sheet_url="", db_path=db_path, brief_path=brief_path)
 
         self.assertEqual(result.payload["items"], [])
-        self.assertIn("Google Sheet URL is empty", message)
-        self.assertIn("Source mode: sheet", message)
+        self.assertEqual(result.stats["fallback_reason"], "sheet_empty")
+        self.assertEqual(result.stats["source_mode"], "sheet")
 
 
 def _item(source_type, source_name, url):

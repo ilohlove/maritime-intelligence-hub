@@ -60,3 +60,10 @@ python -m compileall app tests
 python -m app.main validate-sources
 python -m app.main run-pipeline --priority P1
 ```
+## Backup lane checks
+
+- Verify the Vietnam-source checkbox excludes `Country=Vietnam`, `.vn`, and
+  resolved Vietnamese publishers.
+- Verify Sheet failure/empty data activates backup feeds and records a reason.
+- Verify Jina -> Trafilatura -> BeautifulSoup extraction order.
+- Verify Gemini -> Groq -> OpenRouter fallback and provider metadata.

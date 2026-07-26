@@ -20,6 +20,9 @@ from app.services.storage import (
     get_brief_candidates,
     list_published_item_keys,
 )
+from app.services.backup_source_collector import collect_backup_news
+from app.services.source_policy import filter_sources, normalize_filter_flag, vietnam_source_reason
+from app.services.source_master import load_sources
 
 
 DEFAULT_COMBINED_BRIEF_PATH = ROOT_DIR / "output" / "briefs" / "combined_brief.json"
@@ -47,6 +50,8 @@ def build_combined_brief(
     brief_path=DEFAULT_COMBINED_BRIEF_PATH,
     db_path=DEFAULT_DB_PATH,
     session=None,
+    exclude_vietnam=False,
+    backup_feed_master=None,
 ):
     session = session or requests.Session()
     source_mode = (source_mode or "combined").strip().lower()
@@ -57,14 +62,49 @@ def build_combined_brief(
     sheet_diagnostics = sheet_lookup(sheet_url) if use_sheet else {}
     app_items = load_app_items(limit=app_limit, db_path=db_path) if use_app else []
     effective_sheet_limit = None if source_mode == "sheet" else sheet_limit
-    sheet_data = load_sheet_data(sheet_url, limit=effective_sheet_limit, session=session) if use_sheet else {}
+    sheet_error = ""
+    try:
+        sheet_data = load_sheet_data(sheet_url, limit=effective_sheet_limit, session=session) if use_sheet else {}
+    except Exception as exc:
+        sheet_error = str(exc)
+        sheet_data = {"items": [], "run_marker": "", "run_label": ""}
     sheet_items = sheet_data.get("items", []) if use_sheet else []
+    if normalize_filter_flag(exclude_vietnam):
+        sheet_items = [item for item in sheet_items if not vietnam_source_reason(item)]
+        app_items = [item for item in app_items if not vietnam_source_reason(item)]
+    backup_items = []
+    backup_results = []
+    fallback_reason = ""
+    if use_sheet and source_mode in {"sheet", "combined"} and not sheet_items:
+        fallback_reason = sheet_error or "sheet_empty"
+        try:
+            backup_results = collect_backup_news(
+                feed_master=backup_feed_master or ROOT_DIR / "BACKUP_FEED_MASTER.csv",
+                official_sources=load_sources(ROOT_DIR / "NEWS_SOURCE_MASTER.csv")[0],
+                limit_per_source=effective_sheet_limit or 10,
+                db_path=db_path,
+                session=session,
+                exclude_vietnam=exclude_vietnam,
+            )
+            for result in backup_results:
+                backup_items.extend(result.get("items") or [])
+        except Exception as exc:
+            fallback_reason = f"{fallback_reason}; backup_error={exc}"
     raw_items = app_items + sheet_items
     if source_mode == "sheet":
         filtered_items, stats = select_unpublished_sheet_items(raw_items, db_path=db_path)
     else:
         filtered_items, stats = filter_publishable_items(raw_items, db_path=db_path)
     stats["source_mode"] = source_mode
+    stats["fallback_reason"] = fallback_reason
+    stats["backup_total"] = len(backup_items)
+    stats["backup_results"] = backup_results
+    if backup_items:
+        backup_items = [_backup_item_to_brief(item) for item in backup_items]
+        backup_filtered, backup_stats = filter_publishable_items(backup_items, db_path=db_path)
+        filtered_items.extend(backup_filtered)
+        stats["selected_total"] = len(filtered_items)
+        stats["raw_total"] += backup_stats["raw_total"]
     if use_app:
         stats["app_db"] = app_diagnostics
     if use_sheet:
@@ -117,6 +157,19 @@ def load_app_items(limit=None, db_path=DEFAULT_DB_PATH):
         item["item_key"] = item_key(item)
         items.append(item)
     return items if limit is None else items[: max(1, int(limit))]
+
+
+def _backup_item_to_brief(item):
+    normalized = dict(item)
+    normalized["original_url"] = normalized.get("original_url") or normalized.get("url") or ""
+    normalized["source_name"] = normalized.get("source_name") or normalized.get("name") or "Backup RSS"
+    normalized["summary"] = normalized.get("summary") or normalized.get("description") or normalized.get("content_excerpt") or ""
+    normalized["impact_note"] = normalized.get("impact_note") or ""
+    normalized["source_type"] = "backup"
+    normalized["canonical_url"] = canonicalize_url(normalized["original_url"])
+    normalized["title_hash"] = title_hash(normalized.get("title"))
+    normalized["item_key"] = item_key(normalized)
+    return normalized
 
 
 def load_sheet_items(sheet_url, limit=None, session=None):
@@ -447,6 +500,8 @@ def format_combined_stats(stats, brief_path=None):
         f"Duplicate removed: {stats.get('duplicate_removed', 0)}",
         f"Eligible after published filter: {stats.get('eligible_total', 0)}",
         f"Selected after dedupe: {stats.get('selected_total', 0)}",
+        f"Backup items: {stats.get('backup_total', 0)}",
+        f"Fallback reason: {stats.get('fallback_reason', '') or 'none'}",
     ]
     app_db = stats.get("app_db") or {}
     if app_db:
@@ -509,7 +564,10 @@ def format_empty_combined_message(stats, brief_path=None):
             )
     elif source_mode == "sheet":
         sheet_source = stats.get("sheet_source") or {}
-        if not sheet_source.get("sheet_url"):
+        fallback_reason = stats.get("fallback_reason")
+        if fallback_reason and int(stats.get("backup_total") or 0) == 0:
+            reason = f"Google Sheet unavailable ({fallback_reason}) and the backup lane returned no usable articles."
+        elif not sheet_source.get("sheet_url"):
             reason = "Google Sheet URL is empty. Select Sheet mode and paste the Google Sheet link."
         elif int(sheet_source.get("loaded_items") or 0) == 0:
             reason = "No usable rows loaded from the Google Sheet link."

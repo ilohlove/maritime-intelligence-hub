@@ -53,7 +53,9 @@ def fetch_rss_source(source, limit=10, db_path=None, session=None):
 
         message = f"Fetched {len(items[:limit])} items, inserted {inserted}, duplicates {duplicates}"
         _log(source, "rss", "ok", fetch_url, message, db_path, inserted)
-        return _result(source, "ok", message, feed_url=fetch_url, fetched=len(items[:limit]), inserted=inserted)
+        result = _result(source, "ok", message, feed_url=fetch_url, fetched=len(items[:limit]), inserted=inserted)
+        result["items"] = items[:limit]
+        return result
     except Exception as exc:
         message = str(exc)
         _log(source, "rss", "error", fetch_url or source.get("website"), message, db_path)

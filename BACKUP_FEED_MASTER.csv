@@ -1,0 +1,5 @@
+ID,Name,Provider,Feed URL,Query,Website/Domain,Country,Language,Category,Priority,Enabled,Max Items,Copyright Risk,AI Summary Enabled
+BF001,Official maritime RSS,official_rss,,,"https://safety4sea.com;https://splash247.com;https://www.maritime-executive.com;https://gcaptain.com;https://www.marineinsight.com",Global,EN,Shipping News,P1,Yes,10,Medium,Yes
+BF002,Google News maritime,google_news_rss,,maritime shipping vessel port logistics,news.google.com,Global,EN,Shipping News,P1,Yes,10,Medium,Yes
+BF003,Google News maritime safety,google_news_rss,,marine safety vessel accident IMO regulation,news.google.com,Global,EN,Safety,P1,Yes,10,Medium,Yes
+BF004,RSSHub custom maritime feeds,rsshub,https://rsshub.local/,,"rsshub.local",Global,EN,Shipping News,P2,No,10,Medium,Yes

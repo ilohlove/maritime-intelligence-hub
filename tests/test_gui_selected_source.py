@@ -18,6 +18,47 @@ from app.services.facebook_publisher import FacebookAPIError
 
 
 class GuiSelectedSourceTests(unittest.TestCase):
+    def test_selecting_app_source_starts_fetch_summarize_and_render(self):
+        app = _gui_stub()
+        app._update_visual_limit_states = Mock()
+        app._save_settings = Mock()
+        app._run_background = Mock()
+
+        AppGUI._on_visual_source_mode_changed(app, "app")
+
+        app._update_visual_limit_states.assert_called_once()
+        app._save_settings.assert_called_once()
+        app._run_background.assert_called_once_with(
+            "Fetching app news and generating image cards",
+            app._task_generate_combined_cards,
+        )
+
+    def test_selecting_non_app_source_does_not_start_pipeline(self):
+        app = _gui_stub()
+        app._update_visual_limit_states = Mock()
+        app._save_settings = Mock()
+        app._run_background = Mock()
+
+        AppGUI._on_visual_source_mode_changed(app, "sheet")
+
+        app._update_visual_limit_states.assert_called_once()
+        app._save_settings.assert_not_called()
+        app._run_background.assert_not_called()
+
+    def test_generate_app_cards_refreshes_pipeline_before_render(self):
+        app = _gui_stub()
+        app.visual_source_mode_var = _Var("app")
+        app._refresh_app_source_if_selected = Mock(return_value=_pipeline_result())
+        app._generate_combined_cards_result = Mock(return_value=_selected_result())
+
+        output, ok = AppGUI._task_generate_combined_cards(app)
+
+        self.assertTrue(ok)
+        app._refresh_app_source_if_selected.assert_called_once()
+        app._generate_combined_cards_result.assert_called_once_with(test_mode=True)
+        self.assertIn("App news refreshed: evening", output)
+        self.assertIn("AI summaries: 1", output)
+
     def test_loop_scan_uses_selected_source_cards(self):
         app = _gui_stub()
         selected_result = _selected_result()
@@ -662,16 +703,14 @@ class GuiSelectedSourceTests(unittest.TestCase):
 
         with patch(
             "app.gui.get_sheet_run_status",
-            side_effect=[
-                ValueError("Sheet L1 must contain a valid HH:MM run time."),
-                {"run_marker": "07:30", "run_label": "morning"},
-            ],
+            side_effect=ValueError("Sheet L1 must contain a valid HH:MM run time."),
         ):
             result = AppGUI._wait_for_sheet_if_needed(app, "sheet")
 
-        app._sleep_with_controls.assert_called_once_with(60)
-        self.assertTrue(result["sheet_ready"])
-        self.assertEqual(result["run_label"], "morning")
+        app._sleep_with_controls.assert_not_called()
+        self.assertFalse(result["sheet_ready"])
+        self.assertEqual(result["run_label"], "invalid")
+        self.assertIn("valid HH:MM", result["sheet_error"])
 
     def test_sheet_mode_waits_for_fresh_items_before_rendering(self):
         app = _gui_stub()
@@ -728,6 +767,27 @@ class GuiSelectedSourceTests(unittest.TestCase):
         intro = AppGUI._telegram_intro_text(app, "morning")
 
         self.assertEqual(intro, "Bản tin buổi sáng - 2026-06-18 07:15")
+
+    def test_backup_cards_continue_all_selected_completion_actions(self):
+        app = _gui_stub()
+        app.send_telegram_var = _Var(True)
+        app.post_facebook_var = _Var(True)
+        app.post_facebook_groups_var = _Var(True)
+        app._retry_gui_step = Mock(side_effect=lambda _name, action: action())
+        app._task_send_cards = Mock(return_value=("telegram sent", True))
+        app._task_post_facebook_cards = Mock(return_value=("facebook posted", True))
+        app._task_post_facebook_groups_cards = Mock(return_value=("groups posted", True))
+        result = _selected_result()
+        result["source_stats"]["fallback_reason"] = "sheet_error"
+        result["source_stats"]["backup_total"] = 1
+
+        lines, ok = AppGUI._run_selected_completion_actions(app, result)
+
+        self.assertTrue(ok)
+        self.assertEqual(lines, ["telegram sent", "facebook posted", "groups posted"])
+        app._task_send_cards.assert_called_once_with(["card-1.png"], "evening")
+        app._task_post_facebook_cards.assert_called_once_with(["card-1.png"], "evening", dry_run=True)
+        app._task_post_facebook_groups_cards.assert_called_once_with(["card-1.png"], "evening", dry_run=True)
 
 
 def _gui_stub():
@@ -790,6 +850,17 @@ def _selected_result():
             "cards": ["card-1.png"],
         },
         "brief_label": "evening",
+    }
+
+
+def _pipeline_result():
+    return {
+        "ok": True,
+        "fetch": {"results": [{"inserted": 2}]},
+        "html_fetch": {"results": [{"inserted": 1}]},
+        "scored": [{"id": 1}, {"id": 2}],
+        "summaries": [{"article_id": 1}],
+        "brief": {"scan_label": "evening", "items": 1},
     }
 
 

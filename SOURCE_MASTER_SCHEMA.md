@@ -41,6 +41,12 @@
 - `Legal Notes`
 - `Owner Notes`
 
+## Backup feed columns
+
+`BACKUP_FEED_MASTER.csv` uses `ID`, `Name`, `Provider`, `Feed URL`, `Query`,
+`Website/Domain`, `Country`, `Language`, `Category`, `Priority`, `Enabled`,
+`Max Items`, `Copyright Risk`, and `AI Summary Enabled`.
+
 ## Allowed Values
 
 - `Priority`: `P1`, `P2`, `P3`

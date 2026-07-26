@@ -77,6 +77,11 @@ def init_db(db_path=DEFAULT_DB_PATH):
                 hotness_score INTEGER,
                 hot_keywords TEXT,
                 why_hot TEXT,
+                source_type TEXT,
+                provider TEXT,
+                reader_provider TEXT,
+                reader_status TEXT,
+                reader_error TEXT,
                 status TEXT NOT NULL DEFAULT 'new',
                 FOREIGN KEY(source_id) REFERENCES sources(id)
             );
@@ -97,6 +102,9 @@ def init_db(db_path=DEFAULT_DB_PATH):
                 prompt_version TEXT NOT NULL,
                 model_name TEXT NOT NULL,
                 token_usage INTEGER NOT NULL DEFAULT 0,
+                ai_provider TEXT,
+                image_prompt TEXT,
+                fallback_errors TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE
             );
@@ -192,11 +200,19 @@ def init_db(db_path=DEFAULT_DB_PATH):
         _ensure_column(conn, "articles", "hotness_score", "INTEGER")
         _ensure_column(conn, "articles", "hot_keywords", "TEXT")
         _ensure_column(conn, "articles", "why_hot", "TEXT")
+        _ensure_column(conn, "articles", "source_type", "TEXT")
+        _ensure_column(conn, "articles", "provider", "TEXT")
+        _ensure_column(conn, "articles", "reader_provider", "TEXT")
+        _ensure_column(conn, "articles", "reader_status", "TEXT")
+        _ensure_column(conn, "articles", "reader_error", "TEXT")
         _ensure_column(conn, "article_summaries", "headline", "TEXT")
         _ensure_column(conn, "article_summaries", "category", "TEXT")
         _ensure_column(conn, "article_summaries", "importance_score", "INTEGER")
         _ensure_column(conn, "article_summaries", "source_name", "TEXT")
         _ensure_column(conn, "article_summaries", "original_url", "TEXT")
+        _ensure_column(conn, "article_summaries", "ai_provider", "TEXT")
+        _ensure_column(conn, "article_summaries", "image_prompt", "TEXT")
+        _ensure_column(conn, "article_summaries", "fallback_errors", "TEXT")
         _ensure_column(conn, "published_items", "telegram_chat_id", "TEXT")
         _ensure_column(conn, "published_items", "facebook_page_id", "TEXT")
         _ensure_column(conn, "published_items", "facebook_post_id", "TEXT")
@@ -343,9 +359,10 @@ def upsert_article(article, db_path=DEFAULT_DB_PATH):
             INSERT INTO articles (
                 source_id, source_name, title, url, normalized_title, title_hash,
                 published_at, fetched_at, language, category, description,
-                content_excerpt, importance_score, status
+                content_excerpt, importance_score, source_type, provider,
+                reader_provider, reader_status, reader_error, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 article["source_id"],
@@ -361,6 +378,11 @@ def upsert_article(article, db_path=DEFAULT_DB_PATH):
                 article.get("description"),
                 article.get("content_excerpt"),
                 article.get("importance_score"),
+                article.get("source_type"),
+                article.get("provider"),
+                article.get("reader_provider"),
+                article.get("reader_status"),
+                article.get("reader_error"),
                 status,
             ),
         )
@@ -454,9 +476,9 @@ def upsert_summary(summary, db_path=DEFAULT_DB_PATH):
             INSERT INTO article_summaries (
                 article_id, headline, summary, impact_note, category,
                 importance_score, source_name, original_url, prompt_version,
-                model_name, token_usage, created_at
+                model_name, token_usage, ai_provider, image_prompt, fallback_errors, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(article_id) DO UPDATE SET
                 headline=excluded.headline,
                 summary=excluded.summary,
@@ -468,6 +490,9 @@ def upsert_summary(summary, db_path=DEFAULT_DB_PATH):
                 prompt_version=excluded.prompt_version,
                 model_name=excluded.model_name,
                 token_usage=excluded.token_usage,
+                ai_provider=excluded.ai_provider,
+                image_prompt=excluded.image_prompt,
+                fallback_errors=excluded.fallback_errors,
                 created_at=excluded.created_at
             """,
             (
@@ -482,6 +507,9 @@ def upsert_summary(summary, db_path=DEFAULT_DB_PATH):
                 summary["prompt_version"],
                 summary["model_name"],
                 summary["token_usage"],
+                summary.get("ai_provider"),
+                summary.get("image_prompt"),
+                json.dumps(summary.get("fallback_errors") or [], ensure_ascii=False),
                 now,
             ),
         )

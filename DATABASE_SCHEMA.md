@@ -21,6 +21,7 @@ Stores cleaned excerpt or limited content required for AI processing.
 ### article_summaries
 
 Stores AI output, category, importance score, impact note, model, prompt version, and token usage.
+It also stores the selected provider, optional image prompt, and fallback errors.
 
 ### briefs
 

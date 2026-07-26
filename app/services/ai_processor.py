@@ -17,6 +17,8 @@ MODEL_NAME = "rule-based-mock"
 OPENAI_PROMPT_VERSION = "openai-v1"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
+GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
+OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
 GEMINI_PROMPT_VERSION = "gemini-v1"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 GEMINI_GENERATE_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -57,6 +59,8 @@ def get_ai_provider():
     provider_name = os.getenv("AI_PROVIDER", "mock").strip().lower()
     openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
     gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
 
     if provider_name == "openai" and openai_api_key:
         return OpenAIChatProvider(
@@ -68,6 +72,16 @@ def get_ai_provider():
             api_key=gemini_api_key,
             model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL,
         )
+    if provider_name in {"chain", "auto"}:
+        providers = []
+        if gemini_api_key:
+            providers.append(GeminiChatProvider(api_key=gemini_api_key, model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL))
+        if groq_api_key:
+            providers.append(OpenAICompatibleProvider(groq_api_key, os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"), GROQ_CHAT_COMPLETIONS_URL, "groq"))
+        if openrouter_api_key:
+            providers.append(OpenAICompatibleProvider(openrouter_api_key, os.getenv("OPENROUTER_MODEL", "openrouter/free"), OPENROUTER_CHAT_COMPLETIONS_URL, "openrouter"))
+        if providers:
+            return AIProviderChain(providers)
     return MockAIProvider()
 
 
@@ -122,6 +136,85 @@ class OpenAIChatProvider:
         payload = json.loads(_strip_json_fence(content))
         payload["token_usage"] = int((body.get("usage") or {}).get("total_tokens") or 0)
         return payload
+
+
+class OpenAICompatibleProvider:
+    def __init__(self, api_key, model, endpoint, provider_name):
+        self.api_key = api_key
+        self.model_name = model
+        self.endpoint = endpoint
+        self.provider_name = provider_name
+        self.prompt_version = f"{provider_name}-v1"
+
+    def summarize(self, article):
+        return _summarize_with_retry(self, article, self.provider_name.title())
+
+    def _request_summary(self, article):
+        response = requests.post(
+            self.endpoint,
+            timeout=30,
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            json={
+                "model": self.model_name,
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": "Return only valid JSON Vietnamese maritime summary with full diacritics."},
+                    {"role": "user", "content": build_ai_prompt(article)},
+                ],
+            },
+        )
+        response.raise_for_status()
+        body = response.json()
+        content = body["choices"][0]["message"]["content"]
+        payload = json.loads(_strip_json_fence(content))
+        payload["token_usage"] = int((body.get("usage") or {}).get("total_tokens") or 0)
+        return payload
+
+
+class AIProviderChain:
+    def __init__(self, providers):
+        self.providers = providers
+        self.model_name = " -> ".join(provider.model_name for provider in providers)
+        self.prompt_version = "provider-chain-v1"
+
+    def summarize(self, article):
+        errors = []
+        for provider in self.providers:
+            try:
+                payload = provider._request_summary(article)
+                validate_ai_provider_payload(payload)
+                normalized = normalize_ai_payload(payload, article, provider.prompt_version, provider.model_name)
+                normalized["ai_provider"] = getattr(provider, "provider_name", provider.__class__.__name__)
+                normalized["fallback_errors"] = errors
+                return normalized
+            except Exception as exc:
+                errors.append(f"{getattr(provider, 'provider_name', provider.__class__.__name__)}: {exc}")
+                logger.warning("AI provider failed; trying next provider: %s", errors[-1])
+        fallback = build_mock_summary(article)
+        fallback["fallback_errors"] = errors
+        fallback["ai_provider"] = "mock"
+        return fallback
+
+
+def validate_ai_provider_payload(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("AI response must be a JSON object")
+    for key in ("headline", "summary", "impact_note"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"AI response is missing a valid {key}")
+    score = payload.get("importance_score")
+    if score is not None:
+        try:
+            numeric_score = int(score)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("AI importance_score must be an integer") from exc
+        if not 1 <= numeric_score <= 10:
+            raise ValueError("AI importance_score must be from 1 to 10")
+    for key in ("headline", "summary", "impact_note"):
+        if _looks_unaccented_vietnamese(payload.get(key)):
+            raise ValueError(f"AI response contains unaccented Vietnamese in {key}")
+    return payload
 
 
 class GeminiChatProvider:
@@ -197,6 +290,7 @@ def build_ai_prompt(article):
                 "importance_score",
                 "source_name",
                 "original_url",
+                "image_prompt",
             ],
             "output_language": "Vietnamese with full diacritics",
             "article": {
@@ -217,6 +311,7 @@ def normalize_ai_payload(payload, article, prompt_version, model_name):
     headline = _bounded_text(payload.get("headline") or fallback["headline"], 180)
     summary = _bounded_text(payload.get("summary") or fallback["summary"], 900)
     impact_note = _bounded_text(payload.get("impact_note") or fallback["impact_note"], 600)
+    image_prompt = _bounded_text(payload.get("image_prompt") or payload.get("visual_hint") or "", 400)
     if _looks_unaccented_vietnamese(summary):
         summary = fallback["summary"]
     if _looks_unaccented_vietnamese(impact_note):
@@ -235,6 +330,7 @@ def normalize_ai_payload(payload, article, prompt_version, model_name):
         "prompt_version": prompt_version,
         "model_name": model_name,
         "token_usage": int(payload.get("token_usage") or 0),
+        "image_prompt": image_prompt,
     }
 
 

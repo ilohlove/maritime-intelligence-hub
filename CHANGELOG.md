@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.1.3 - 2026-07-26
+
+- Fall back automatically from Google Sheets to approved maritime RSS, Google News RSS, and self-hosted RSSHub feeds.
+- Add Vietnamese-source exclusion, Jina/Trafilatura/BeautifulSoup article extraction, and source provenance tracking.
+- Add Gemini, Groq, and OpenRouter API settings with validated automatic provider failover.
+- Let Generate Test ignore Sheet time windows while completion flows continue selected Telegram and Facebook actions after backup rendering.
+
 ## v1.1.2 - 2026-07-23
 
 - Verify Facebook login using a positive session cookie and show clear login status in the Groups UI.

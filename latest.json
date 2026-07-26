@@ -1,11 +1,12 @@
 {
-  "version": "1.1.2",
-  "release_date": "2026-07-23",
-  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.1.2/BV-maritime-intelligence-hub.exe",
+  "version": "1.1.3",
+  "release_date": "2026-07-26",
+  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.1.3/BV-maritime-intelligence-hub.exe",
   "changelog": [
-    "Verify Facebook login using a positive session cookie and show clear login status in the Groups UI.",
-    "Handle checkpoint, closed-browser, and context cleanup states without exposing technical tracebacks.",
-    "Prefer Google Chrome with an isolated persistent profile, then fall back to Edge or Playwright Chromium."
+    "Fall back automatically from Google Sheets to approved maritime RSS, Google News RSS, and self-hosted RSSHub feeds.",
+    "Add Vietnamese-source exclusion, Jina/Trafilatura/BeautifulSoup article extraction, and source provenance tracking.",
+    "Add Gemini, Groq, and OpenRouter API settings with validated automatic provider failover.",
+    "Let Generate Test ignore Sheet time windows while completion flows continue selected Telegram and Facebook actions after backup rendering."
   ],
   "force_update": false
 }

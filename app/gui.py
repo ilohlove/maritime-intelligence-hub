@@ -18,6 +18,7 @@ from app.services.pipeline import (
     fetch_html,
     fetch_rss,
     refresh_trends,
+    run_pipeline,
     score_articles,
     summarize_articles,
     validate_sources,
@@ -120,9 +121,15 @@ class AppGUI:
         self.timezone_offset_var = ctk.StringVar(value=str(scan.get("timezone_offset", "+7")))
         self.retry_attempts_var = ctk.StringVar(value=str(scan.get("retry_attempts", 2)))
 
-        self.provider_var = ctk.StringVar(value=ai["provider"])
+        self.provider_var = ctk.StringVar(value=ai.get("provider", "chain"))
         self.model_var = ctk.StringVar(value=ai["model"])
         self.api_key_var = ctk.StringVar(value=self._current_api_key())
+        self.gemini_model_var = ctk.StringVar(value=self.env.get("GEMINI_MODEL") or "gemini-2.5-flash-lite")
+        self.gemini_api_key_var = ctk.StringVar(value=self.env.get("GEMINI_API_KEY", ""))
+        self.groq_model_var = ctk.StringVar(value=self.env.get("GROQ_MODEL") or "llama-3.1-8b-instant")
+        self.groq_api_key_var = ctk.StringVar(value=self.env.get("GROQ_API_KEY", ""))
+        self.openrouter_model_var = ctk.StringVar(value=self.env.get("OPENROUTER_MODEL") or "openrouter/free")
+        self.openrouter_api_key_var = ctk.StringVar(value=self.env.get("OPENROUTER_API_KEY", ""))
         self.min_score_var = ctk.StringVar(value=str(ai["min_score"]))
         self.force_summary_var = ctk.BooleanVar(value=bool(ai["force_summary"]))
         self.ai_request_delay_var = ctk.StringVar(value=str(ai.get("request_delay_seconds", 1.5)))
@@ -142,7 +149,8 @@ class AppGUI:
         self.show_url_var = ctk.BooleanVar(value=bool(visual["show_url"]))
         self.show_hot_keywords_var = ctk.BooleanVar(value=bool(visual["show_hot_keywords"]))
         self.visual_limit_var = ctk.StringVar(value=str(scan["brief_limit"]))
-        self.visual_source_mode_var = ctk.StringVar(value=visual.get("source_mode", "combined"))
+        self.visual_source_mode_var = ctk.StringVar(value=visual.get("source_mode", "sheet"))
+        self.exclude_vietnam_sources_var = ctk.BooleanVar(value=bool(visual.get("exclude_vietnam_sources", False)))
         self.sheet_url_var = ctk.StringVar(value=visual.get("sheet_url", ""))
         self.sheet_limit_max_var = ctk.BooleanVar(value=bool(visual.get("sheet_limit_max", True)))
         self.sheet_limit_var = ctk.StringVar(value=str(visual.get("sheet_limit", 20)))
@@ -324,18 +332,27 @@ class AppGUI:
         form = ctk.CTkFrame(tab)
         form.grid(row=0, column=0, sticky="new", pady=8)
         form.grid_columnconfigure(1, weight=1)
-        self._option(form, "Provider", self.provider_var, ["mock", "openai", "gemini"], 0, command=self._provider_changed)
-        self._entry(form, "Model", self.model_var, 1, width=260)
-        self._entry(form, "API Key", self.api_key_var, 2, width=420, show="*")
-        self._entry(form, "Min score để tóm tắt", self.min_score_var, 3)
-        self._entry(form, "Delay giữa request AI", self.ai_request_delay_var, 4, width=90)
-        self._entry(form, "Retry AI", self.ai_retry_attempts_var, 5, width=90)
+        ctk.CTkLabel(
+            form,
+            text="Thứ tự tự động: Gemini → Groq → OpenRouter",
+            anchor="w",
+            font=ctk.CTkFont(weight="bold"),
+        ).grid(row=0, column=1, sticky="w", padx=10, pady=8)
+        self._entry(form, "Gemini model", self.gemini_model_var, 1, width=300)
+        self._entry(form, "Gemini API key", self.gemini_api_key_var, 2, width=520, show="*")
+        self._entry(form, "Groq model", self.groq_model_var, 3, width=300)
+        self._entry(form, "Groq API key", self.groq_api_key_var, 4, width=520, show="*")
+        self._entry(form, "OpenRouter model", self.openrouter_model_var, 5, width=300)
+        self._entry(form, "OpenRouter API key", self.openrouter_api_key_var, 6, width=520, show="*")
+        self._entry(form, "Min score để tóm tắt", self.min_score_var, 7)
+        self._entry(form, "Delay giữa request AI", self.ai_request_delay_var, 8, width=90)
+        self._entry(form, "Retry AI", self.ai_retry_attempts_var, 9, width=90)
         ctk.CTkCheckBox(form, text="Force summarize lại tin cũ", variable=self.force_summary_var).grid(
-            row=6, column=1, sticky="w", padx=10, pady=8
+            row=10, column=1, sticky="w", padx=10, pady=8
         )
         actions = ctk.CTkFrame(form, fg_color="transparent")
-        actions.grid(row=7, column=1, sticky="w", padx=10, pady=12)
-        ctk.CTkButton(actions, text="Check API Key", width=140, command=self._check_api_key).pack(side="left", padx=(0, 8))
+        actions.grid(row=11, column=1, sticky="w", padx=10, pady=12)
+        ctk.CTkButton(actions, text="Kiểm tra các API key", width=170, command=self._check_api_key).pack(side="left", padx=(0, 8))
         ctk.CTkButton(actions, text="Save AI Settings", width=150, command=self._save_settings).pack(side="left")
 
     def _build_sources_tab(self):
@@ -403,15 +420,20 @@ class AppGUI:
             self.visual_source_mode_var,
             ["combined", "app", "sheet"],
             0,
-            command=lambda _value: self._update_visual_limit_states(),
+            command=self._on_visual_source_mode_changed,
         )
         compact_entry(source_panel, "Google Sheet URL", self.sheet_url_var, 1, width=620)
-        compact_limit_control(source_panel, "Sheet items", self.sheet_limit_var, self.sheet_limit_max_var, 2)
-        compact_limit_control(source_panel, "App items", self.app_limit_var, self.app_limit_max_var, 3)
-        compact_limit_control(source_panel, "Image cards", self.card_limit_var, self.card_limit_max_var, 4)
+        ctk.CTkCheckBox(
+            source_panel,
+            text="Không lấy tin tức từ nguồn Việt Nam",
+            variable=self.exclude_vietnam_sources_var,
+        ).grid(row=2, column=1, sticky="w", padx=8, pady=4)
+        compact_limit_control(source_panel, "Sheet items", self.sheet_limit_var, self.sheet_limit_max_var, 3)
+        compact_limit_control(source_panel, "App items", self.app_limit_var, self.app_limit_max_var, 4)
+        compact_limit_control(source_panel, "Image cards", self.card_limit_var, self.card_limit_max_var, 5)
 
         source_actions = ctk.CTkFrame(source_panel, fg_color="transparent")
-        source_actions.grid(row=5, column=1, sticky="w", padx=8, pady=6)
+        source_actions.grid(row=6, column=1, sticky="w", padx=8, pady=6)
         check_button = ctk.CTkButton(source_actions, text="Check Sources", width=130, command=self._check_combined_sources)
         check_button.pack(side="left", padx=(0, 8))
         self.action_buttons.append(check_button)
@@ -594,8 +616,8 @@ class AppGUI:
                 "preferred_sources": self.settings.get("scan", {}).get("preferred_sources", []),
             },
             "ai": {
-                "provider": self.provider_var.get(),
-                "model": self.model_var.get().strip() or self._default_model(self.provider_var.get()),
+                "provider": "chain",
+                "model": "provider-chain",
                 "min_score": self._int_var(self.min_score_var, 6),
                 "force_summary": self.force_summary_var.get(),
                 "request_delay_seconds": self._float_var(self.ai_request_delay_var, 1.5),
@@ -625,12 +647,16 @@ class AppGUI:
             },
         }
         save_runtime_settings(self.settings)
-        provider = self.provider_var.get()
-        env_values = {"AI_PROVIDER": provider}
-        if provider == "openai":
-            env_values.update({"OPENAI_MODEL": self.model_var.get(), "OPENAI_API_KEY": self.api_key_var.get()})
-        elif provider == "gemini":
-            env_values.update({"GEMINI_MODEL": self.model_var.get(), "GEMINI_API_KEY": self.api_key_var.get()})
+        env_values = {
+            "AI_PROVIDER": "chain",
+            "AI_PROVIDER_CHAIN": "gemini,groq,openrouter",
+            "GEMINI_MODEL": self.gemini_model_var.get().strip(),
+            "GEMINI_API_KEY": self.gemini_api_key_var.get().strip(),
+            "GROQ_MODEL": self.groq_model_var.get().strip(),
+            "GROQ_API_KEY": self.groq_api_key_var.get().strip(),
+            "OPENROUTER_MODEL": self.openrouter_model_var.get().strip(),
+            "OPENROUTER_API_KEY": self.openrouter_api_key_var.get().strip(),
+        }
         env_values["TELEGRAM_BOT_TOKEN"] = self.telegram_bot_token_var.get().strip()
         env_values["FACEBOOK_PAGE_ID"] = self.facebook_page_id_var.get().strip()
         env_values["FACEBOOK_PAGE_ACCESS_TOKEN"] = self.facebook_page_access_token_var.get().strip()
@@ -933,20 +959,27 @@ class AppGUI:
             sheet_limit=self._optional_limit(self.sheet_limit_var, self.sheet_limit_max_var),
             app_limit=self._optional_limit(self.app_limit_var, self.app_limit_max_var),
             card_limit=None,
+            exclude_vietnam=self._exclude_vietnam_sources(),
         )
         return format_combined_stats(result.stats, result.brief_path), True
 
     def _generate_combined_cards(self):
         self._save_settings()
-        self._run_background("Generating combined image cards", self._task_generate_combined_cards)
+        source_mode = self.visual_source_mode_var.get().strip().lower()
+        title = "Fetching app news and generating image cards" if source_mode == "app" else "Generating combined image cards"
+        self._run_background(title, self._task_generate_combined_cards)
 
     def _task_generate_combined_cards(self):
-        result = self._generate_combined_cards_result()
-        lines = [
+        refresh_result = self._refresh_app_source_if_selected()
+        result = self._generate_combined_cards_result(test_mode=True)
+        lines = []
+        if refresh_result:
+            lines.extend([self._format_app_source_refresh(refresh_result), ""])
+        lines.extend([
             format_combined_stats(result["source_stats"], result["brief_path"]),
             "",
             self._format_card_result(result["cards_result"]),
-        ]
+        ])
         return "\n".join(lines), True
 
     def _generate_and_send_combined_cards(self):
@@ -954,38 +987,115 @@ class AppGUI:
         self._run_background("Generating and sending combined cards", self._task_generate_and_send_combined_cards)
 
     def _task_generate_and_send_combined_cards(self):
-        result = self._retry_gui_step("generate_combined_image_cards", self._generate_combined_cards_result)
-        cards = result["cards_result"]["cards"]
-        send_output, send_ok = self._retry_gui_step(
-            "send_telegram",
-            lambda: self._task_send_cards(cards, result.get("brief_label")),
+        refresh_result = self._refresh_app_source_if_selected()
+        result = self._retry_gui_step(
+            "generate_combined_image_cards",
+            lambda: self._generate_combined_cards_result(test_mode=False),
         )
-        lines = [
+        lines = []
+        if refresh_result:
+            lines.extend([self._format_app_source_refresh(refresh_result), ""])
+        lines.extend([
             format_combined_stats(result["source_stats"], result["brief_path"]),
             "",
             self._format_card_result(result["cards_result"]),
-            "",
-            send_output,
-        ]
-        return "\n".join(lines), send_ok
+        ])
+        completion_lines, completion_ok = self._run_selected_completion_actions(result)
+        if completion_lines:
+            lines.extend(["", *completion_lines])
+        else:
+            lines.extend(["", "Không có tác vụ hoàn thành nào được tích chọn. Ảnh đã được render nhưng chưa đăng."])
+        return "\n".join(lines), completion_ok
 
-    def _generate_combined_cards_result(self):
+    def _run_selected_completion_actions(self, result):
+        cards = result["cards_result"]["cards"]
+        brief_label = result.get("brief_label")
+        lines = []
+        ok = True
+        if self._var_bool("send_telegram_var", False):
+            output, action_ok = self._retry_gui_step(
+                "send_telegram",
+                lambda: self._task_send_cards(cards, brief_label),
+            )
+            lines.append(output)
+            ok = ok and action_ok
+        if self._var_bool("post_facebook_var", False):
+            output, action_ok = self._retry_gui_step(
+                "post_facebook",
+                lambda: self._task_post_facebook_cards(
+                    cards,
+                    brief_label,
+                    dry_run=self._var_bool("facebook_dry_run_var", True),
+                ),
+            )
+            lines.append(output)
+            ok = ok and action_ok
+        if self._var_bool("post_facebook_groups_var", False):
+            output, action_ok = self._retry_gui_step(
+                "post_facebook_groups",
+                lambda: self._task_post_facebook_groups_cards(
+                    cards,
+                    brief_label,
+                    dry_run=self._var_bool("facebook_group_dry_run_var", True),
+                ),
+            )
+            lines.append(output)
+            ok = ok and action_ok
+        return lines, ok
+
+    def _on_visual_source_mode_changed(self, value):
+        self._update_visual_limit_states()
+        if str(value or "").strip().lower() != "app":
+            return
+        self._save_settings()
+        self._run_background(
+            "Fetching app news and generating image cards",
+            self._task_generate_combined_cards,
+        )
+
+    def _refresh_app_source_if_selected(self):
+        if self.visual_source_mode_var.get().strip().lower() != "app":
+            return None
+        self._checkpoint("fetch and summarize app news")
+        result = run_pipeline(
+            priority=self.priority_var.get(),
+            limit=self._int_var(self.limit_var, 10),
+            source_master=DEFAULT_SOURCE_MASTER,
+            scan_label=self._current_scan_label(),
+            brief_limit=self._int_var(self.brief_limit_var, 12),
+            min_score=self._int_var(self.min_score_var, 6),
+            force_summary=self.force_summary_var.get(),
+            retry_attempts=self._int_var(self.retry_attempts_var, 1),
+        )
+        if not result["ok"]:
+            validation = result["fetch"].get("validation")
+            errors = validation.errors if validation else ["App news scan failed"]
+            raise RuntimeError(self._format_errors(errors))
+        return result
+
+    @staticmethod
+    def _format_app_source_refresh(result):
+        rss_inserted = sum(item["inserted"] for item in result["fetch"]["results"])
+        html_inserted = sum(item["inserted"] for item in result["html_fetch"]["results"])
+        brief = result["brief"]
+        return "\n".join(
+            [
+                f"App news refreshed: {brief['scan_label']}",
+                f"RSS inserted articles: {rss_inserted}",
+                f"HTML inserted articles: {html_inserted}",
+                f"Scored articles: {len(result['scored'])}",
+                f"AI summaries: {len(result['summaries'])}",
+                f"Brief items: {brief['items']}",
+            ]
+        )
+
+    def _generate_combined_cards_result(self, test_mode=False):
         source_mode = self.visual_source_mode_var.get().strip().lower()
         sheet_url = self.sheet_url_var.get().strip()
-        if source_mode == "sheet" and not sheet_url:
-            source_result = build_combined_brief(
-                source_mode=source_mode,
-                sheet_url=sheet_url,
-                sheet_limit=None,
-                app_limit=self._optional_limit(self.app_limit_var, self.app_limit_max_var),
-                card_limit=None,
-                brief_path=DEFAULT_COMBINED_BRIEF_PATH,
-            )
-            raise RuntimeError(format_empty_combined_message(source_result.stats, source_result.brief_path))
         sheet_limit = None if source_mode == "sheet" else self._optional_limit(self.sheet_limit_var, self.sheet_limit_max_var)
         card_limit = None if source_mode == "sheet" else self._optional_limit(self.card_limit_var, self.card_limit_max_var)
         while True:
-            sheet_ready = self._wait_for_sheet_if_needed(source_mode)
+            sheet_ready = {} if test_mode else self._wait_for_sheet_if_needed(source_mode)
             source_result = build_combined_brief(
                 source_mode=source_mode,
                 sheet_url=sheet_url,
@@ -993,12 +1103,13 @@ class AppGUI:
                 app_limit=self._optional_limit(self.app_limit_var, self.app_limit_max_var),
                 card_limit=card_limit,
                 brief_path=DEFAULT_COMBINED_BRIEF_PATH,
+                exclude_vietnam=self._exclude_vietnam_sources(),
             )
             if sheet_ready:
                 source_result.stats.setdefault("sheet_source", {}).update(sheet_ready)
             if source_result.payload.get("items"):
                 break
-            if source_mode != "sheet":
+            if test_mode or source_mode != "sheet":
                 raise RuntimeError(format_empty_combined_message(source_result.stats, source_result.brief_path))
             self._wait_for_fresh_sheet_items(source_result)
 
@@ -1993,15 +2104,28 @@ class AppGUI:
 
     def _check_api_key(self):
         self._save_settings()
-        provider = self.provider_var.get()
-        api_key = self.api_key_var.get().strip()
-        if provider == "mock":
-            messagebox.showinfo("API Key", "Mock mode does not need an API key.", parent=self.root)
+        configured = self._configured_ai_keys()
+        if not configured:
+            messagebox.showwarning("API Key", "Chưa nhập API key cho Gemini, Groq hoặc OpenRouter.", parent=self.root)
             return
-        if not api_key:
-            messagebox.showwarning("API Key", "API key is empty.", parent=self.root)
-            return
-        self._run_background("Checking API key", lambda: self._task_check_api_key(provider, api_key))
+        self._run_background("Checking AI API keys", lambda: self._task_check_all_api_keys(configured))
+
+    def _configured_ai_keys(self):
+        result = []
+        for provider, variable in [
+            ("gemini", getattr(self, "gemini_api_key_var", None)),
+            ("groq", getattr(self, "groq_api_key_var", None)),
+            ("openrouter", getattr(self, "openrouter_api_key_var", None)),
+        ]:
+            key = variable.get().strip() if variable is not None else ""
+            if key:
+                result.append((provider, key))
+        return result
+
+    def _task_check_all_api_keys(self, configured):
+        results = [self._task_check_api_key(provider, key) for provider, key in configured]
+        lines = [message for message, _ok in results]
+        return "\n".join(lines), any(ok for _message, ok in results)
 
     def _task_check_api_key(self, provider, api_key):
         try:
@@ -2011,12 +2135,26 @@ class AppGUI:
                     timeout=20,
                     headers={"Authorization": f"Bearer {api_key}"},
                 )
-            else:
+            elif provider == "gemini":
                 response = requests.get(
                     "https://generativelanguage.googleapis.com/v1beta/models",
                     timeout=20,
                     params={"key": api_key},
                 )
+            elif provider == "groq":
+                response = requests.get(
+                    "https://api.groq.com/openai/v1/models",
+                    timeout=20,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+            elif provider == "openrouter":
+                response = requests.get(
+                    "https://openrouter.ai/api/v1/models",
+                    timeout=20,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+            else:
+                raise ValueError(f"Unsupported AI provider: {provider}")
             response.raise_for_status()
             return f"{provider} API key is valid.", True
         except Exception as exc:
@@ -2071,9 +2209,23 @@ class AppGUI:
                 marker = status.get("run_marker", "")
                 sheet_label = status.get("run_label", "")
             except ValueError as exc:
-                marker = ""
-                sheet_label = "invalid"
-                sheet_error = str(exc)
+                return {
+                    "run_marker": "",
+                    "run_label": "invalid",
+                    "expected_run_label": expected_label,
+                    "vietnam_now": now.strftime("%Y-%m-%d %H:%M:%S +07"),
+                    "sheet_ready": False,
+                    "sheet_error": str(exc),
+                }
+            except Exception as exc:
+                return {
+                    "run_marker": "",
+                    "run_label": "error",
+                    "expected_run_label": expected_label,
+                    "vietnam_now": now.strftime("%Y-%m-%d %H:%M:%S +07"),
+                    "sheet_ready": False,
+                    "sheet_error": str(exc),
+                }
             ready = sheet_label == expected_label
             wait_status = {
                 "run_marker": marker,
@@ -2326,6 +2478,7 @@ class AppGUI:
     def _visual_settings(self):
         return {
             "source_mode": self.visual_source_mode_var.get(),
+            "exclude_vietnam_sources": self._exclude_vietnam_sources(),
             "sheet_url": self.sheet_url_var.get().strip(),
             "sheet_limit_max": self.sheet_limit_max_var.get(),
             "sheet_limit": self._int_var(self.sheet_limit_var, 20),
@@ -2347,6 +2500,10 @@ class AppGUI:
             "show_url": self.show_url_var.get(),
             "show_hot_keywords": self.show_hot_keywords_var.get(),
         }
+
+    def _exclude_vietnam_sources(self):
+        variable = getattr(self, "exclude_vietnam_sources_var", None)
+        return bool(variable.get()) if variable is not None else False
 
     def _provider_changed(self, value):
         self.model_var.set(self._default_model(value))

@@ -47,3 +47,15 @@ Each active source should define:
 - Validate source data before running fetch jobs.
 - Treat missing legal notes as a release blocker before enabling publishing.
 - Keep disabled/future sources in the master for planning, but do not fetch them by default.
+
+## Backup feed master
+
+`BACKUP_FEED_MASTER.csv` stores non-Sheet feed definitions and provider
+metadata. It is intentionally separate from the source master so Google News
+queries and RSSHub routes can be enabled without hard-coding them in Python.
+The combined brief tries Sheet first and activates this lane only when Sheet
+data is unavailable or empty.
+
+The optional “Không lấy tin tức từ nguồn Việt Nam” policy filters by source
+country, Vietnamese domains, and resolved publisher URL before article text or
+AI processing.

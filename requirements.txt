@@ -4,3 +4,5 @@ python-dotenv
 packaging
 pyinstaller
 playwright
+trafilatura
+beautifulsoup4

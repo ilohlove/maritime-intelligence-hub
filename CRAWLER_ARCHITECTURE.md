@@ -50,3 +50,11 @@ HTML P1 sources:
 - Respect configured frequency.
 - Respect disabled/future status.
 - Respect legal notes and robots decisions before publishing.
+
+## Backup lane
+
+When the Google Sheet is unavailable or has no usable rows, the combined brief
+automatically uses `BACKUP_FEED_MASTER.csv`: approved official RSS, Google News
+RSS queries, and optional self-hosted RSSHub routes. Article text is extracted
+with Jina Reader first, then Trafilatura, then BeautifulSoup. Feed failures are
+isolated and recorded; no full article is republished.

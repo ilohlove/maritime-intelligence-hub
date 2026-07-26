@@ -144,3 +144,14 @@ Do not release until:
 - `latest_json_url` points to the real raw `latest.json`;
 - security checks are completed;
 - required self-tests pass.
+## Backup news lane
+
+If the configured Google Sheet is unavailable or empty, the combined brief
+falls back to `BACKUP_FEED_MASTER.csv`. Enable feeds by setting `Enabled=Yes`.
+The lane supports official maritime RSS, Google News RSS queries, and an
+optional self-hosted RSSHub endpoint. Set `JINA_READER_URL` for article
+extraction; Trafilatura and BeautifulSoup are local fallbacks.
+
+AI can use `AI_PROVIDER=chain` with Gemini, Groq, and OpenRouter keys. The
+“Không lấy tin tức từ nguồn Việt Nam” checkbox excludes Vietnamese sources
+before fetching and before AI processing.

@@ -42,3 +42,12 @@ Each AI-processed article should produce:
 - Do not fabricate facts not present in the source.
 - Do not remove source attribution.
 - Do not publish AI output without retaining the original URL.
+
+## Provider fallback
+
+The configured production chain is Gemini -> Groq -> OpenRouter. All providers
+must return the same JSON fields (`headline`, `summary`, `impact_note`,
+`category`, `importance_score`, `source_name`, `original_url`, and optional
+`image_prompt`). Rate-limit, timeout, transport, missing-key, and invalid-JSON
+errors move to the next provider; the selected provider and fallback errors are
+stored with the summary. The mock provider remains available for offline tests.

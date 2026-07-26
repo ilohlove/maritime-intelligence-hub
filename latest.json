@@ -6,7 +6,8 @@
     "Fall back automatically from Google Sheets to approved maritime RSS, Google News RSS, and self-hosted RSSHub feeds.",
     "Add Vietnamese-source exclusion, Jina/Trafilatura/BeautifulSoup article extraction, and source provenance tracking.",
     "Add Gemini, Groq, and OpenRouter API settings with validated automatic provider failover.",
-    "Let Generate Test ignore Sheet time windows while completion flows continue selected Telegram and Facebook actions after backup rendering."
+    "Let Generate Test ignore Sheet time windows so each processing step can be checked at any time.",
+    "Continue selected Telegram and Facebook completion actions automatically after backup rendering."
   ],
   "force_update": false
 }

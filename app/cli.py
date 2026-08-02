@@ -582,6 +582,9 @@ def _run_scheduled(args):
                     sheet_snapshot=decision.get("snapshot") if primary else None,
                     expected_run_id=decision["run_id"] if primary else None,
                     allow_backup=not primary,
+                    run_id=decision["run_id"],
+                    selected_lane=decision["lane"],
+                    production=True,
                 )
                 source_result.stats.update(
                     {
@@ -974,6 +977,9 @@ def _post_facebook_from_cli(dry_run=False):
 
     visual = settings.get("visual", {})
     source_mode = str(visual.get("source_mode") or "combined").strip().lower()
+    if source_mode in {"app", "sheet", "combined"}:
+        print("Facebook skipped: direct legacy publishing is disabled; use run-scheduled to claim a run and lane.")
+        return 1
     result = build_combined_brief(
         source_mode=source_mode,
         sheet_url=visual.get("sheet_url", ""),

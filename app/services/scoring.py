@@ -56,9 +56,11 @@ def calculate_hotness_score(article, trends=None):
     business = int(article.get("business_value_score") or 5)
     base = round((quality + business) / 2)
 
-    score = base
-    score += PRIORITY_BONUS.get(article.get("priority"), 0)
-    score += CATEGORY_BONUS.get(article.get("category"), 0)
+    # Keep the source score meaningful instead of saturating every P1 article at 10.
+    # Hotness adds recency and trend signals separately below.
+    score = round(base * 0.65)
+    score += min(1, PRIORITY_BONUS.get(article.get("priority"), 0))
+    score += min(1, CATEGORY_BONUS.get(article.get("category"), 0))
     score -= COPYRIGHT_PENALTY.get(article.get("copyright_risk"), 0)
 
     if article.get("status") == "duplicate_title":

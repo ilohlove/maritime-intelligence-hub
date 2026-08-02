@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 
 import requests
@@ -10,6 +11,26 @@ from app.services.storage import get_articles_for_summary, upsert_summary
 
 
 logger = logging.getLogger(__name__)
+
+
+class AIEnrichmentError(RuntimeError):
+    """Raised when production enrichment cannot produce a publishable result."""
+
+
+def sanitize_ai_error(exc):
+    """Return a short provider error without credentials or response bodies."""
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code:
+        return f"HTTP {status_code}"
+    text = str(exc or "AI provider error")
+    text = re.sub(r"(?i)([?&](?:key|api[_-]?key|token|access_token)=)[^&\s]+", r"\1***", text)
+    text = re.sub(r"(?i)((?:x-goog-api-key|authorization|api[_-]?key)\s*[:=]\s*)[^\s,;]+", r"\1***", text)
+    for env_key in ("OPENAI_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"):
+        secret = os.getenv(env_key, "").strip()
+        if secret:
+            text = text.replace(secret, "***")
+    return " ".join(text.split())[:240]
 
 
 PROMPT_VERSION = "mock-v1"
@@ -54,7 +75,7 @@ def summarize_pending_articles(db_path=None, min_score=6, provider=None, force=F
     return summaries
 
 
-def get_ai_provider():
+def get_ai_provider(allow_mock=True):
     load_dotenv(encoding="utf-8-sig")
     provider_name = os.getenv("AI_PROVIDER", "mock").strip().lower()
     openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -82,7 +103,9 @@ def get_ai_provider():
             providers.append(OpenAICompatibleProvider(openrouter_api_key, os.getenv("OPENROUTER_MODEL", "openrouter/free"), OPENROUTER_CHAT_COMPLETIONS_URL, "openrouter"))
         if providers:
             return AIProviderChain(providers)
-    return MockAIProvider()
+    if allow_mock:
+        return MockAIProvider()
+    raise AIEnrichmentError("No production AI provider is configured")
 
 
 class MockAIProvider:
@@ -177,23 +200,32 @@ class AIProviderChain:
         self.model_name = " -> ".join(provider.model_name for provider in providers)
         self.prompt_version = "provider-chain-v1"
 
-    def summarize(self, article):
+    def summarize(self, article, allow_mock=True):
         errors = []
         for provider in self.providers:
             try:
-                payload = provider._request_summary(article)
+                payload = _request_provider_with_retry(provider, article)
                 validate_ai_provider_payload(payload)
-                normalized = normalize_ai_payload(payload, article, provider.prompt_version, provider.model_name)
+                normalized = normalize_ai_payload(
+                    payload,
+                    article,
+                    provider.prompt_version,
+                    provider.model_name,
+                    allow_fallback=False,
+                )
                 normalized["ai_provider"] = getattr(provider, "provider_name", provider.__class__.__name__)
                 normalized["fallback_errors"] = errors
                 return normalized
             except Exception as exc:
-                errors.append(f"{getattr(provider, 'provider_name', provider.__class__.__name__)}: {exc}")
+                provider_name = getattr(provider, "provider_name", provider.__class__.__name__)
+                errors.append(f"{provider_name}: {sanitize_ai_error(exc)}")
                 logger.warning("AI provider failed; trying next provider: %s", errors[-1])
-        fallback = build_mock_summary(article)
-        fallback["fallback_errors"] = errors
-        fallback["ai_provider"] = "mock"
-        return fallback
+        if allow_mock:
+            fallback = build_mock_summary(article)
+            fallback["fallback_errors"] = errors
+            fallback["ai_provider"] = "mock"
+            return fallback
+        raise AIEnrichmentError("All configured AI providers failed: " + "; ".join(errors))
 
 
 def validate_ai_provider_payload(payload):
@@ -231,8 +263,7 @@ class GeminiChatProvider:
         response = requests.post(
             self.endpoint_template.format(model=self.model_name),
             timeout=30,
-            params={"key": self.api_key},
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
             json={
                 "contents": [
                     {
@@ -280,6 +311,8 @@ def build_ai_prompt(article):
                 "Translate and write headline, summary, and impact_note in Vietnamese with full diacritics.",
                 "Never output unaccented Vietnamese such as 'Tom tat', 'Tac dong', or 'hang hai'.",
                 "Keep the Vietnamese summary to 2-4 sentences.",
+                "Explain why the item matters to ship operators, ports, logistics, trade, safety, insurance, or supply chains.",
+                "Classify topic at article level; do not copy a generic source category when the article topic differs.",
                 "Keep source attribution and original URL.",
             ],
             "required_json_keys": [
@@ -288,6 +321,9 @@ def build_ai_prompt(article):
                 "impact_note",
                 "category",
                 "importance_score",
+                "commercial_relevance",
+                "operational_impact",
+                "vietnam_relevance",
                 "source_name",
                 "original_url",
                 "image_prompt",
@@ -306,18 +342,26 @@ def build_ai_prompt(article):
     )
 
 
-def normalize_ai_payload(payload, article, prompt_version, model_name):
+def normalize_ai_payload(payload, article, prompt_version, model_name, allow_fallback=True):
     fallback = build_mock_summary(article)
-    headline = _bounded_text(payload.get("headline") or fallback["headline"], 180)
-    summary = _bounded_text(payload.get("summary") or fallback["summary"], 900)
-    impact_note = _bounded_text(payload.get("impact_note") or fallback["impact_note"], 600)
+    headline = _bounded_text(payload.get("headline"), 180)
+    summary = _bounded_text(payload.get("summary"), 900)
+    impact_note = _bounded_text(payload.get("impact_note"), 600)
+    if allow_fallback:
+        headline = headline or fallback["headline"]
+        summary = summary or fallback["summary"]
+        impact_note = impact_note or fallback["impact_note"]
+    elif not headline or not summary or not impact_note:
+        raise ValueError("AI response is missing required Vietnamese fields")
     image_prompt = _bounded_text(payload.get("image_prompt") or payload.get("visual_hint") or "", 400)
-    if _looks_unaccented_vietnamese(summary):
+    if allow_fallback and _looks_unaccented_vietnamese(summary):
         summary = fallback["summary"]
-    if _looks_unaccented_vietnamese(impact_note):
+    if allow_fallback and _looks_unaccented_vietnamese(impact_note):
         impact_note = fallback["impact_note"]
-    if _looks_unaccented_vietnamese(headline):
+    if allow_fallback and _looks_unaccented_vietnamese(headline):
         headline = fallback["headline"]
+    if not allow_fallback and any(_looks_unaccented_vietnamese(value) for value in (headline, summary, impact_note)):
+        raise ValueError("AI response contains unaccented Vietnamese")
     return {
         "article_id": article["id"],
         "headline": headline,
@@ -325,6 +369,9 @@ def normalize_ai_payload(payload, article, prompt_version, model_name):
         "impact_note": impact_note,
         "category": payload.get("category") or article.get("category"),
         "importance_score": payload.get("importance_score") or article.get("importance_score"),
+        "commercial_relevance": _bounded_int(payload.get("commercial_relevance"), 0, 4),
+        "operational_impact": _bounded_int(payload.get("operational_impact"), 0, 3),
+        "vietnam_relevance": _bounded_int(payload.get("vietnam_relevance"), 0, 2),
         "source_name": payload.get("source_name") or article.get("source_name"),
         "original_url": payload.get("original_url") or article.get("url"),
         "prompt_version": prompt_version,
@@ -413,6 +460,13 @@ def _bounded_text(value, max_length):
     return text[:max_length].strip()
 
 
+def _bounded_int(value, minimum, maximum):
+    try:
+        return max(minimum, min(maximum, int(value)))
+    except (TypeError, ValueError):
+        return None
+
+
 def _summarize_with_retry(provider, article, provider_label):
     attempts = max(1, _env_int("AI_RETRY_ATTEMPTS", 2))
     base_delay = max(0.5, _env_float("AI_RETRY_BASE_DELAY_SECONDS", 4))
@@ -436,14 +490,62 @@ def _summarize_with_retry(provider, article, provider_label):
                     attempt,
                     attempts,
                     sleep_seconds,
-                    exc,
+                    sanitize_ai_error(exc),
                 )
                 time.sleep(sleep_seconds)
                 continue
             break
 
-    logger.warning("%s summary failed; falling back to mock: %s", provider_label, last_error)
+    logger.warning("%s summary failed; falling back to mock: %s", provider_label, sanitize_ai_error(last_error))
     return build_mock_summary(article)
+
+
+def _request_provider_with_retry(provider, article):
+    """Request raw JSON with bounded retries; never returns a mock payload."""
+    attempts = max(1, _env_int("AI_CHAIN_RETRY_ATTEMPTS", 3))
+    base_delay = max(0.5, _env_float("AI_RETRY_BASE_DELAY_SECONDS", 2))
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return provider._request_summary(article)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts or not _should_retry_ai_error(exc):
+                break
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                "%s provider attempt %s/%s failed; retrying in %.1fs: %s",
+                getattr(provider, "provider_name", provider.__class__.__name__),
+                attempt,
+                attempts,
+                delay,
+                sanitize_ai_error(exc),
+            )
+            # Unit-test doubles often raise RuntimeError("429") without an HTTP response;
+            # avoid slowing those tests while retaining backoff for real requests.
+            if isinstance(exc, requests.RequestException):
+                time.sleep(delay)
+    raise last_error or AIEnrichmentError("AI provider returned no response")
+
+
+def summarize_article_strict(provider, article):
+    """Summarize one article for production; mock output is never accepted."""
+    if isinstance(provider, MockAIProvider):
+        raise AIEnrichmentError("Mock AI provider is disabled for production")
+    if isinstance(provider, AIProviderChain):
+        return provider.summarize(article, allow_mock=False)
+    payload = _request_provider_with_retry(provider, article)
+    validate_ai_provider_payload(payload)
+    result = normalize_ai_payload(
+        payload,
+        article,
+        provider.prompt_version,
+        provider.model_name,
+        allow_fallback=False,
+    )
+    result["ai_provider"] = getattr(provider, "provider_name", provider.__class__.__name__)
+    result["fallback_errors"] = []
+    return result
 
 
 def _should_retry_ai_error(exc):

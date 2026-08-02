@@ -128,6 +128,7 @@ def build_brief_item(article):
         "published_at": article.get("published_at"),
         "summary": summary,
         "impact_note": impact_note,
+        "why_important": impact_note,
         "category": article.get("ai_category") or article.get("category"),
         "importance_score": article.get("ai_importance_score") or article.get("importance_score"),
         "hotness_score": article.get("hotness_score") or article.get("importance_score"),
@@ -190,7 +191,7 @@ def classify_brief_section(article):
     return "Top Maritime Hot News"
 
 
-def validate_publish_items(items):
+def validate_publish_items(items, strict=False):
     errors = []
     for index, item in enumerate(items, start=1):
         if not item.get("source_name"):
@@ -199,6 +200,10 @@ def validate_publish_items(items):
             errors.append(f"Item {index}: missing original_url")
         if len(item.get("summary") or "") > 900:
             errors.append(f"Item {index}: summary is too long")
+        if strict and not item.get("impact_note"):
+            errors.append(f"Item {index}: missing why-important impact_note")
+        if strict and item.get("quality_status") == "rejected":
+            errors.append(f"Item {index}: failed content quality gate")
         if _looks_like_full_article(item.get("summary") or ""):
             errors.append(f"Item {index}: summary may be too close to full article length")
 

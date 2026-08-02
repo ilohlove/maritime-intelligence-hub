@@ -19,7 +19,7 @@ from app.services.facebook_publisher import FacebookAPIError
 
 
 class GuiSelectedSourceTests(unittest.TestCase):
-    def test_selecting_app_source_starts_fetch_summarize_and_render(self):
+    def test_selecting_app_source_is_preview_only(self):
         app = _gui_stub()
         app._update_visual_limit_states = Mock()
         app._save_settings = Mock()
@@ -29,10 +29,7 @@ class GuiSelectedSourceTests(unittest.TestCase):
 
         app._update_visual_limit_states.assert_called_once()
         app._save_settings.assert_called_once()
-        app._run_background.assert_called_once_with(
-            "Fetching app news and generating image cards",
-            app._task_generate_combined_cards,
-        )
+        app._run_background.assert_not_called()
 
     def test_selecting_non_app_source_does_not_start_pipeline(self):
         app = _gui_stub()
@@ -43,7 +40,7 @@ class GuiSelectedSourceTests(unittest.TestCase):
         AppGUI._on_visual_source_mode_changed(app, "sheet")
 
         app._update_visual_limit_states.assert_called_once()
-        app._save_settings.assert_not_called()
+        app._save_settings.assert_called_once()
         app._run_background.assert_not_called()
 
     def test_generate_app_cards_refreshes_pipeline_before_render(self):

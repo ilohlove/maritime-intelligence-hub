@@ -79,6 +79,14 @@ def generate_image_cards(
             {
                 "index": index,
                 "title": item.get("title"),
+                "summary": item.get("summary"),
+                "impact_note": item.get("impact_note"),
+                "why_important": item.get("why_important") or item.get("impact_note"),
+                "category": item.get("category"),
+                "importance_score": item.get("importance_score"),
+                "hotness_score": item.get("hotness_score"),
+                "editorial_score": item.get("editorial_score"),
+                "quality_status": item.get("quality_status") or "accepted",
                 "source_name": item.get("source_name"),
                 "original_url": item.get("original_url"),
                 "published_at": item.get("published_at"),
@@ -290,7 +298,7 @@ def render_card_html(payload, item, index, image, style_settings=None):
     style = _normalize_style(style_settings)
     title = _text(item.get("title"))
     summary = _text(item.get("summary"))
-    impact_note = _text(item.get("impact_note"))
+    impact_note = _text(item.get("impact_note") or item.get("why_important"))
     hot_keywords = ", ".join(item.get("hot_keywords") or [])
     source_name = _text(item.get("source_name"))
     original_url = item.get("original_url") or ""
@@ -298,7 +306,12 @@ def render_card_html(payload, item, index, image, style_settings=None):
     hero = _hero_markup(image, style)
     title_markup = f"<h1>{_escape(title)}</h1>" if style["show_title"] else ""
     summary_markup = f'<div class="summary">{_escape(summary)}</div>' if style["show_summary"] else ""
-    impact_markup = f'<div class="impact">{_escape(impact_note)}</div>' if style["show_impact"] else ""
+    impact_markup = (
+        f'<div class="impact-label">Tại sao quan trọng</div>'
+        f'<div class="impact">{_escape(impact_note)}</div>'
+        if style["show_impact"]
+        else ""
+    )
     hot_markup = f'<div class="hotwords">{_escape(hot_keywords)}</div>' if style["show_hot_keywords"] and hot_keywords else ""
     source_markup = f'<span class="source">{_escape(source_name)}</span>' if style["show_source"] else ""
     url_markup = f'<div class="url">{_escape(domain)}</div>' if style["show_url"] else ""
@@ -393,6 +406,14 @@ h1 {{
   font-size: var(--summary-size);
   line-height: 1.28;
   color: #263746;
+}}
+.impact-label {{
+  margin-top: 18px;
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--accent-color);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
 }}
 .impact {{
   border-left: 7px solid var(--accent-color);

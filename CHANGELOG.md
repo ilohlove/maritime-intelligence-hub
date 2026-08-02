@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v1.1.5 - 2026-08-02
+
+- Enforce Vietnamese title, summary, and why-important quality gates for primary and backup lanes; production no longer publishes mock AI output.
+- Rank backup/App preview items by maritime editorial relevance, deduplicate similar cross-source stories, and prevent App mode from publishing.
+- Add explicit “Tại sao quan trọng” card labels, preserve impact fields in manifests, and isolate previews from run-scoped production artifacts.
+- Redact AI credentials from logs and SQLite errors, move Gemini authentication to the request header, and scrub existing runtime artifacts.
+
 ## v1.1.4 - 2026-08-02
 
 - Add run-scoped primary/backup coordination with Sheet protocol v1, SQLite leases, lane locking, atomic artifacts, and headless scheduling.

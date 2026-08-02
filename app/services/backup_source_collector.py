@@ -177,7 +177,9 @@ def _collect_one(source, provider, limit, db_path, session):
                 item["reader_provider"] = extracted["provider"]
                 item["reader_status"] = extracted["status"]
                 item["reader_error"] = "; ".join(extracted["errors"])
-            _, created = upsert_article(item, db_path=db_path) if db_path else upsert_article(item)
+            article_id, created = upsert_article(item, db_path=db_path) if db_path else upsert_article(item)
+            item["id"] = item.get("id") or article_id
+            item["article_id"] = item["id"]
             inserted += int(created)
             accepted_items.append(item)
         result = _result(source, provider, f"Fetched {len(accepted_items)} usable items, inserted {inserted}")

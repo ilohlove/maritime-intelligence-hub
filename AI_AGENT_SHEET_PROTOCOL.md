@@ -14,6 +14,7 @@ The scheduled AI agent must publish one complete, identifiable snapshot for each
 2. Collect and validate the complete article set off-sheet.
 3. Replace the old article rows in `A2:K` with the complete new set. Do not append to the previous run.
 4. Count every non-empty written article row. Every row must contain a usable title and an absolute `http://` or `https://` Source URL.
+   `Vietnamese translation`, `Main summary (Vietnamese)`, and `Why it matters (Vietnamese)` are required publish fields; English columns are source inputs only and must never be used as the final output.
 5. As the final write, set `M1=completed_at`, `O1=COMPLETED`, `P1=row_count`, and keep `Q1` empty.
 6. If the run cannot complete, set `O1=FAILED`, keep `M1/P1` empty, and put a short non-sensitive error code in `Q1`.
 
@@ -24,6 +25,7 @@ The scheduled AI agent must publish one complete, identifiable snapshot for each
 - Never leave `M1` or `P1` populated when starting a new run.
 - Do not place API keys, tokens, stack traces, or private content in `Q1`.
 - A successful run with zero articles uses `O1=COMPLETED` and `P1=0`; the app records `NO_NEW_CONTENT` and does not activate backup.
+- Each Vietnamese field must contain full Vietnamese diacritics and factual content. Rows failing the language/impact quality gate are quarantined and reported; they do not become publishable rows.
 
 ## Example completed morning run
 

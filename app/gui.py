@@ -1297,6 +1297,10 @@ class AppGUI:
 
     def _task_generate_and_send_combined_cards(self):
         source_mode = self.visual_source_mode_var.get().strip().lower()
+        if source_mode == "app":
+            raise RuntimeError(
+                "App source is preview-only. Production publishing must run through the primary/backup coordinator."
+            )
         if source_mode in {"sheet", "combined"}:
             label, _scheduled = self._latest_started_schedule()
             if not label:
@@ -1403,13 +1407,11 @@ class AppGUI:
 
     def _on_visual_source_mode_changed(self, value):
         self._update_visual_limit_states()
-        if str(value or "").strip().lower() != "app":
-            return
         self._save_settings()
-        self._run_background(
-            "Fetching app news and generating image cards",
-            self._task_generate_combined_cards,
-        )
+        if str(value or "").strip().lower() == "app":
+            summary_var = getattr(self, "summary_var", None)
+            if summary_var is not None:
+                summary_var.set("App source is preview-only; use Run Now for scheduled primary/backup publishing.")
 
     def _refresh_app_source_if_selected(self):
         if self.visual_source_mode_var.get().strip().lower() != "app":
@@ -1457,13 +1459,18 @@ class AppGUI:
         sheet_url = self.sheet_url_var.get().strip()
         sheet_limit = None if source_mode == "sheet" else self._optional_limit(self.sheet_limit_var, self.sheet_limit_max_var)
         card_limit = None if source_mode == "sheet" else self._optional_limit(self.card_limit_var, self.card_limit_max_var)
+        preview_dir = None
+        brief_path = DEFAULT_COMBINED_BRIEF_PATH
+        if source_mode == "app":
+            preview_dir = ROOT_DIR / "output" / "previews" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            brief_path = preview_dir / "combined_brief.json"
         source_result = build_combined_brief(
             source_mode=source_mode,
             sheet_url=sheet_url,
             sheet_limit=sheet_limit,
             app_limit=self._optional_limit(self.app_limit_var, self.app_limit_max_var),
             card_limit=card_limit,
-            brief_path=DEFAULT_COMBINED_BRIEF_PATH,
+            brief_path=brief_path,
             exclude_vietnam=self._exclude_vietnam_sources(),
         )
         if test_mode and source_mode in {"sheet", "combined"}:
@@ -1477,6 +1484,7 @@ class AppGUI:
         cards_result = generate_image_cards(
             "combined",
             limit=card_limit,
+            output_dir=preview_dir / "visual" if preview_dir else None,
             source_brief_path=source_result.brief_path,
             style_settings=self._visual_settings(),
         )

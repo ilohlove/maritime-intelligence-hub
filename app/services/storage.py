@@ -1,4 +1,6 @@
 import json
+import os
+import re
 import sqlite3
 import time
 import uuid
@@ -30,6 +32,17 @@ FACEBOOK_GROUP_QUOTA_STATUSES = {"reserved", "published", "pending", "failed"}
 
 def utc_now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def sanitize_persisted_error(value):
+    text = str(value or "")
+    text = re.sub(r"(?i)([?&](?:key|api[_-]?key|token|access_token)=)[^&\s]+", r"\1***", text)
+    text = re.sub(r"(?i)((?:x-goog-api-key|authorization|api[_-]?key)\s*[:=]\s*)[^\s,;]+", r"\1***", text)
+    for env_key in ("OPENAI_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"):
+        secret = os.getenv(env_key, "").strip()
+        if secret:
+            text = text.replace(secret, "***")
+    return " ".join(text.split())[:1000]
 
 
 @contextmanager
@@ -308,6 +321,7 @@ def init_db(db_path=DEFAULT_DB_PATH):
         _ensure_column(conn, "facebook_group_deliveries", "lease_expires_at", "TEXT")
         _ensure_column(conn, "facebook_group_deliveries", "quota_reservation_token", "TEXT")
         _ensure_column(conn, "facebook_group_attempts", "reservation_token", "TEXT")
+        _scrub_sensitive_records(conn)
         conn.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_facebook_group_attempts_reservation
@@ -348,6 +362,24 @@ def _ensure_column(conn, table, column, column_type):
             refreshed = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if column not in refreshed:
                 raise
+
+
+def _scrub_sensitive_records(conn):
+    for table, key_column, value_column in (
+        ("article_summaries", "article_id", "fallback_errors"),
+        ("fetch_logs", "id", "message"),
+    ):
+        rows = conn.execute(
+            f"SELECT {key_column}, {value_column} FROM {table} WHERE {value_column} IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            original = row[value_column]
+            sanitized = sanitize_persisted_error(original)
+            if sanitized != original:
+                conn.execute(
+                    f"UPDATE {table} SET {value_column} = ? WHERE {key_column} = ?",
+                    (sanitized, row[key_column]),
+                )
 
 
 def sync_sources(rows, db_path=DEFAULT_DB_PATH):
@@ -608,7 +640,10 @@ def upsert_summary(summary, db_path=DEFAULT_DB_PATH):
                 summary["token_usage"],
                 summary.get("ai_provider"),
                 summary.get("image_prompt"),
-                json.dumps(summary.get("fallback_errors") or [], ensure_ascii=False),
+                json.dumps(
+                    [sanitize_persisted_error(error) for error in (summary.get("fallback_errors") or [])],
+                    ensure_ascii=False,
+                ),
                 now,
             ),
         )

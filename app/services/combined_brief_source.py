@@ -5,6 +5,7 @@ import json
 import os
 import re
 import tempfile
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -14,12 +15,14 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import requests
 
 from app.config import ROOT_DIR, ensure_runtime_seed
+from app.services.ai_processor import AIEnrichmentError, get_ai_provider, summarize_article_strict
 from app.services.brief_writer import build_brief_item, validate_publish_items
 from app.services.storage import (
     DEFAULT_DB_PATH,
     get_brief_candidate_diagnostics,
     get_brief_candidates,
     list_published_item_keys,
+    upsert_summary,
 )
 from app.services.backup_source_collector import DEFAULT_BACKUP_FEED_MASTER, collect_backup_news
 from app.services.source_policy import normalize_filter_flag, vietnam_source_reason
@@ -66,6 +69,9 @@ def build_combined_brief(
     sheet_snapshot=None,
     expected_run_id=None,
     allow_backup=True,
+    run_id="",
+    selected_lane="",
+    production=False,
 ):
     session = session or requests.Session()
     source_mode = (source_mode or "combined").strip().lower()
@@ -134,6 +140,32 @@ def build_combined_brief(
     normalized_backup_items = [_backup_item_to_brief(item) for item in backup_items]
     raw_items = app_items + sheet_items + normalized_backup_items
     filtered_items, stats = filter_publishable_items(raw_items, db_path=db_path)
+    if source_mode == "app" and not production:
+        for item in filtered_items:
+            item["editorial_score"] = calculate_editorial_score(item)
+        filtered_items = sorted(
+            filtered_items,
+            key=lambda item: (int(item.get("editorial_score") or 0), str(item.get("published_at") or "")),
+            reverse=True,
+        )
+    if production:
+        filtered_items, quality_stats = enrich_brief_items(
+            filtered_items,
+            db_path=db_path,
+            production=True,
+        )
+        stats.update(quality_stats)
+        filtered_items, semantic_removed = dedupe_similar_items(filtered_items)
+        stats["duplicate_removed"] += semantic_removed
+        stats["selected_total"] = len(filtered_items)
+        if selected_lane == "backup":
+            filtered_items = rank_backup_items(filtered_items)
+        elif selected_lane == "primary":
+            filtered_items = sorted(
+                filtered_items,
+                key=lambda item: int(item.get("source_rank") or item.get("row_index") or 999999),
+            )
+        stats["selected_total"] = len(filtered_items)
     stats["source_mode"] = source_mode
     stats["fallback_reason"] = fallback_reason
     stats["backup_results"] = backup_results
@@ -163,6 +195,8 @@ def build_combined_brief(
     effective_card_limit = None if source_mode == "sheet" else card_limit
     selected_items = filtered_items if effective_card_limit is None else filtered_items[: max(1, int(effective_card_limit))]
     stats["output_total"] = len(selected_items)
+    for item in selected_items:
+        item["why_important"] = item.get("impact_note") or ""
 
     payload = {
         "brief_type": "combined",
@@ -170,8 +204,11 @@ def build_combined_brief(
         "title": "Maritime Intelligence Hub - Combined Brief",
         "generated_at": datetime.now().replace(microsecond=0).isoformat(),
         "source_mode": source_mode,
+        "run_id": run_id or "",
+        "selected_lane": selected_lane or "",
+        "preview_only": not production,
         "stats": stats,
-        "publish_safety": validate_publish_items(selected_items),
+        "publish_safety": validate_publish_items(selected_items, strict=production),
         "items": selected_items,
     }
 
@@ -218,6 +255,226 @@ def _backup_item_to_brief(item):
     normalized["title_hash"] = title_hash(normalized.get("title"))
     normalized["item_key"] = item_key(normalized)
     return normalized
+
+
+def enrich_brief_items(items, db_path=DEFAULT_DB_PATH, production=False):
+    """Ensure every production item has Vietnamese editorial fields."""
+    result = []
+    rejected = []
+    needs_ai = [item for item in items if not is_valid_vietnamese_item(item)]
+    provider = None
+    provider_error = ""
+    if needs_ai:
+        try:
+            provider = get_ai_provider(allow_mock=not production)
+        except Exception as exc:
+            provider_error = str(exc)
+
+    for item in items:
+        candidate = dict(item)
+        if is_valid_vietnamese_item(candidate):
+            candidate["quality_status"] = "accepted"
+            candidate.setdefault("quality_errors", [])
+            candidate["ai_provider"] = candidate.get("ai_provider") or "sheet"
+            candidate["editorial_score"] = calculate_editorial_score(candidate)
+            result.append(candidate)
+            continue
+
+        try:
+            if provider is None:
+                raise AIEnrichmentError(provider_error or "No AI provider available")
+            article = {
+                "id": candidate.get("id") or candidate.get("article_id") or 0,
+                "source_name": candidate.get("source_name") or "Backup RSS",
+                "category": candidate.get("category") or "Maritime",
+                "title": candidate.get("title") or "",
+                "url": candidate.get("original_url") or candidate.get("url") or "",
+                "description": candidate.get("description") or candidate.get("summary") or "",
+                "content_excerpt": candidate.get("content_excerpt") or "",
+                "importance_score": candidate.get("importance_score"),
+            }
+            summary = summarize_article_strict(provider, article)
+            candidate.update(
+                {
+                    "title": summary["headline"],
+                    "summary": summary["summary"],
+                    "impact_note": summary["impact_note"],
+                    "category": summary.get("category") or candidate.get("category"),
+                    "importance_score": summary.get("importance_score") or candidate.get("importance_score"),
+                    "commercial_relevance": summary.get("commercial_relevance"),
+                    "operational_impact": summary.get("operational_impact"),
+                    "vietnam_relevance": summary.get("vietnam_relevance"),
+                    "source_name": summary.get("source_name") or candidate.get("source_name"),
+                    "original_url": summary.get("original_url") or candidate.get("original_url"),
+                    "ai_provider": summary.get("ai_provider"),
+                    "model_name": summary.get("model_name"),
+                    "fallback_errors": summary.get("fallback_errors") or [],
+                    "quality_status": "accepted",
+                    "quality_errors": [],
+                }
+            )
+            candidate["canonical_url"] = canonicalize_url(candidate.get("original_url"))
+            candidate["title_hash"] = title_hash(candidate.get("title"))
+            candidate["item_key"] = item_key(candidate)
+            if not is_valid_vietnamese_item(candidate):
+                raise ValueError("Vietnamese quality gate rejected AI output")
+            candidate["editorial_score"] = calculate_editorial_score(candidate)
+            if db_path and isinstance(candidate.get("id"), int) and candidate.get("id"):
+                upsert_summary(
+                    {
+                        "article_id": candidate["id"],
+                        "headline": candidate["title"],
+                        "summary": candidate["summary"],
+                        "impact_note": candidate["impact_note"],
+                        "category": candidate.get("category"),
+                        "importance_score": candidate.get("importance_score"),
+                        "source_name": candidate.get("source_name"),
+                        "original_url": candidate.get("original_url"),
+                        "prompt_version": summary.get("prompt_version") or "strict-production-v1",
+                        "model_name": summary.get("model_name") or "unknown",
+                        "token_usage": summary.get("token_usage") or 0,
+                        "ai_provider": summary.get("ai_provider"),
+                        "image_prompt": summary.get("image_prompt"),
+                        "fallback_errors": summary.get("fallback_errors") or [],
+                    },
+                    db_path=db_path,
+                )
+            result.append(candidate)
+        except Exception as exc:
+            candidate["quality_status"] = "rejected"
+            candidate["quality_errors"] = [str(exc)[:240]]
+            rejected.append(candidate)
+
+    return result, {
+        "enriched_total": len(needs_ai),
+        "quality_rejected": len(rejected),
+        "quality_rejections": [
+            {"title": item.get("title"), "errors": item.get("quality_errors") or []}
+            for item in rejected[:20]
+        ],
+        "quality_gate_ready": bool(result),
+    }
+
+
+def is_valid_vietnamese_item(item):
+    required = (item.get("title"), item.get("summary"), item.get("impact_note"))
+    if any(not str(value or "").strip() for value in required):
+        return False
+    text = " ".join(str(value) for value in required)
+    if any(marker in text for marker in ("Ãƒ", "Ã‚", "Ã¢â", "Ä‘á")):
+        return False
+    if not all(has_vietnamese_marks(value) for value in required):
+        return False
+    for sentence in re.split(r"[.!?]+", str(item.get("summary") or "")):
+        words = re.findall(r"[A-Za-zÀ-ỹĐđ]+", sentence)
+        if len(words) >= 7 and not has_vietnamese_marks(sentence):
+            return False
+    return len(str(item.get("summary") or "")) <= 900 and len(str(item.get("impact_note") or "")) <= 600
+
+
+def calculate_editorial_score(item):
+    if item.get("source_type") == "sheet":
+        return max(1, 1000 - int(item.get("source_rank") or item.get("row_index") or 999))
+    text = " ".join(str(item.get(key) or "").lower() for key in ("title", "summary", "impact_note", "category"))
+    commercial_terms = ("tàu thương mại", "vận tải", "cảng", "logistics", "chuỗi cung ứng", "giá cước", "bảo hiểm", "xuất khẩu", "nhập khẩu", "container", "lịch tàu")
+    impact_terms = ("an toàn", "tấn công", "mắc cạn", "đình trệ", "gián đoạn", "quy định", "chi phí", "thiệt hại", "đóng cửa")
+    regional_terms = ("việt nam", "đông nam á", "biển đông", "cái mép", "hải phòng", "singapore", "malaysia", "indonesia")
+    commercial = item.get("commercial_relevance")
+    impact = item.get("operational_impact")
+    regional = item.get("vietnam_relevance")
+    commercial = min(4, int(commercial)) if commercial is not None else min(4, sum(term in text for term in commercial_terms))
+    impact = min(3, int(impact)) if impact is not None else min(3, sum(term in text for term in impact_terms))
+    regional = min(2, int(regional)) if regional is not None else min(2, sum(term in text for term in regional_terms))
+    quality = min(10, max(1, int(item.get("content_quality_score") or 8)))
+    recency = _editorial_recency_score(item.get("published_at"))
+    off_scope = any(term in text for term in ("tàu chiến", "tàu ngầm hạt nhân", "săn cá voi", "tàu du lịch")) and not commercial
+    return max(0, commercial * 10 + impact * 8 + recency + quality + regional * 5 - (40 if off_scope else 0))
+
+
+def _editorial_recency_score(value):
+    try:
+        text = str(value or "").replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() / 3600
+    except (TypeError, ValueError):
+        return 0
+    if age_hours <= 12:
+        return 15
+    if age_hours <= 24:
+        return 10
+    if age_hours <= 48:
+        return 5
+    return 0
+
+
+def rank_backup_items(items, limit=12):
+    ranked = sorted(
+        items,
+        key=lambda item: (int(item.get("editorial_score") or 0), str(item.get("published_at") or "")),
+        reverse=True,
+    )
+    selected = []
+    source_counts = {}
+    category_counts = {}
+    for item in ranked:
+        source = item.get("source_name") or "unknown"
+        category = item.get("category") or "Maritime"
+        if int(item.get("editorial_score") or 0) < 41:
+            continue
+        if source_counts.get(source, 0) >= 4 or category_counts.get(category, 0) >= 4:
+            continue
+        selected.append(item)
+        source_counts[source] = source_counts.get(source, 0) + 1
+        category_counts[category] = category_counts.get(category, 0) + 1
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def dedupe_similar_items(items):
+    selected = []
+    removed = 0
+    for item in items:
+        normalized = normalize_title(item.get("title"))
+        duplicate = next(
+            (
+                existing
+                for existing in selected
+                if normalized
+                and _similar_story_title(normalized, normalize_title(existing.get("title")))
+            ),
+            None,
+        )
+        if duplicate is None:
+            selected.append(item)
+            continue
+        if winner_score(item) > winner_score(duplicate):
+            selected[selected.index(duplicate)] = item
+        removed += 1
+    return selected, removed
+
+
+def _similar_story_title(left, right):
+    if SequenceMatcher(None, left, right).ratio() >= 0.8:
+        return True
+    left_tokens = set(left.split())
+    right_tokens = set(right.split())
+    shared = left_tokens & right_tokens
+    anchors = {
+        "yemen", "houthi", "houthis", "hormuz", "red", "sea", "black", "ukraine",
+        "russia", "iran", "israel", "gaza", "suez", "bab", "mandeb", "gaslog",
+    }
+    contradictions = (
+        ("worsens", "improves"),
+        ("increase", "decrease"),
+        ("rises", "falls"),
+        ("deny", "confirm"),
+    )
+    if any((left_word in left_tokens and right_word in right_tokens) or (right_word in left_tokens and left_word in right_tokens) for left_word, right_word in contradictions):
+        return False
+    return len(shared) >= 4 and bool(shared & anchors)
 
 
 def load_sheet_items(sheet_url, limit=None, session=None):
@@ -779,6 +1036,8 @@ def format_combined_stats(stats, brief_path=None):
     lines = [
         "Combined source check",
         f"Source mode: {stats.get('source_mode', 'combined')}",
+        f"Run ID: {stats.get('run_id', '') or 'preview'}",
+        f"Selected lane: {stats.get('selected_lane', '') or 'preview'}",
         f"App items: {stats.get('app_total', 0)}",
         f"Sheet items: {stats.get('sheet_total', 0)}",
         f"Raw items: {stats.get('raw_total', 0)}",
@@ -786,6 +1045,8 @@ def format_combined_stats(stats, brief_path=None):
         f"Duplicate removed: {stats.get('duplicate_removed', 0)}",
         f"Eligible after published filter: {stats.get('eligible_total', 0)}",
         f"Selected after dedupe: {stats.get('selected_total', 0)}",
+        f"AI enriched: {stats.get('enriched_total', 0)}",
+        f"Quality rejected: {stats.get('quality_rejected', 0)}",
         f"Backup items: {stats.get('backup_total', 0)}",
         (
             f"Backup status: {stats.get('backup_status', 'not_used')} "

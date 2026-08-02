@@ -1,7 +1,7 @@
 from pathlib import Path
 import time
 
-from app.config import ROOT_DIR
+from app.config import ROOT_DIR, ensure_runtime_seed
 from app.services.ai_processor import summarize_pending_articles
 from app.services.brief_generator import generate_source_readiness_brief
 from app.services.brief_writer import generate_brief, generate_scan_brief
@@ -20,7 +20,7 @@ from app.services.storage import DEFAULT_DB_PATH, init_db, list_active_sources, 
 from app.services.trend_collector import fetch_google_trends_rss, import_trends_csv, seed_default_trends
 
 
-DEFAULT_SOURCE_MASTER = ROOT_DIR / "NEWS_SOURCE_MASTER.csv"
+DEFAULT_SOURCE_MASTER = ensure_runtime_seed("NEWS_SOURCE_MASTER.csv")
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "output"
 
 

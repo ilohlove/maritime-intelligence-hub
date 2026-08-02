@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app.services.ai_processor import AIProviderChain, OpenAICompatibleProvider
@@ -25,6 +27,40 @@ class BackupLaneTests(unittest.TestCase):
         plan = build_backup_feed_plan.__globals__["filter_sources"]  # ensure policy is shared
         self.assertIn("news.google.com/rss/search", GOOGLE_NEWS_RSS)
         self.assertTrue(source["Query"])
+
+    def test_disabled_official_master_row_disables_official_sources(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            master = Path(temp_dir) / "backup.csv"
+            master.write_text(
+                "ID,Name,Provider,Website/Domain,Enabled,Max Items\n"
+                "BF001,Official,official_rss,example.com,No,10\n",
+                encoding="utf-8",
+            )
+            plan = build_backup_feed_plan(
+                master,
+                official_sources=[_official_source("SRC1", "https://example.com")],
+            )
+
+        self.assertEqual(plan, [])
+
+    def test_official_sources_are_limited_to_configured_domains(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            master = Path(temp_dir) / "backup.csv"
+            master.write_text(
+                "ID,Name,Provider,Website/Domain,Enabled,Max Items\n"
+                "BF001,Official,official_rss,safety4sea.com,Yes,5\n",
+                encoding="utf-8",
+            )
+            plan = build_backup_feed_plan(
+                master,
+                official_sources=[
+                    _official_source("SAFE", "https://safety4sea.com"),
+                    _official_source("OTHER", "https://other.example.com"),
+                ],
+            )
+
+        self.assertEqual([item["source"]["id"] for item in plan], ["SAFE"])
+        self.assertEqual(plan[0]["max_items"], 5)
 
     def test_reader_falls_back_when_jina_fails(self):
         session = Mock()
@@ -75,6 +111,19 @@ class BackupLaneTests(unittest.TestCase):
         )
         self.assertEqual(result["ai_provider"], "groq")
         self.assertIn("valid headline", result["fallback_errors"][0])
+
+
+def _official_source(source_id, website):
+    return {
+        "ID": source_id,
+        "Source Name": source_id,
+        "Website": website,
+        "Country": "Global",
+        "Language": "EN",
+        "Category": "Shipping News",
+        "RSS": "Yes",
+        "Status": "Active",
+    }
 
 
 if __name__ == "__main__":

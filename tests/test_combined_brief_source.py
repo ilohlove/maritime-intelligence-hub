@@ -1,20 +1,27 @@
+import csv
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 from app.services.combined_brief_source import (
     build_combined_brief,
     canonicalize_url,
+    evaluate_sheet_snapshot,
     filter_publishable_items,
     format_empty_combined_message,
     item_key,
+    load_sheet_snapshot,
     normalize_source_url,
+    parse_sheet_snapshot,
     sheet_run_label,
     sheet_row_to_item,
     title_hash,
+    write_json_atomic,
 )
 from app.services.source_master import load_sources
 from app.services.storage import init_db, mark_items_published, sync_sources, upsert_article, upsert_summary, utc_now
@@ -96,6 +103,161 @@ class CombinedBriefSourceTests(unittest.TestCase):
         self.assertEqual(selected[0]["source_type"], "sheet")
         self.assertEqual(selected[0]["source_name"], "Sheet Source")
         self.assertEqual(stats["duplicate_removed"], 1)
+
+    def test_exact_dedupe_does_not_remove_merely_similar_titles(self):
+        first = _item_with_title(
+            "backup",
+            "Source A",
+            "https://example.com/a",
+            "Port congestion worsens across major Asian hubs",
+        )
+        second = _item_with_title(
+            "backup",
+            "Source B",
+            "https://example.com/b",
+            "Port congestion improves across major Asian hubs",
+        )
+
+        selected, stats = filter_publishable_items([first, second])
+
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(stats["duplicate_removed"], 0)
+
+    def test_protocol_v1_snapshot_is_loaded_and_evaluated_from_one_request(self):
+        session = _FakeSession(
+            _protocol_csv(
+                started_at="2026-08-01T07:15:00+07:00",
+                completed_at="2026-08-01T07:21:00+07:00",
+                run_id="2026-08-01:morning",
+                status="COMPLETED",
+                row_count="1",
+                rows=[_sheet_data_row("New maritime report", "https://example.com/new")],
+            )
+        )
+
+        snapshot = load_sheet_snapshot(
+            "https://docs.google.com/spreadsheets/d/sheet123/edit?gid=0",
+            session=session,
+        )
+        evaluation = evaluate_sheet_snapshot(snapshot, "2026-08-01:morning")
+
+        self.assertEqual(len(session.requested_urls), 1)
+        self.assertEqual(snapshot["protocol_version"], "v1")
+        self.assertEqual(snapshot["run_id"], "2026-08-01:morning")
+        self.assertEqual(snapshot["status"], "COMPLETED")
+        self.assertEqual(snapshot["row_count"], 1)
+        self.assertEqual(snapshot["data_row_count"], 1)
+        self.assertEqual(snapshot["usable_row_count"], 1)
+        self.assertEqual(evaluation["state"], "ready")
+        self.assertTrue(evaluation["ready"])
+
+    def test_protocol_v1_running_snapshot_with_old_rows_waits(self):
+        snapshot = parse_sheet_snapshot(
+            _protocol_csv(
+                started_at="2026-08-01T07:15:00+07:00",
+                run_id="2026-08-01:morning",
+                status="RUNNING",
+                rows=[_sheet_data_row("Yesterday's report", "https://example.com/old", date="2026-07-31")],
+            )
+        )
+
+        evaluation = evaluate_sheet_snapshot(snapshot, "2026-08-01:morning")
+
+        self.assertEqual(evaluation["state"], "waiting")
+        self.assertEqual(evaluation["reason"], "run_in_progress")
+        self.assertFalse(evaluation["ready"])
+
+    def test_protocol_v1_previous_completed_run_is_still_waiting(self):
+        snapshot = parse_sheet_snapshot(
+            _protocol_csv(
+                started_at="2026-07-31T19:15:00+07:00",
+                completed_at="2026-07-31T19:21:00+07:00",
+                run_id="2026-07-31:evening",
+                status="COMPLETED",
+                row_count="1",
+                rows=[_sheet_data_row("Old report", "https://example.com/old", date="2026-07-31")],
+            )
+        )
+
+        evaluation = evaluate_sheet_snapshot(snapshot, "2026-08-01:morning")
+
+        self.assertEqual(evaluation["state"], "waiting")
+        self.assertEqual(evaluation["reason"], "run_id_mismatch")
+
+    def test_protocol_v1_rejects_row_count_or_unusable_row_mismatch(self):
+        snapshot = parse_sheet_snapshot(
+            _protocol_csv(
+                started_at="2026-08-01T07:15:00+07:00",
+                completed_at="2026-08-01T07:21:00+07:00",
+                run_id="2026-08-01:morning",
+                status="COMPLETED",
+                row_count="2",
+                rows=[_sheet_data_row("Valid report", "https://example.com/valid")],
+            )
+        )
+
+        evaluation = evaluate_sheet_snapshot(snapshot, "2026-08-01:morning")
+
+        self.assertEqual(evaluation["state"], "invalid")
+        self.assertTrue(any("snapshot contains 1 data rows" in error for error in evaluation["errors"]))
+
+    def test_protocol_v1_rejects_malformed_source_url(self):
+        snapshot = parse_sheet_snapshot(
+            _protocol_csv(
+                started_at="2026-08-01T07:15:00+07:00",
+                completed_at="2026-08-01T07:21:00+07:00",
+                run_id="2026-08-01:morning",
+                status="COMPLETED",
+                row_count="1",
+                rows=[_sheet_data_row("Invalid report", "not-a-url")],
+            )
+        )
+
+        evaluation = evaluate_sheet_snapshot(snapshot, "2026-08-01:morning")
+
+        self.assertEqual(snapshot["usable_row_count"], 0)
+        self.assertEqual(evaluation["state"], "invalid")
+        self.assertTrue(any("only 0 rows are usable" in error for error in evaluation["errors"]))
+
+    def test_protocol_v1_failed_snapshot_is_terminal(self):
+        snapshot = parse_sheet_snapshot(
+            _protocol_csv(
+                started_at="2026-08-01T07:15:00+07:00",
+                run_id="2026-08-01:morning",
+                status="FAILED",
+                error_code="AGENT_TIMEOUT",
+            )
+        )
+
+        evaluation = evaluate_sheet_snapshot(snapshot, "2026-08-01:morning")
+
+        self.assertEqual(evaluation["state"], "failed")
+        self.assertEqual(evaluation["reason"], "AGENT_TIMEOUT")
+        self.assertTrue(evaluation["terminal"])
+
+    def test_protocol_v1_rejects_naive_timestamp_and_wrong_slot(self):
+        naive = parse_sheet_snapshot(
+            _protocol_csv(
+                started_at="2026-08-01T07:15:00",
+                run_id="2026-08-01:morning",
+                status="RUNNING",
+            )
+        )
+        wrong_slot = parse_sheet_snapshot(
+            _protocol_csv(
+                started_at="2026-08-01T19:15:00+07:00",
+                run_id="2026-08-01:morning",
+                status="RUNNING",
+            )
+        )
+
+        naive_result = evaluate_sheet_snapshot(naive, "2026-08-01:morning")
+        wrong_slot_result = evaluate_sheet_snapshot(wrong_slot, "2026-08-01:morning")
+
+        self.assertEqual(naive_result["state"], "invalid")
+        self.assertTrue(any("timezone" in error for error in naive_result["errors"]))
+        self.assertEqual(wrong_slot_result["state"], "invalid")
+        self.assertTrue(any("slot" in error for error in wrong_slot_result["errors"]))
 
     def test_generate_cards_limit_none_uses_all_items(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -216,7 +378,7 @@ class CombinedBriefSourceTests(unittest.TestCase):
             "https://docs.google.com/spreadsheets/d/sheet123/export?format=csv&gid=456",
         )
 
-    def test_sheet_mode_uses_unpublished_rows_without_limits_or_dedupe(self):
+    def test_sheet_mode_uses_all_rows_then_applies_exact_dedupe(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             db_path = temp_path / "mih.db"
@@ -238,10 +400,10 @@ class CombinedBriefSourceTests(unittest.TestCase):
                 session=session,
             )
 
-        self.assertEqual(len(result.payload["items"]), 2)
+        self.assertEqual(len(result.payload["items"]), 1)
         self.assertEqual(result.stats["sheet_total"], 2)
-        self.assertEqual(result.stats["duplicate_removed"], 0)
-        self.assertEqual(result.stats["selected_total"], 2)
+        self.assertEqual(result.stats["duplicate_removed"], 1)
+        self.assertEqual(result.stats["selected_total"], 1)
         self.assertEqual(result.stats["sheet_source"]["run_marker"], "19:15")
         self.assertEqual(result.stats["sheet_source"]["run_label"], "evening")
 
@@ -298,7 +460,122 @@ class CombinedBriefSourceTests(unittest.TestCase):
 
         self.assertEqual(result.payload["items"], [])
         self.assertEqual(result.stats["fallback_reason"], "sheet_empty")
+        self.assertEqual(result.stats["backup_status"], "failed")
         self.assertEqual(result.stats["source_mode"], "sheet")
+
+    def test_completed_empty_primary_does_not_start_backup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            snapshot = parse_sheet_snapshot(
+                _protocol_csv(
+                    started_at="2026-08-01T07:15:00+07:00",
+                    completed_at="2026-08-01T07:16:00+07:00",
+                    run_id="2026-08-01:morning",
+                    status="COMPLETED",
+                    row_count="0",
+                )
+            )
+            with patch("app.services.combined_brief_source.collect_backup_news") as backup:
+                result = build_combined_brief(
+                    source_mode="sheet",
+                    sheet_url="https://docs.google.com/spreadsheets/d/sheet123/edit?gid=0",
+                    sheet_snapshot=snapshot,
+                    expected_run_id="2026-08-01:morning",
+                    allow_backup=True,
+                    db_path=temp_path / "mih.db",
+                    brief_path=temp_path / "brief.json",
+                )
+
+        backup.assert_not_called()
+        self.assertEqual(result.payload["items"], [])
+        self.assertEqual(result.stats["sheet_source"]["evaluation"]["state"], "ready")
+
+    def test_build_reuses_supplied_snapshot_without_second_get(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            snapshot = parse_sheet_snapshot(
+                _protocol_csv(
+                    started_at="2026-08-01T07:15:00+07:00",
+                    completed_at="2026-08-01T07:16:00+07:00",
+                    run_id="2026-08-01:morning",
+                    status="COMPLETED",
+                    row_count="1",
+                    rows=[_sheet_data_row("Current report", "https://example.com/current")],
+                )
+            )
+            session = _FakeSession("must not be requested")
+            result = build_combined_brief(
+                source_mode="sheet",
+                sheet_url="https://docs.google.com/spreadsheets/d/sheet123/edit?gid=0",
+                sheet_snapshot=snapshot,
+                expected_run_id="2026-08-01:morning",
+                allow_backup=False,
+                session=session,
+                db_path=temp_path / "mih.db",
+                brief_path=temp_path / "brief.json",
+            )
+
+        self.assertEqual(session.requested_urls, [])
+        self.assertEqual(len(result.payload["items"]), 1)
+
+    def test_backup_items_receive_one_final_exact_dedupe_and_complete_stats(self):
+        duplicate_a = _item_with_title("backup", "Backup A", "https://example.com/duplicate", "Report A")
+        duplicate_b = _item_with_title("backup", "Backup B", "https://example.com/duplicate?utm_source=rss", "Report B")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            with patch(
+                "app.services.combined_brief_source.collect_backup_news",
+                return_value=[{"items": [duplicate_a, duplicate_b]}],
+            ):
+                result = build_combined_brief(
+                    source_mode="sheet",
+                    sheet_url="",
+                    db_path=temp_path / "mih.db",
+                    brief_path=temp_path / "brief.json",
+                )
+
+        self.assertEqual(len(result.payload["items"]), 1)
+        self.assertEqual(result.stats["raw_total"], 2)
+        self.assertEqual(result.stats["backup_total"], 2)
+        self.assertEqual(result.stats["eligible_total"], 2)
+        self.assertEqual(result.stats["duplicate_removed"], 1)
+        self.assertEqual(result.stats["selected_total"], 1)
+        self.assertEqual(result.stats["backup_status"], "ok")
+
+    def test_all_backup_source_errors_are_not_reported_as_no_content(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            with patch(
+                "app.services.combined_brief_source.collect_backup_news",
+                return_value=[
+                    {"status": "error", "message": "timeout", "items": []},
+                    {"status": "error", "message": "connection failed", "items": []},
+                ],
+            ):
+                result = build_combined_brief(
+                    source_mode="sheet",
+                    sheet_url="",
+                    db_path=temp_path / "mih.db",
+                    brief_path=temp_path / "brief.json",
+                )
+
+        self.assertEqual(result.payload["items"], [])
+        self.assertEqual(result.stats["backup_status"], "failed")
+        self.assertEqual(result.stats["backup_failed_sources"], 2)
+
+    def test_json_write_replaces_destination_atomically(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "brief.json"
+            path.write_text('{"old": true}', encoding="utf-8")
+            with patch("app.services.combined_brief_source.os.replace", wraps=os.replace) as replace:
+                write_json_atomic(path, {"new": True})
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            temporary_files = list(path.parent.glob(f".{path.name}.*.tmp"))
+
+        self.assertEqual(payload, {"new": True})
+        replace.assert_called_once()
+        self.assertEqual(temporary_files, [])
 
 
 def _item(source_type, source_name, url):
@@ -315,6 +592,63 @@ def _item(source_type, source_name, url):
     item["title_hash"] = title_hash(item["title"])
     item["item_key"] = item_key(item)
     return item
+
+
+def _item_with_title(source_type, source_name, url, title):
+    item = _item(source_type, source_name, url)
+    item["title"] = title
+    item["title_hash"] = title_hash(title)
+    item["item_key"] = item_key(item)
+    return item
+
+
+SHEET_HEADERS = [
+    "Date",
+    "Section",
+    "Topic",
+    "Headline",
+    "Vietnamese translation",
+    "Source",
+    "Source URL",
+    "Main summary",
+    "Main summary (Vietnamese)",
+    "Why it matters",
+    "Why it matters (Vietnamese)",
+]
+
+
+def _sheet_data_row(title, url, date="2026-08-01"):
+    return {
+        "Date": date,
+        "Section": "Global",
+        "Topic": "Shipping",
+        "Headline": title,
+        "Vietnamese translation": title,
+        "Source": "Sheet Source",
+        "Source URL": url,
+        "Main summary": "Summary",
+        "Main summary (Vietnamese)": "Summary",
+        "Why it matters": "Impact",
+        "Why it matters (Vietnamese)": "Impact",
+    }
+
+
+def _protocol_csv(
+    *,
+    started_at,
+    run_id,
+    status,
+    completed_at="",
+    row_count="",
+    error_code="",
+    rows=None,
+):
+    output = StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(SHEET_HEADERS + [started_at, completed_at, run_id, status, row_count, error_code])
+    for row in rows or []:
+        writer.writerow([row.get(header, "") for header in SHEET_HEADERS])
+    return output.getvalue()
 
 
 def _seed_sources(db_path):

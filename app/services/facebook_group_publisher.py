@@ -14,6 +14,8 @@ from app.config import ROOT_DIR
 from app.services.facebook_publisher import validate_cards_publish_safety
 from app.services.storage import (
     cancel_facebook_group_delivery,
+    claim_facebook_group_delivery,
+    confirm_facebook_group_delivery_claim_succeeded,
     count_facebook_group_attempts_since,
     expire_facebook_group_deliveries,
     get_facebook_group_delivery,
@@ -22,6 +24,7 @@ from app.services.storage import (
     list_facebook_group_deliveries,
     mark_items_published,
     record_facebook_group_delivery,
+    release_facebook_group_delivery_claim,
 )
 
 
@@ -189,6 +192,8 @@ def publish_to_groups(
     random_uniform=random.uniform,
     now=None,
     progress_callback=None,
+    before_group_publish=None,
+    after_group_publish=None,
 ):
     safety = validate_cards_publish_safety(cards)
     if not safety["ready"]:
@@ -208,6 +213,7 @@ def publish_to_groups(
     storage_args = {} if db_path is None else {"db_path": db_path}
     effective_now = now or datetime.now(timezone.utc)
     expiry_time = effective_now + timedelta(hours=max(1, int(queue_expiry_hours)))
+    publish_owner = f"facebook-group:{os.getpid()}:{threading.get_ident()}:{time.time_ns()}"
 
     if not _PUBLISH_LOCK.acquire(blocking=False):
         raise FacebookGroupPublisherError("Facebook Groups publisher is already running.")
@@ -250,7 +256,8 @@ def publish_to_groups(
                     **storage_args,
                 )
 
-        daily_used = count_facebook_group_attempts_since(_vietnam_day_start_iso(effective_now), **storage_args)
+        daily_since_iso = _vietnam_day_start_iso(effective_now)
+        daily_used = count_facebook_group_attempts_since(daily_since_iso, **storage_args)
         daily_available = max(0, daily_limit - daily_used)
         delivered_in_batch = sum(
             1 for delivery in existing.values() if delivery and delivery.get("status") in DELIVERED_STATUSES
@@ -312,6 +319,77 @@ def publish_to_groups(
                 for index, group in enumerate(candidates):
                     if index:
                         sleep_fn(planned_delays[index])
+                    queued_delivery = get_facebook_group_delivery(batch_id, group["id"], **storage_args)
+                    queue_claim = claim_facebook_group_delivery(
+                        queued_delivery["id"],
+                        publish_owner,
+                        daily_since_iso=daily_since_iso,
+                        daily_limit=daily_limit,
+                        now=effective_now,
+                        **storage_args,
+                    )
+                    if not queue_claim or not queue_claim.get("acquired"):
+                        reason = (queue_claim or {}).get("claim_reason") or "queue claim unavailable"
+                        results_by_group[group["id"]] = _delivery_result(
+                            group,
+                            "skipped",
+                            batch_id,
+                            message=f"cross-process delivery lock: {reason}",
+                        )
+                        continue
+                    guard_started = False
+                    if before_group_publish is not None:
+                        try:
+                            guard_result = before_group_publish(group, batch_id)
+                        except Exception:
+                            release_facebook_group_delivery_claim(
+                                queued_delivery["id"],
+                                publish_owner,
+                                "delivery guard raised before browser publish",
+                                **storage_args,
+                            )
+                            raise
+                        allowed = bool(
+                            guard_result.get("allowed")
+                            if isinstance(guard_result, dict)
+                            else guard_result
+                        )
+                        if not allowed:
+                            message = (
+                                str(guard_result.get("message") or "delivery guard blocked")
+                                if isinstance(guard_result, dict)
+                                else "delivery guard blocked"
+                            )
+                            results_by_group[group["id"]] = _delivery_result(
+                                group, "skipped", batch_id, message=message
+                            )
+                            terminal_status = (
+                                str(guard_result.get("terminal_status") or "").lower()
+                                if isinstance(guard_result, dict)
+                                else ""
+                            )
+                            if terminal_status in DELIVERED_STATUSES:
+                                confirmed = confirm_facebook_group_delivery_claim_succeeded(
+                                    queued_delivery["id"],
+                                    publish_owner,
+                                    now=effective_now,
+                                    **storage_args,
+                                )
+                                if not confirmed:
+                                    raise FacebookGroupPublisherError(
+                                        "Could not terminalize the already-succeeded group delivery claim."
+                                    )
+                            else:
+                                release_facebook_group_delivery_claim(
+                                    queued_delivery["id"],
+                                    publish_owner,
+                                    message,
+                                    **storage_args,
+                                )
+                            continue
+                        guard_started = True
+                    result = None
+                    safety_stop = False
                     try:
                         posted = browser.publish_group(group["url"], captions[group["id"]], image_paths, group["id"])
                         status = posted.get("status") or "failed"
@@ -361,7 +439,7 @@ def publish_to_groups(
                                 **storage_args,
                             )
                         _notify_progress(progress_callback, daily_limit, storage_args, effective_now)
-                        break
+                        safety_stop = True
                     except Exception as exc:
                         message = _safe_error(exc)
                         result = _delivery_result(group, "failed", batch_id, message=message)
@@ -374,7 +452,12 @@ def publish_to_groups(
                             **storage_args,
                         )
                         _notify_progress(progress_callback, daily_limit, storage_args, effective_now)
+                    finally:
+                        if guard_started and after_group_publish is not None:
+                            after_group_publish(group, batch_id, result or {})
                     results_by_group[group["id"]] = result
+                    if safety_stop:
+                        break
 
         for group in enabled_groups:
             if group["id"] not in results_by_group:
@@ -394,7 +477,8 @@ def get_group_queue_status(max_groups_per_day=4, db_path=None, now=None):
     effective_now = now or datetime.now(timezone.utc)
     daily_limit = max(1, int(max_groups_per_day))
     expire_facebook_group_deliveries(effective_now.isoformat(), **storage_args)
-    used = count_facebook_group_attempts_since(_vietnam_day_start_iso(effective_now), **storage_args)
+    daily_since_iso = _vietnam_day_start_iso(effective_now)
+    used = count_facebook_group_attempts_since(daily_since_iso, **storage_args)
     deliveries = list_facebook_group_deliveries(**storage_args)
     queued = [delivery for delivery in deliveries if delivery.get("status") == "queued"]
     scheduled = sorted(
@@ -415,7 +499,11 @@ def list_group_queue(db_path=None, include_history=False, now=None):
     expire_facebook_group_deliveries(effective_now.isoformat(), **storage_args)
     rows = list_facebook_group_deliveries(**storage_args)
     if not include_history:
-        rows = [row for row in rows if row.get("status") in {"queued", "failed", "needs_login"}]
+        rows = [
+            row
+            for row in rows
+            if row.get("status") in {"queued", "failed", "needs_login", "needs_review", "sending"}
+        ]
     return sorted(
         rows,
         key=lambda row: (
@@ -461,7 +549,8 @@ def publish_queue_item(
         raise ValueError("Facebook Groups queue item was not found.")
     if delivery.get("status") not in {"queued", "failed", "needs_login"}:
         raise ValueError(f"Queue item cannot be published from status '{delivery.get('status')}'.")
-    used = count_facebook_group_attempts_since(_vietnam_day_start_iso(effective_now), **storage_args)
+    daily_since_iso = _vietnam_day_start_iso(effective_now)
+    used = count_facebook_group_attempts_since(daily_since_iso, **storage_args)
     if used >= max(1, int(max_groups_per_day)):
         raise FacebookGroupPublisherError("Daily Facebook Groups safety limit has been reached.")
     try:
@@ -481,45 +570,75 @@ def publish_queue_item(
         "priority": delivery.get("priority") or 100,
     }
     browser_factory = browser_factory or facebook_browser_session
+    publish_owner = f"facebook-group-queue:{os.getpid()}:{threading.get_ident()}:{time.time_ns()}"
     if not _PUBLISH_LOCK.acquire(blocking=False):
         raise FacebookGroupPublisherError("Facebook Groups publisher is already running.")
     try:
-        with browser_factory(profile_dir=profile_dir, headed=True) as browser:
-            try:
-                posted = browser.publish_group(group["url"], caption, image_paths, group["id"])
-                status = posted.get("status") or "failed"
-                message = posted.get("message", "")
-                post_url = posted.get("post_url", "")
-                record_facebook_group_delivery(
-                    delivery["batch_id"],
-                    group,
-                    status,
-                    post_url=post_url,
-                    error_message=message if status not in DELIVERED_STATUSES else "",
-                    payload=payload,
+        claim = claim_facebook_group_delivery(
+            delivery_id,
+            publish_owner,
+            daily_since_iso=daily_since_iso,
+            daily_limit=max(1, int(max_groups_per_day)),
+            now=effective_now,
+            **storage_args,
+        )
+        if not claim or not claim.get("acquired"):
+            raise FacebookGroupPublisherError(
+                "Facebook Groups queue item is locked or requires review: "
+                f"{(claim or {}).get('claim_reason') or 'unavailable'}"
+            )
+        browser_opened = False
+        status = "failed"
+        message = ""
+        post_url = ""
+        try:
+            browser_context = browser_factory(profile_dir=profile_dir, headed=True)
+            with browser_context as browser:
+                browser_opened = True
+                try:
+                    posted = browser.publish_group(group["url"], caption, image_paths, group["id"])
+                    status = posted.get("status") or "failed"
+                    message = posted.get("message", "")
+                    post_url = posted.get("post_url", "")
+                    record_facebook_group_delivery(
+                        delivery["batch_id"],
+                        group,
+                        status,
+                        post_url=post_url,
+                        error_message=message if status not in DELIVERED_STATUSES else "",
+                        payload=payload,
+                        **storage_args,
+                    )
+                    if status in DELIVERED_STATUSES:
+                        mark_items_published(payload.get("cards") or [], **storage_args)
+                except FacebookSafetyStop as exc:
+                    message = _safe_error(exc)
+                    status = "needs_login" if isinstance(exc, FacebookLoginRequired) else "failed"
+                    record_facebook_group_delivery(
+                        delivery["batch_id"],
+                        group,
+                        status,
+                        error_message=message,
+                        stop_reason=message,
+                        payload=payload,
+                        **storage_args,
+                    )
+                    raise
+                except Exception as exc:
+                    message = _safe_error(exc)
+                    status = "failed"
+                    record_facebook_group_delivery(
+                        delivery["batch_id"], group, status, error_message=message, payload=payload, **storage_args
+                    )
+        except Exception:
+            if not browser_opened:
+                release_facebook_group_delivery_claim(
+                    delivery_id,
+                    publish_owner,
+                    "browser failed before group publish started",
                     **storage_args,
                 )
-                if status in DELIVERED_STATUSES:
-                    mark_items_published(payload.get("cards") or [], **storage_args)
-            except FacebookSafetyStop as exc:
-                message = _safe_error(exc)
-                status = "needs_login" if isinstance(exc, FacebookLoginRequired) else "failed"
-                record_facebook_group_delivery(
-                    delivery["batch_id"],
-                    group,
-                    status,
-                    error_message=message,
-                    stop_reason=message,
-                    payload=payload,
-                    **storage_args,
-                )
-                raise
-            except Exception as exc:
-                message = _safe_error(exc)
-                status = "failed"
-                record_facebook_group_delivery(
-                    delivery["batch_id"], group, status, error_message=message, payload=payload, **storage_args
-                )
+            raise
     finally:
         _PUBLISH_LOCK.release()
     return {

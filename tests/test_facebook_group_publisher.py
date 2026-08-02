@@ -263,6 +263,64 @@ class FacebookGroupPublisherTests(unittest.TestCase):
             self.assertEqual(result["counts"]["queued"], 1)
             self.assertEqual(result["safety"]["used_today"], 2)
 
+    def test_delivery_guard_blocks_group_before_external_publish(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image = root / "card.png"
+            image.write_bytes(b"png")
+            cards = [_card(image, "item-1", "https://example.com/story")]
+            fake = _FakeBrowser({"guarded": {"status": "published"}})
+            after_calls = []
+
+            result = publish_to_groups(
+                cards,
+                [_group("guarded")],
+                "unused",
+                db_path=root / "test.db",
+                browser_factory=_factory(fake),
+                before_group_publish=lambda _group, _batch: {
+                    "allowed": False,
+                    "message": "run lease lost",
+                },
+                after_group_publish=lambda *args: after_calls.append(args),
+            )
+
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(after_calls, [])
+        self.assertEqual(result["counts"]["skipped"], 1)
+        self.assertIn("run lease lost", result["results"][0]["message"])
+
+    def test_already_succeeded_delivery_guard_terminalizes_group_queue(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "test.db"
+            image = root / "card.png"
+            image.write_bytes(b"png")
+            cards = [_card(image, "item-1", "https://example.com/story")]
+            fake = _FakeBrowser({"guarded": {"status": "published"}})
+
+            result = publish_to_groups(
+                cards,
+                [_group("guarded")],
+                "unused",
+                db_path=db_path,
+                browser_factory=_factory(fake),
+                before_group_publish=lambda _group, _batch: {
+                    "allowed": False,
+                    "message": "delivery ledger already succeeded",
+                    "terminal_status": "published",
+                },
+            )
+            delivery = get_facebook_group_delivery(
+                build_batch_id(cards), "guarded", db_path=db_path
+            )
+            queue = list_group_queue(db_path=db_path)
+
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(result["counts"]["skipped"], 1)
+        self.assertEqual(delivery["status"], "published")
+        self.assertEqual(queue, [])
+
     def test_manual_publish_processes_one_queued_group_and_counts_daily_quota(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -293,6 +351,34 @@ class FacebookGroupPublisherTests(unittest.TestCase):
             self.assertEqual(manual.calls, ["3"])
             self.assertEqual(result["counts"]["pending"], 1)
             self.assertEqual(result["safety"]["used_today"], 3)
+
+    def test_manual_retry_reclaims_failed_group_delivery(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "test.db"
+            image = root / "card.png"
+            image.write_bytes(b"png")
+            cards = [_card(image, "item-1", "https://example.com/story")]
+            group = _group("retry-failed")
+            record_facebook_group_delivery(
+                build_batch_id(cards),
+                group,
+                "failed",
+                db_path=db_path,
+            )
+            fake = _FakeBrowser({"retry-failed": {"status": "published"}})
+
+            result = publish_to_groups(
+                cards,
+                [group],
+                "unused",
+                manual=True,
+                db_path=db_path,
+                browser_factory=_factory(fake),
+            )
+
+        self.assertEqual(fake.calls, ["retry-failed"])
+        self.assertEqual(result["counts"]["published"], 1)
 
     def test_daily_limit_queues_without_opening_browser(self):
         with tempfile.TemporaryDirectory() as temp_dir:

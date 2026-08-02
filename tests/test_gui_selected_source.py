@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -104,6 +105,37 @@ class GuiSelectedSourceTests(unittest.TestCase):
         self.assertIn("Source mode: sheet", output)
         self.assertIn("sent", output)
 
+    def test_preview_only_sheet_cards_cannot_be_sent(self):
+        app = _gui_stub()
+        selected_result = _selected_result()
+        selected_result["preview_only"] = True
+        app._latest_rendered_cards_result = Mock(return_value=selected_result)
+        app._task_send_cards = Mock()
+
+        output, ok = AppGUI._task_send_latest_cards(app)
+
+        self.assertFalse(ok)
+        self.assertIn("preview-only", output)
+        app._task_send_cards.assert_not_called()
+
+    def test_coordinated_latest_cards_use_delivery_claims(self):
+        app = _gui_stub()
+        selected_result = _selected_result()
+        selected_result["run_id"] = "2026-08-01:morning"
+        app._latest_rendered_cards_result = Mock(return_value=selected_result)
+        app._manual_delivery_owner = Mock(return_value="gui-worker")
+        app._task_send_cards = Mock(return_value=("sent", True))
+
+        _output, ok = AppGUI._task_send_latest_cards(app)
+
+        self.assertTrue(ok)
+        app._task_send_cards.assert_called_once_with(
+            ["card-1.png"],
+            "evening",
+            run_id="2026-08-01:morning",
+            run_owner="gui-worker",
+        )
+
     def test_latest_rendered_cards_result_reads_newest_manifest(self):
         app = _gui_stub()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -135,7 +167,7 @@ class GuiSelectedSourceTests(unittest.TestCase):
             os.utime(older_manifest, (1000, 1000))
             os.utime(newer_manifest, (2000, 2000))
 
-            with patch("app.gui.DEFAULT_VISUAL_BRIEF_DIR", root):
+            with patch("app.gui.DEFAULT_VISUAL_BRIEF_DIR", root), patch("app.gui.ROOT_DIR", root):
                 result = AppGUI._latest_rendered_cards_result(app)
 
         self.assertTrue(result["latest_rendered"])
@@ -158,7 +190,7 @@ class GuiSelectedSourceTests(unittest.TestCase):
                 "cards": [{"card_path": str(run_dir / "missing.png"), "original_url": "https://example.com/story"}],
             }), encoding="utf-8")
 
-            with patch("app.gui.DEFAULT_VISUAL_BRIEF_DIR", root):
+            with patch("app.gui.DEFAULT_VISUAL_BRIEF_DIR", root), patch("app.gui.ROOT_DIR", root):
                 with self.assertRaisesRegex(RuntimeError, "Generate Test"):
                     AppGUI._latest_rendered_cards_result(app)
 
@@ -455,6 +487,116 @@ class GuiSelectedSourceTests(unittest.TestCase):
         self.assertIn("Facebook published", output)
         self.assertIn("Photo descriptions with source links: 1", output)
 
+    def test_scheduled_facebook_claims_delivery_before_publish(self):
+        app = _gui_stub()
+        app.facebook_page_id_var = _Var("page-1")
+        app.facebook_page_access_token_var = _Var("token")
+        app.facebook_dry_run_var = _Var(False)
+        app.facebook_intro_text_var = _Var("{date}")
+        app._vietnam_now = Mock(return_value=_FakeNow("2026-08-01 07:15"))
+        cards = [
+            {
+                "card_path": "card-1.png",
+                "source_name": "Source",
+                "original_url": "https://example.com/story",
+                "item_key": "url:test",
+            }
+        ]
+
+        with patch("app.gui.claim_delivery_cards", return_value={"claimed": cards, "skipped": []}) as claim:
+            with patch(
+                "app.gui.publish_photo_post",
+                return_value={
+                    "dry_run": False,
+                    "page_id": "page-1",
+                    "post_id": "post-1",
+                    "uploaded_photo_ids": ["photo-1"],
+                    "photo_descriptions": [],
+                    "fallback": False,
+                },
+            ) as publish:
+                with patch("app.gui.finish_delivery_cards", return_value=1) as finish:
+                    with patch("app.gui.mark_items_published", return_value=1):
+                        output, ok = AppGUI._task_post_facebook_cards(
+                            app,
+                            cards,
+                            "morning",
+                            dry_run=False,
+                            run_id="2026-08-01:morning",
+                            run_owner="worker-a",
+                        )
+
+        self.assertTrue(ok)
+        claim.assert_called_once()
+        publish.assert_called_once()
+        self.assertTrue(finish.call_args.kwargs["succeeded"])
+        self.assertIn("Facebook published", output)
+
+    def test_scheduled_facebook_uncertain_failure_requires_review(self):
+        app = _gui_stub()
+        app.facebook_page_id_var = _Var("page-1")
+        app.facebook_page_access_token_var = _Var("token")
+        app.facebook_dry_run_var = _Var(False)
+        app.facebook_intro_text_var = _Var("{date}")
+        app._vietnam_now = Mock(return_value=_FakeNow("2026-08-01 07:15"))
+        cards = [
+            {
+                "card_path": "card-1.png",
+                "source_name": "Source",
+                "original_url": "https://example.com/story",
+                "item_key": "url:test",
+            }
+        ]
+
+        with patch("app.gui.claim_delivery_cards", return_value={"claimed": cards, "skipped": []}):
+            with patch("app.gui.publish_photo_post", side_effect=RuntimeError("connection lost")):
+                with patch("app.gui.finish_delivery_cards", return_value=1) as finish:
+                    output, ok = AppGUI._task_post_facebook_cards(
+                        app,
+                        cards,
+                        "morning",
+                        dry_run=False,
+                        run_id="2026-08-01:morning",
+                        run_owner="worker-a",
+                    )
+
+        self.assertFalse(ok)
+        self.assertFalse(finish.call_args.kwargs["succeeded"])
+        self.assertIn("connection lost", output)
+
+    def test_scheduled_facebook_needs_review_is_not_reported_successful(self):
+        app = _gui_stub()
+        app.facebook_page_id_var = _Var("page-1")
+        app.facebook_page_access_token_var = _Var("token")
+        app.facebook_dry_run_var = _Var(False)
+        cards = [
+            {
+                "card_path": "card-1.png",
+                "item_key": "url:test",
+                "source_name": "Source",
+                "original_url": "https://example.com/story",
+            }
+        ]
+        claims = {
+            "claimed": [],
+            "skipped": [{"card": cards[0], "reason": "needs_review"}],
+        }
+
+        with patch("app.gui.claim_delivery_cards", return_value=claims):
+            with patch("app.gui.publish_photo_post") as publish:
+                output, ok = AppGUI._task_post_facebook_cards(
+                    app,
+                    cards,
+                    "morning",
+                    dry_run=False,
+                    run_id="2026-08-01:morning",
+                    run_owner="worker-a",
+                )
+
+        self.assertFalse(ok)
+        self.assertIn("needs_review", output)
+        publish.assert_not_called()
+
     def test_facebook_preview_uses_latest_rendered_cards_without_rendering(self):
         app = _gui_stub()
         selected_result = _selected_result()
@@ -592,7 +734,7 @@ class GuiSelectedSourceTests(unittest.TestCase):
         caption = AppGUI._facebook_intro_text(app, "morning")
 
         self.assertIn("ĐIỂM TIN HÀNG HẢI BUỔI SÁNG", caption)
-        self.assertIn("Cập nhật lúc 07:30 và 19:30 mỗi ngày.", caption)
+        self.assertIn("Cập nhật lúc 07:15 và 19:15 mỗi ngày.", caption)
         self.assertIn("#MaritimeBrief", caption)
 
     def test_facebook_intro_text_uses_evening_caption(self):
@@ -627,7 +769,7 @@ class GuiSelectedSourceTests(unittest.TestCase):
         caption = _render_facebook_intro_text(DEFAULT_FACEBOOK_INTRO_TEXT, "evening")
 
         self.assertIn("ĐIỂM TIN HÀNG HẢI BUỔI TỐI", caption)
-        self.assertIn("Cập nhật lúc 07:30 và 19:30 mỗi ngày.", caption)
+        self.assertIn("Cập nhật lúc 07:15 và 19:15 mỗi ngày.", caption)
         self.assertIn("#MaritimeBrief", caption)
 
     def test_cli_facebook_intro_text_migrates_legacy_default_caption(self):
@@ -673,82 +815,119 @@ class GuiSelectedSourceTests(unittest.TestCase):
         self.assertEqual(settings["publish"]["facebook_group_queue_expiry_hours"], 12)
         self.assertTrue(settings["publish"]["facebook_group_auto_resume_queue"])
 
-    def test_wait_for_sheet_l1_until_matching_current_brief(self):
+    def test_run_now_uses_latest_started_slot_not_future_evening(self):
         app = _gui_stub()
-        app.sheet_url_var = _Var("https://docs.google.com/spreadsheets/d/sheet123/edit?gid=0#gid=0")
-        app._current_scan_label = Mock(return_value="evening")
-        app._vietnam_now = Mock(return_value=_FakeNow("2026-06-18 19:16:00 +07"))
-        app._sleep_with_controls = Mock()
+        app._schedule_now = Mock(return_value=datetime(2026, 8, 1, 12, 0))
+        app._schedule_times = Mock(return_value=["07:15", "19:15"])
 
-        with patch(
-            "app.gui.get_sheet_run_status",
-            side_effect=[
-                {"run_marker": "08:00", "run_label": "morning"},
-                {"run_marker": "19:20", "run_label": "evening"},
-            ],
-        ) as status:
-            result = AppGUI._wait_for_sheet_if_needed(app, "sheet")
+        label, scheduled = AppGUI._latest_started_schedule(app)
 
-        self.assertEqual(status.call_count, 2)
-        app._sleep_with_controls.assert_called_once_with(60)
-        self.assertTrue(result["sheet_ready"])
-        self.assertEqual(result["run_label"], "evening")
+        self.assertEqual(label, "morning")
+        self.assertEqual(scheduled.strftime("%H:%M"), "07:15")
 
-    def test_wait_for_sheet_l1_handles_invalid_marker(self):
-        app = _gui_stub()
-        app.sheet_url_var = _Var("https://docs.google.com/spreadsheets/d/sheet123/edit?gid=0#gid=0")
-        app._current_scan_label = Mock(return_value="morning")
-        app._vietnam_now = Mock(return_value=_FakeNow("2026-06-24 07:30:00 +07"))
-        app._sleep_with_controls = Mock()
-
-        with patch(
-            "app.gui.get_sheet_run_status",
-            side_effect=ValueError("Sheet L1 must contain a valid HH:MM run time."),
-        ):
-            result = AppGUI._wait_for_sheet_if_needed(app, "sheet")
-
-        app._sleep_with_controls.assert_not_called()
-        self.assertFalse(result["sheet_ready"])
-        self.assertEqual(result["run_label"], "invalid")
-        self.assertIn("valid HH:MM", result["sheet_error"])
-
-    def test_sheet_mode_waits_for_fresh_items_before_rendering(self):
+    def test_generate_and_send_sheet_routes_through_coordinator(self):
         app = _gui_stub()
         app.visual_source_mode_var = _Var("sheet")
-        app.sheet_url_var = _Var("https://docs.google.com/spreadsheets/d/sheet123/edit?gid=0#gid=0")
-        app.sheet_limit_var = _Var("20")
-        app.sheet_limit_max_var = _Var(True)
-        app.app_limit_var = _Var("20")
-        app.app_limit_max_var = _Var(True)
-        app.card_limit_var = _Var("12")
-        app.card_limit_max_var = _Var(True)
-        app._optional_limit = Mock(return_value=None)
-        app._visual_settings = Mock(return_value={})
-        app._wait_for_sheet_if_needed = Mock(
-            return_value={"run_marker": "07:30", "run_label": "morning", "sheet_ready": True}
-        )
-        app._sleep_with_controls = Mock()
         app._current_scan_label = Mock(return_value="morning")
-        empty_result = _combined_result([], already_published=10, selected_total=0)
-        fresh_result = _combined_result([{"title": "Tin mới", "original_url": "https://example.com/new"}], selected_total=1)
+        app._latest_started_schedule = Mock(return_value=("morning", datetime(2026, 8, 1, 7, 15)))
+        app._task_run_scheduled_brief = Mock(return_value=("coordinated", True))
+        app._refresh_app_source_if_selected = Mock(side_effect=AssertionError("legacy path must not run"))
 
-        with patch("app.gui.build_combined_brief", side_effect=[empty_result, fresh_result]) as build:
-            with patch(
-                "app.gui.generate_image_cards",
-                return_value={
-                    "items": 1,
-                    "output_dir": "cards",
-                    "manifest_path": "cards/manifest.json",
-                    "preview_path": "cards/preview.html",
-                    "cards": ["card-1.png"],
-                },
-            ) as render:
-                result = AppGUI._generate_combined_cards_result(app)
+        result = AppGUI._task_generate_and_send_combined_cards(app)
 
-        self.assertEqual(build.call_count, 2)
-        app._sleep_with_controls.assert_called_once_with(60)
-        render.assert_called_once()
-        self.assertEqual(result["cards_result"]["items"], 1)
+        self.assertEqual(result, ("coordinated", True))
+        app._task_run_scheduled_brief.assert_called_once_with("morning")
+        app._refresh_app_source_if_selected.assert_not_called()
+
+    def test_scheduled_resume_publishing_does_not_rebuild_brief(self):
+        app = _gui_stub()
+        app.settings = {"orchestration": {}}
+        app.sheet_url_var = _Var("sheet")
+        app._schedule_now = Mock(return_value=datetime(2026, 8, 1, 8, 0))
+        app._schedule_times = Mock(return_value=["07:15", "19:15"])
+        app.active_news_run = None
+        resumed = _selected_result()
+        resumed.update(
+            {
+                "run_id": "2026-08-01:morning",
+                "run_owner": "worker-a",
+                "publish_plan": {"version": 1},
+            }
+        )
+        app._resume_orchestrated_cards_result = Mock(return_value=resumed)
+        app._generate_orchestrated_cards_result = Mock(side_effect=AssertionError("must not rebuild"))
+        app._run_selected_completion_actions = Mock(return_value=([], True))
+        decision = {
+            "run_id": "2026-08-01:morning",
+            "owner": "worker-a",
+            "lane": "primary",
+            "state": "PUBLISHING",
+            "action": "selected",
+            "reason": "recovered",
+        }
+
+        with patch("app.gui.select_scheduled_lane", return_value=decision):
+            with patch("app.gui.maintain_news_run_lease", return_value=nullcontext()):
+                with patch("app.gui.update_scheduled_run"):
+                    _output, ok = AppGUI._task_run_scheduled_brief(app, "morning")
+
+        self.assertTrue(ok)
+        app._resume_orchestrated_cards_result.assert_called_once_with(decision, "morning")
+        app._generate_orchestrated_cards_result.assert_not_called()
+
+    def test_reconciled_failed_run_is_healthy_in_gui(self):
+        app = _gui_stub()
+        app.settings = {"orchestration": {}}
+        app.sheet_url_var = _Var("sheet")
+        app._schedule_now = Mock(return_value=datetime(2026, 8, 1, 8, 0))
+        app._schedule_times = Mock(return_value=["07:15", "19:15"])
+        decision = {
+            "run_id": "2026-08-01:morning",
+            "state": "FAILED",
+            "action": "terminal",
+            "record": {
+                "stats": {"publish_reconciliation": {"status": "succeeded"}}
+            },
+        }
+
+        with patch("app.gui.select_scheduled_lane", return_value=decision):
+            output, ok = AppGUI._task_run_scheduled_brief(app, "morning")
+
+        self.assertTrue(ok)
+        self.assertIn("publishing reconciled", output)
+
+    def test_scheduled_resume_fails_closed_when_frozen_manifest_is_missing(self):
+        app = _gui_stub()
+        decision = {"run_id": "2026-08-01:morning", "owner": "worker-a"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir) / "output" / "runs" / "2026-08-01_morning"
+            run_dir.mkdir(parents=True)
+            (run_dir / "combined_brief.json").write_text(
+                '{"run_id":"2026-08-01:morning","stats":{},'
+                '"publish_plan":{"version":1}}',
+                encoding="utf-8",
+            )
+            with patch("app.gui.ROOT_DIR", Path(temp_dir)):
+                with patch(
+                    "app.gui.load_image_cards_result",
+                    side_effect=FileNotFoundError("manifest missing"),
+                ):
+                    with patch("app.gui.generate_image_cards") as render:
+                        with self.assertRaisesRegex(ValueError, "frozen card manifest"):
+                            AppGUI._resume_orchestrated_cards_result(app, decision, "morning")
+
+        render.assert_not_called()
+
+    def test_direct_sheet_publish_cannot_bypass_coordinator(self):
+        for source_mode in ("sheet", "combined"):
+            with self.subTest(source_mode=source_mode):
+                app = _gui_stub()
+                app.visual_source_mode_var = _Var(source_mode)
+                with patch("app.gui.build_combined_brief") as build:
+                    with self.assertRaisesRegex(RuntimeError, "coordinator"):
+                        AppGUI._generate_combined_cards_result(app, test_mode=False)
+
+                build.assert_not_called()
 
     def test_telegram_intro_text_prefixes_vietnamese_brief_label(self):
         app = _gui_stub()
@@ -788,6 +967,70 @@ class GuiSelectedSourceTests(unittest.TestCase):
         app._task_send_cards.assert_called_once_with(["card-1.png"], "evening")
         app._task_post_facebook_cards.assert_called_once_with(["card-1.png"], "evening", dry_run=True)
         app._task_post_facebook_groups_cards.assert_called_once_with(["card-1.png"], "evening", dry_run=True)
+
+    def test_scheduled_completion_uses_frozen_publish_plan(self):
+        app = _gui_stub()
+        app._task_send_cards = Mock(return_value=("telegram sent", True))
+        plan = {
+            "version": 1,
+            "send_telegram": True,
+            "telegram_chat_ids": ["frozen-chat"],
+            "telegram_intro_text": "Frozen {date}",
+            "post_facebook": False,
+            "post_facebook_groups": False,
+        }
+
+        lines, ok = AppGUI._run_selected_completion_actions(
+            app,
+            _selected_result(),
+            run_id="2026-08-01:morning",
+            run_owner="worker-a",
+            publish_plan=plan,
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(lines, ["telegram sent"])
+        app._task_send_cards.assert_called_once_with(
+            ["card-1.png"],
+            "evening",
+            run_id="2026-08-01:morning",
+            run_owner="worker-a",
+            chat_ids=["frozen-chat"],
+            intro_template="Frozen {date}",
+            fence_run=True,
+        )
+
+    def test_scheduled_facebook_groups_receive_run_fence(self):
+        app = _gui_stub()
+        app._task_post_facebook_groups_cards = Mock(return_value=("groups posted", True))
+        plan = {
+            "version": 1,
+            "send_telegram": False,
+            "post_facebook": False,
+            "post_facebook_groups": True,
+            "facebook_group_dry_run": False,
+            "facebook_groups": [],
+        }
+
+        lines, ok = AppGUI._run_selected_completion_actions(
+            app,
+            _selected_result(),
+            run_id="2026-08-01:morning",
+            run_owner="worker-a",
+            publish_plan=plan,
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(lines, ["groups posted"])
+        app._task_post_facebook_groups_cards.assert_called_once_with(
+            ["card-1.png"],
+            "evening",
+            dry_run=False,
+            publish_plan=plan,
+            run_id="2026-08-01:morning",
+            run_owner="worker-a",
+            fence_run=True,
+        )
 
 
 def _gui_stub():

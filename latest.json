@@ -1,13 +1,13 @@
 {
-  "version": "1.1.3",
-  "release_date": "2026-07-26",
-  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.1.3/BV-maritime-intelligence-hub.exe",
+  "version": "1.1.4",
+  "release_date": "2026-08-02",
+  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.1.4/BV-maritime-intelligence-hub.exe",
   "changelog": [
-    "Fall back automatically from Google Sheets to approved maritime RSS, Google News RSS, and self-hosted RSSHub feeds.",
-    "Add Vietnamese-source exclusion, Jina/Trafilatura/BeautifulSoup article extraction, and source provenance tracking.",
-    "Add Gemini, Groq, and OpenRouter API settings with validated automatic provider failover.",
-    "Let Generate Test ignore Sheet time windows so each processing step can be checked at any time.",
-    "Continue selected Telegram and Facebook completion actions automatically after backup rendering."
+    "Coordinate primary Google Sheets and backup feeds with one run_id, a 30-minute deadline, and a permanently latched source lane.",
+    "Validate the L:Q Sheet completion protocol and stop cleanly with NO_NEW_CONTENT instead of rendering stale or already-published news.",
+    "Prevent duplicate Telegram, Facebook Page, and Facebook Group delivery with SQLite leases, per-destination claims, and audited recovery.",
+    "Add headless scheduled, status, review-resolution, and controlled publish-retry commands with atomic run-scoped artifacts.",
+    "Standardize the production schedule at 07:15 and 19:15 Asia/Bangkok and bundle both source masters plus Playwright Chromium."
   ],
   "force_update": false
 }

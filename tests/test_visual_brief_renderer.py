@@ -8,6 +8,7 @@ from app.cli import run_cli
 from app.services.visual_brief_renderer import (
     extract_image_url,
     generate_image_cards,
+    load_image_cards_result,
     render_card_html,
     render_html_to_png,
     resolve_card_image,
@@ -15,6 +16,30 @@ from app.services.visual_brief_renderer import (
 
 
 class VisualBriefRendererTests(unittest.TestCase):
+    def test_load_image_cards_result_reuses_completed_manifest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir) / "visual"
+            run_dir.mkdir()
+            card_path = run_dir / "card_01.png"
+            card_path.write_bytes(b"png")
+            preview_path = run_dir / "preview.html"
+            preview_path.write_text("preview", encoding="utf-8")
+            (run_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "brief_type": "combined",
+                        "preview_path": str(preview_path),
+                        "cards": [{"item_key": "url:test", "card_path": str(card_path)}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = load_image_cards_result(run_dir)
+
+        self.assertEqual(result["items"], 1)
+        self.assertEqual(result["cards"][0]["item_key"], "url:test")
+
     def test_extract_image_url_prefers_og_image(self):
         html = """
         <html><head>

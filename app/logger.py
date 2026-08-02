@@ -1,5 +1,6 @@
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
@@ -11,10 +12,14 @@ else:
 LOG_DIR = ROOT_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-logging.basicConfig(
-    filename=LOG_DIR / "application.log",
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+_file_handler = RotatingFileHandler(
+    LOG_DIR / "application.log",
+    maxBytes=10 * 1024 * 1024,
+    backupCount=7,
+    encoding="utf-8",
 )
+_file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler])
 
 logger = logging.getLogger("app")

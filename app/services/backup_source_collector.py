@@ -3,11 +3,11 @@
 import csv
 import time
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 
-from app.config import ROOT_DIR
+from app.config import ensure_runtime_seed
 from app.services.rss_collector import fetch_rss_source, parse_rss_items
 from app.services.article_reader import read_article
 from app.services.source_policy import filter_sources
@@ -16,7 +16,7 @@ from app.services.storage import log_fetch, upsert_article, utc_now
 from app.services.storage import sync_sources
 
 
-DEFAULT_BACKUP_FEED_MASTER = ROOT_DIR / "BACKUP_FEED_MASTER.csv"
+DEFAULT_BACKUP_FEED_MASTER = ensure_runtime_seed("BACKUP_FEED_MASTER.csv")
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
 
 
@@ -32,11 +32,20 @@ def build_backup_feed_plan(
 ):
     rows = [row for row in load_backup_feeds(feed_master) if str(row.get("Enabled", "")).lower() == "yes"]
     plan = []
-    if official_sources:
-        official = [row for row in official_sources if str(row.get("RSS", "")).lower() in {"yes", "partial"}]
+    official_config = next((row for row in rows if row.get("Provider") == "official_rss"), None)
+    if official_sources and official_config:
+        allowed_domains = _configured_domains(official_config.get("Website/Domain"))
+        official = [
+            row
+            for row in official_sources
+            if str(row.get("RSS", "")).lower() in {"yes", "partial"}
+            and str(row.get("Status", "Active")).lower() == "active"
+            and (not allowed_domains or _domain_allowed(row.get("Website"), allowed_domains))
+        ]
         official, _ = filter_sources(official, exclude_vietnam=exclude_vietnam)
         for source in official:
-            mapped = {
+            mapped = dict(source)
+            mapped.update({
                 "id": source.get("ID") or source.get("id"),
                 "name": source.get("Source Name") or source.get("name"),
                 "website": source.get("Website") or source.get("website"),
@@ -44,8 +53,14 @@ def build_backup_feed_plan(
                 "country": source.get("Country") or source.get("country"),
                 "language": source.get("Language") or source.get("language"),
                 "category": source.get("Category") or source.get("category"),
-            }
-            plan.append({"provider": "official_rss", "source": mapped, "max_items": 10})
+            })
+            plan.append(
+                {
+                    "provider": "official_rss",
+                    "source": mapped,
+                    "max_items": int(official_config.get("Max Items") or 10),
+                }
+            )
     for row in rows:
         if row.get("Provider") == "official_rss":
             continue
@@ -87,7 +102,7 @@ def collect_backup_news(
         if provider == "google_news_rss":
             source["rss_url"] = GOOGLE_NEWS_RSS.format(query=quote(source.get("query") or "maritime shipping"))
         elif provider == "rsshub" and not source.get("rss_url"):
-            results.append(_result(source, provider, "skipped: RSSHub feed URL is empty"))
+            results.append(_result(source, provider, "RSSHub feed URL is empty", status="error"))
             continue
         result = None
         for attempt in range(1, max(1, retry_attempts) + 1):
@@ -112,20 +127,20 @@ def _storage_source(source, provider):
         "Website": website,
         "Country": source.get("country") or "Global",
         "Language": source.get("language") or "EN",
-        "Type": "Media",
+        "Type": source.get("Type") or "Media",
         "Category": source.get("category") or "Shipping News",
-        "Priority": "P1",
-        "RSS": "Yes",
-        "API": "No",
-        "Crawl Method": "RSS",
-        "Frequency": "Hourly",
-        "Audience": "All",
-        "Content Quality Score": "8",
-        "Business Value Score": "8",
-        "Crawl Difficulty": "Easy",
-        "Copyright Risk": "Medium",
-        "AI Summary Enabled": "Yes",
-        "Status": "Active",
+        "Priority": source.get("Priority") or "P1",
+        "RSS": source.get("RSS") or "Yes",
+        "API": source.get("API") or "No",
+        "Crawl Method": source.get("Crawl Method") or "RSS",
+        "Frequency": source.get("Frequency") or "Hourly",
+        "Audience": source.get("Audience") or "All",
+        "Content Quality Score": source.get("Content Quality Score") or "8",
+        "Business Value Score": source.get("Business Value Score") or "8",
+        "Crawl Difficulty": source.get("Crawl Difficulty") or "Easy",
+        "Copyright Risk": source.get("Copyright Risk") or "Medium",
+        "AI Summary Enabled": source.get("AI Summary Enabled") or "Yes",
+        "Status": source.get("Status") or "Active",
     }
 
 
@@ -143,6 +158,7 @@ def _collect_one(source, provider, limit, db_path, session):
         response.raise_for_status()
         items = parse_rss_items(response.text, source, feed_url=source.get("rss_url"))
         inserted = 0
+        accepted_items = []
         for item in items[:limit]:
             if provider == "google_news_rss" and item.get("url"):
                 resolved = _resolve_url(item["url"], session)
@@ -163,8 +179,9 @@ def _collect_one(source, provider, limit, db_path, session):
                 item["reader_error"] = "; ".join(extracted["errors"])
             _, created = upsert_article(item, db_path=db_path) if db_path else upsert_article(item)
             inserted += int(created)
-        result = _result(source, provider, f"Fetched {len(items[:limit])} items, inserted {inserted}")
-        result.update({"fetched": len(items[:limit]), "inserted": inserted, "items": items[:limit]})
+            accepted_items.append(item)
+        result = _result(source, provider, f"Fetched {len(accepted_items)} usable items, inserted {inserted}")
+        result.update({"fetched": len(accepted_items), "inserted": inserted, "items": accepted_items})
         return result
     except Exception as exc:
         message = str(exc)
@@ -198,3 +215,16 @@ def _result(source, provider, message, status="ok"):
         "fetched": 0,
         "inserted": 0,
     }
+
+
+def _configured_domains(value):
+    return {
+        urlparse(part.strip() if "://" in part else f"https://{part.strip()}").netloc.lower().removeprefix("www.")
+        for part in str(value or "").split(";")
+        if part.strip()
+    }
+
+
+def _domain_allowed(value, allowed_domains):
+    domain = urlparse(str(value or "")).netloc.lower().removeprefix("www.")
+    return any(domain == allowed or domain.endswith(f".{allowed}") for allowed in allowed_domains)

@@ -1,52 +1,52 @@
 # DATABASE_SCHEMA.md
 
-## Purpose
+## Runtime database
 
-Plan the database before implementation.
+The current single-machine deployment uses `data/mih.db` (SQLite). Every connection enables foreign keys, WAL mode, and a 5-second busy timeout. Run and delivery claims use `BEGIN IMMEDIATE` so two processes cannot own the same scheduled work.
 
-## Core Tables
+PostgreSQL is a future migration only when collection or publishing runs on multiple machines. The coordinator contract and identifiers must remain unchanged so that migration does not alter business behavior.
 
-### sources
+## Intelligence tables
 
-Stores source master data, status, crawl settings, quality scores, and legal notes.
+- `sources`: source master data, crawl configuration, quality scores, status, and legal notes.
+- `articles`: source-linked metadata, canonical URL, normalized title/title hash, timestamps, extraction metadata, scores, and processing status.
+- `article_summaries`: AI headline, Vietnamese summary, impact note, category, score, provider/model, prompt version, and fallback diagnostics.
+- `briefs`: generated Morning, Evening, and Weekly brief payloads.
+- `fetch_logs`: isolated source fetch results and errors.
+- `trend_keywords`: curated or fetched trend signals used during scoring.
+- `published_items`: legacy cross-run item ledger used to prevent reposting already-published content.
 
-### articles
+## Scheduled run ownership
 
-Stores article metadata including source ID, title, URL, published time, fetched time, language, and dedup hash.
+### `news_runs`
 
-### article_contents
+One row owns one logical slot. `run_id` is the primary key and has the form `YYYY-MM-DD:morning` or `YYYY-MM-DD:evening` in `Asia/Bangkok`.
 
-Stores cleaned excerpt or limited content required for AI processing.
+Important fields are `lane`, `state`, `owner`, `deadline`, `lease_expires_at`, `heartbeat_at`, `error_code`, `stats_json`, and lifecycle timestamps. `lane` remains null while waiting and becomes exactly `primary` or `backup` once selected; it must not switch afterward.
 
-### article_summaries
+Allowed states are:
 
-Stores AI output, category, importance score, impact note, model, prompt version, and token usage.
-It also stores the selected provider, optional image prompt, and fallback errors.
+```text
+WAIT_PRIMARY
+  -> PRIMARY_SELECTED | BACKUP_SELECTED
+  -> RENDERING
+  -> PUBLISHING
+  -> SUCCEEDED | NO_NEW_CONTENT | FAILED
+```
 
-### briefs
+`NO_NEW_CONTENT` is a successful terminal decision: the chosen lane completed, but nothing remains after validation/deduplication. It must not trigger backup. A worker renews the default 300-second lease every 30 seconds. Another worker may reclaim only an expired active run. An operator-approved `publish-run` retry takes a separate exclusive lease on the terminal row and appends its reconciliation result to `stats_json` without rewriting the historical terminal state.
 
-Stores generated Morning, Evening, and Weekly briefs.
+### `publish_deliveries`
 
-### brief_items
+One row represents one item sent to one destination on one channel. The unique key `(run_id, item_key, channel, destination)` makes delivery creation idempotent. Status is `sending`, `succeeded`, `failed`, or `needs_review`; attempt, lease, payload, result, and error fields support channel-independent recovery.
 
-Links selected articles to briefs with ordering and editorial notes.
+The worker must claim the row before calling Telegram, a Facebook Page, or a Facebook Group. Scheduled claims renew and verify the owning run lease immediately before delivery. A stale `sending` row becomes `needs_review`, because the external service may have accepted the request before the process stopped; it is never resent automatically without confirmation. `resolve-delivery` records reviewer, note, timestamp, and either confirmed success or permission to retry. Confirmed success also writes `published_items` so a later run cannot repost it; `publish-run` performs an explicitly approved retry from the frozen run output under an exclusive terminal-run lease.
 
-### fetch_logs
+### Facebook Group delivery tables
 
-Stores each source fetch attempt, status, error, and duration.
+- `facebook_group_deliveries`: one group delivery per content batch, with queue, expiry, priority, attempt, moderation state, owner, lease, and quota reservation token. Unique `(batch_id, group_id)` plus an atomic `sending` claim prevents two GUI/CLI processes from opening the same group post. An expired in-flight claim becomes `needs_review`.
+- `facebook_group_attempts`: append-only attempt/quota log. A `reserved` row is created in the same `BEGIN IMMEDIATE` transaction as the delivery claim, then finalized or released, so concurrent batches cannot exceed the Vietnam-calendar-day limit. Cancel after operator review records `cancelled/confirmed_no_post`, clears the delivery token, and releases quota; dry-runs and login-only failures do not consume quota.
 
-### dedup_matches
+## Migration policy
 
-Stores duplicate relationships and matching reason.
-
-### facebook_group_deliveries
-
-Stores one delivery per Facebook Group and content batch. The unique `(batch_id, group_id)` pair prevents duplicate submissions. Status values include `queued`, `published`, `pending`, `failed`, `needs_login`, `expired`, and `cancelled`. Scheduling time, expiry, group priority, attempt count, safety stop reason, saved publish payload, and an optional post URL support quota enforcement, rotation, selected retry, and queue recovery.
-
-### facebook_group_attempts
-
-Append-only log of real publish attempts used to enforce the Vietnam-calendar-day quota correctly, including repeated manual retries of the same delivery. Dry-runs, queued rows, and login-only failures do not consume quota.
-
-## MVP Database Choice
-
-Use PostgreSQL for the real service. SQLite may be used only for quick local prototype work if it does not change the schema design.
+`init_db()` creates missing tables and indexes without deleting existing rows. Additive column migrations run under a SQLite write lock, re-check schema after contention, and retry the WAL transition within `busy_timeout`. Existing `published_items` and Facebook ledgers are retained; a release must test concurrent opening of an existing database as well as creating a clean database.

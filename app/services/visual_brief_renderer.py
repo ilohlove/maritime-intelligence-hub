@@ -2,7 +2,9 @@ import base64
 import hashlib
 import html
 import json
+import os
 import re
+import uuid
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -51,7 +53,7 @@ def generate_image_cards(
     payload = load_brief_payload(source_path)
     all_items = payload.get("items", [])
     items = all_items if limit is None else all_items[: max(1, int(limit or 12))]
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_dir = Path(output_dir or DEFAULT_VISUAL_BRIEF_DIR / brief_type / timestamp)
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -100,6 +102,52 @@ def generate_image_cards(
 
     return {
         "brief_type": brief_type,
+        "items": len(cards),
+        "output_dir": run_dir,
+        "manifest_path": manifest_path,
+        "preview_path": preview_path,
+        "cards": cards,
+    }
+
+
+def load_image_cards_result(output_dir):
+    """Load a completed atomic render so a PUBLISHING run can resume safely."""
+    run_dir = Path(output_dir)
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Visual manifest not found: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Visual manifest is invalid JSON: {manifest_path}") from exc
+
+    raw_cards = manifest.get("cards")
+    if not isinstance(raw_cards, list) or not raw_cards:
+        raise ValueError(f"Visual manifest contains no cards: {manifest_path}")
+    cards = []
+    missing = []
+    for raw_card in raw_cards:
+        if not isinstance(raw_card, dict):
+            raise ValueError(f"Visual manifest contains an invalid card: {manifest_path}")
+        card = dict(raw_card)
+        card_path = Path(str(card.get("card_path") or ""))
+        if not card_path.exists():
+            local_path = run_dir / card_path.name
+            card_path = local_path if local_path.exists() else card_path
+        if not card_path.exists():
+            missing.append(str(card_path))
+        card["card_path"] = str(card_path)
+        cards.append(card)
+    if missing:
+        raise FileNotFoundError("Rendered card files are missing: " + ", ".join(missing))
+
+    preview_path = Path(str(manifest.get("preview_path") or run_dir / "preview.html"))
+    if not preview_path.exists():
+        local_preview = run_dir / preview_path.name
+        if local_preview.exists():
+            preview_path = local_preview
+    return {
+        "brief_type": manifest.get("brief_type") or "combined",
         "items": len(cards),
         "output_dir": run_dir,
         "manifest_path": manifest_path,
@@ -234,7 +282,7 @@ def download_image(image_url, session=None, cache_dir=DEFAULT_IMAGE_CACHE_DIR, f
             raise ValueError("Image is larger than 10 MB")
         chunks.append(chunk)
 
-    image_path.write_bytes(b"".join(chunks))
+    _atomic_write_bytes(image_path, b"".join(chunks))
     return image_path, content_type
 
 
@@ -450,18 +498,25 @@ def render_html_to_png(card_html, output_path):
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(
+        f".{output_path.stem}.{os.getpid()}.{uuid.uuid4().hex}{output_path.suffix or '.png'}"
+    )
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch()
             page = browser.new_page(viewport={"width": CARD_WIDTH, "height": CARD_HEIGHT}, device_scale_factor=1)
             page.set_content(card_html, wait_until="networkidle")
             page.evaluate("fitCard()")
-            page.screenshot(path=str(output_path), full_page=False)
+            page.screenshot(path=str(temporary), full_page=False)
             browser.close()
+        os.replace(temporary, output_path)
     except PlaywrightError as exc:
         raise RuntimeError(
             "Playwright Chromium is not installed. Run `python -m playwright install chromium`."
         ) from exc
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def write_manifest(run_dir, payload, source_path, cards, preview_path):
@@ -469,12 +524,15 @@ def write_manifest(run_dir, payload, source_path, cards, preview_path):
         "brief_type": payload.get("brief_type"),
         "title": payload.get("title"),
         "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+        "run_id": payload.get("run_id"),
+        "selected_lane": payload.get("selected_lane"),
+        "preview_only": bool(payload.get("preview_only")),
         "source_brief_json": str(Path(source_path)),
         "preview_path": str(Path(preview_path)),
         "cards": cards,
     }
     path = Path(run_dir) / "manifest.json"
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_text(path, json.dumps(manifest, ensure_ascii=False, indent=2))
     return path
 
 
@@ -502,8 +560,32 @@ img {{ width: 100%; border: 1px solid #cbd5e1; background: white; }}
 </body>
 </html>"""
     path = Path(run_dir) / "preview.html"
-    path.write_text(preview, encoding="utf-8")
+    _atomic_write_text(path, preview)
     return path
+
+
+def _atomic_write_text(path, content):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _atomic_write_bytes(path, content):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_bytes(content)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def image_to_data_uri(path, mime_type):

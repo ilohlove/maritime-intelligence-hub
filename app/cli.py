@@ -1,10 +1,36 @@
 import argparse
+import json
+import os
 import sys
+import uuid
+from datetime import datetime, timedelta, timezone
 
+from app.config import ROOT_DIR, validate_runtime_seeds
 from app.logger import logger
-from app.services.combined_brief_source import DEFAULT_COMBINED_BRIEF_PATH, build_combined_brief, format_combined_stats
+from app.services.business_logic import (
+    build_publish_plan,
+    claim_delivery_cards,
+    delivery_claim_blockers,
+    due_scheduled_slot,
+    FacebookGroupDeliveryGuard,
+    finish_delivery_cards,
+    maintain_news_run_lease,
+    maintain_terminal_news_run_lease,
+    news_run_directory_name,
+    scheduled_datetime,
+    select_scheduled_lane,
+    update_scheduled_run,
+)
+from app.services.combined_brief_source import (
+    DEFAULT_COMBINED_BRIEF_PATH,
+    build_combined_brief,
+    format_empty_combined_message,
+    format_combined_stats,
+    write_json_atomic,
+)
 from app.services.evernote_summarizer import summarize_article_id_with_evernote, summarize_candidates_with_evernote
 from app.services.facebook_publisher import publish_photo_post, validate_cards_publish_safety
+from app.services.facebook_group_publisher import publish_to_groups, validate_group_config
 from app.services.pipeline import (
     DEFAULT_SOURCE_MASTER,
     build_fetch_plan,
@@ -20,9 +46,25 @@ from app.services.pipeline import (
     validate_sources,
     write_brief,
 )
-from app.services.runtime_settings import load_ai_env, load_runtime_settings, render_facebook_intro_text
-from app.services.storage import mark_items_published
-from app.services.visual_brief_renderer import generate_image_cards
+from app.services.runtime_settings import (
+    facebook_brief_label_text,
+    load_ai_env,
+    load_runtime_settings,
+    render_facebook_intro_text,
+)
+from app.services.storage import (
+    DEFAULT_DB_PATH,
+    TERMINAL_RUN_STATES,
+    claim_terminal_news_run_lease,
+    get_news_run,
+    list_news_runs,
+    list_publish_deliveries,
+    mark_items_published,
+    release_terminal_news_run_lease,
+    resolve_publish_delivery,
+)
+from app.services.telegram_publisher import send_message, send_photos
+from app.services.visual_brief_renderer import generate_image_cards, load_image_cards_result
 
 
 def run_cli(argv=None):
@@ -112,6 +154,23 @@ def run_cli(argv=None):
     scan_parser.add_argument("--min-score", type=int, default=6)
     scan_parser.add_argument("--force-summary", action="store_true")
     scan_parser.add_argument("--retry-attempts", type=int, default=1)
+
+    scheduled_parser = subparsers.add_parser("run-scheduled")
+    scheduled_parser.add_argument("--slot", default="auto", choices=["auto", "morning", "evening"])
+    scheduled_parser.add_argument("--dry-run", action="store_true")
+
+    status_parser = subparsers.add_parser("news-status")
+    status_parser.add_argument("--run-id")
+    status_parser.add_argument("--limit", type=int, default=20)
+
+    resolve_parser = subparsers.add_parser("resolve-delivery")
+    resolve_parser.add_argument("--id", type=int, required=True)
+    resolve_parser.add_argument("--resolution", required=True, choices=["succeeded", "retry"])
+    resolve_parser.add_argument("--reviewer", required=True)
+    resolve_parser.add_argument("--note", required=True)
+
+    publish_run_parser = subparsers.add_parser("publish-run")
+    publish_run_parser.add_argument("--run-id", required=True)
 
     subparsers.add_parser("self-test")
 
@@ -258,6 +317,18 @@ def run_cli(argv=None):
         result = _run_scan(args)
         return 0 if result else 1
 
+    if args.command == "run-scheduled":
+        return _run_scheduled(args)
+
+    if args.command == "news-status":
+        return _news_status(args)
+
+    if args.command == "resolve-delivery":
+        return _resolve_delivery(args)
+
+    if args.command == "publish-run":
+        return _publish_run(args)
+
     if args.command == "generate-image-cards":
         result = generate_image_cards(
             args.type,
@@ -287,6 +358,568 @@ def run_cli(argv=None):
         return 0 if outcome.wasSuccessful() else 1
 
     return 1
+
+
+def _news_status(args):
+    if args.run_id:
+        record = get_news_run(args.run_id, db_path=DEFAULT_DB_PATH)
+        runs = [record] if record else []
+    else:
+        runs = list_news_runs(db_path=DEFAULT_DB_PATH, limit=max(1, int(args.limit or 20)))
+    deliveries = list_publish_deliveries(db_path=DEFAULT_DB_PATH, run_id=args.run_id)
+    if not runs:
+        print("No news runs found.")
+    for run in runs:
+        reconciliation = (run.get("stats") or {}).get("publish_reconciliation") or {}
+        print(
+            f"{run['run_id']} | state={run['state']} | lane={run.get('lane') or '-'} | "
+            f"owner={run.get('owner') or '-'} | deadline={run.get('deadline') or '-'} | "
+            f"reconciliation={reconciliation.get('status') or '-'}"
+        )
+    for delivery in deliveries:
+        print(
+            f"delivery={delivery['id']} | run={delivery['run_id']} | status={delivery['status']} | "
+            f"channel={delivery['channel']} | destination={delivery['destination']} | "
+            f"attempts={delivery['attempt_count']}"
+        )
+    has_attention = any(
+        run.get("state") == "FAILED"
+        and ((run.get("stats") or {}).get("publish_reconciliation") or {}).get("status") != "succeeded"
+        for run in runs
+    ) or any(
+        delivery.get("status") == "needs_review" for delivery in deliveries
+    )
+    return 1 if has_attention else 0
+
+
+def _resolve_delivery(args):
+    resolved = resolve_publish_delivery(
+        args.id,
+        args.resolution,
+        args.reviewer,
+        args.note,
+        db_path=DEFAULT_DB_PATH,
+    )
+    if not resolved:
+        print(f"Delivery {args.id} was not found or is not in needs_review.")
+        return 1
+    print(
+        f"Delivery {resolved['id']} resolved as {args.resolution}; "
+        f"new status={resolved['status']} retryable={bool(resolved['retryable'])}."
+    )
+    return 0
+
+
+def _publish_run(args):
+    validate_runtime_seeds()
+    record = get_news_run(args.run_id, db_path=DEFAULT_DB_PATH)
+    if not record:
+        print(f"News run not found: {args.run_id}")
+        return 1
+    if record.get("state") not in TERMINAL_RUN_STATES:
+        print(
+            f"Run {args.run_id} is still {record.get('state')}; "
+            "use run-scheduled so its lease remains fenced."
+        )
+        return 1
+    try:
+        _date, slot = str(args.run_id).split(":", 1)
+        if slot not in {"morning", "evening"}:
+            raise ValueError
+    except ValueError:
+        print("run_id must use YYYY-MM-DD:morning|evening.")
+        return 1
+
+    settings = load_runtime_settings()
+    orchestration = settings.get("orchestration") or {}
+    lease_seconds = int(orchestration.get("lease_seconds") or 300)
+    heartbeat_seconds = int(orchestration.get("heartbeat_seconds") or 30)
+    owner = f"publish-run:{os.getpid()}:{uuid.uuid4().hex[:12]}"
+    claim = claim_terminal_news_run_lease(
+        args.run_id,
+        owner,
+        db_path=DEFAULT_DB_PATH,
+        lease_seconds=lease_seconds,
+    )
+    if not claim or not claim.get("acquired"):
+        print(
+            f"Run {args.run_id} is already being reconciled by another process "
+            f"({(claim or {}).get('claim_reason') or 'unavailable'})."
+        )
+        return 1
+
+    run_dir = ROOT_DIR / "output" / "runs" / news_run_directory_name(args.run_id)
+    decision = {
+        "run_id": args.run_id,
+        "owner": owner,
+        "lane": record.get("lane"),
+        "action": "retry",
+        "lease_seconds": lease_seconds,
+        "heartbeat_seconds": heartbeat_seconds,
+    }
+    ok = False
+    lines = []
+    error_message = ""
+    try:
+        with maintain_terminal_news_run_lease(decision, db_path=DEFAULT_DB_PATH):
+            stats, cards_result, publish_plan = _resume_scheduled_output(
+                run_dir,
+                args.run_id,
+                settings.get("visual") or {},
+            )
+            ok, lines = _publish_scheduled_cards(
+                cards_result["cards"],
+                slot,
+                decision,
+                settings,
+                publish_plan=publish_plan,
+                fence_run=False,
+                terminal_fence=True,
+            )
+    except Exception as exc:
+        logger.exception("Manual publish-run failed")
+        error_message = str(exc)
+        lines.append(f"Manual publish-run failed: {exc}")
+    finally:
+        released = release_terminal_news_run_lease(
+            args.run_id,
+            owner,
+            db_path=DEFAULT_DB_PATH,
+            reconciliation={
+                "status": "succeeded" if ok else "failed",
+                "error": error_message or ("" if ok else "one_or_more_publish_actions_failed"),
+            },
+        )
+        if released is None:
+            ok = False
+            lines.append("Publish retry lease was lost; reconciliation requires review.")
+
+    if "stats" in locals():
+        print(format_combined_stats(stats, run_dir / "combined_brief.json"))
+    for line in lines:
+        print(line)
+    return 0 if ok else 1
+
+
+def _run_scheduled(args):
+    validate_runtime_seeds()
+    settings = load_runtime_settings()
+    scan = settings.get("scan") or {}
+    visual = settings.get("visual") or {}
+    orchestration = settings.get("orchestration") or {}
+    now_vietnam = datetime.now(timezone(timedelta(hours=7)))
+    if args.slot == "auto":
+        slot, scheduled = due_scheduled_slot(
+            now_vietnam,
+            scan.get("times"),
+            (settings.get("orchestration") or {}).get("catch_up_window_minutes", 120),
+        )
+        if not slot:
+            print("No scheduled news run is due inside the catch-up window.")
+            return 0
+    else:
+        slot = args.slot
+        scheduled = scheduled_datetime(slot, now=now_vietnam, schedule_times=scan.get("times"))
+        if scheduled > now_vietnam:
+            print(
+                f"The {slot} slot has not started yet. "
+                f"Scheduled time: {scheduled.isoformat()}."
+            )
+            return 0
+    decision = None
+    try:
+        decision = select_scheduled_lane(
+            slot,
+            visual.get("sheet_url", ""),
+            scheduled_at=scheduled,
+            schedule_times=scan.get("times"),
+            orchestration=orchestration,
+            db_path=DEFAULT_DB_PATH,
+            wait_callback=lambda status: print(
+                f"Waiting for {status['run_id']}: {status['reason']} "
+                f"({int(status['wait_seconds'])}s)"
+            ),
+        )
+        if decision.get("action") == "terminal":
+            reconciliation = (
+                ((decision.get("record") or {}).get("stats") or {}).get("publish_reconciliation") or {}
+            )
+            reconciled = reconciliation.get("status") == "succeeded"
+            suffix = " (publishing reconciled)" if reconciled else ""
+            print(f"Run {decision['run_id']} already finished: {decision.get('state')}{suffix}")
+            return 1 if decision.get("state") == "FAILED" and not reconciled else 0
+        if decision.get("action") != "selected":
+            print(f"Run {decision['run_id']} is already owned by another process: {decision.get('reason')}")
+            return 0
+
+        with maintain_news_run_lease(decision, db_path=DEFAULT_DB_PATH):
+            run_dir = ROOT_DIR / "output" / "runs" / news_run_directory_name(decision["run_id"])
+            brief_path = run_dir / "combined_brief.json"
+            if decision.get("state") == "PUBLISHING":
+                source_stats, cards_result, publish_plan = _resume_scheduled_output(
+                    run_dir,
+                    decision["run_id"],
+                    visual,
+                )
+            else:
+                update_scheduled_run(decision, "RENDERING", db_path=DEFAULT_DB_PATH)
+                publish_env = load_ai_env()
+                publish_plan = build_publish_plan(
+                    settings.get("publish") or {},
+                    facebook_page_id=publish_env.get("FACEBOOK_PAGE_ID", ""),
+                    dry_run=args.dry_run,
+                )
+                primary = decision["lane"] == "primary"
+                source_result = build_combined_brief(
+                    source_mode="sheet",
+                    sheet_url=visual.get("sheet_url", "") if primary else "",
+                    sheet_limit=None,
+                    app_limit=None,
+                    card_limit=None,
+                    brief_path=brief_path,
+                    db_path=DEFAULT_DB_PATH,
+                    exclude_vietnam=visual.get("exclude_vietnam_sources", False),
+                    sheet_snapshot=decision.get("snapshot") if primary else None,
+                    expected_run_id=decision["run_id"] if primary else None,
+                    allow_backup=not primary,
+                )
+                source_result.stats.update(
+                    {
+                        "run_id": decision["run_id"],
+                        "selected_lane": decision["lane"],
+                        "selection_reason": decision.get("reason") or "",
+                    }
+                )
+                source_result.payload.update(
+                    {
+                        "run_id": decision["run_id"],
+                        "scan_label": slot,
+                        "selected_lane": decision["lane"],
+                        "stats": source_result.stats,
+                        "publish_plan": publish_plan,
+                    }
+                )
+                write_json_atomic(source_result.brief_path, source_result.payload)
+                if not source_result.payload.get("items"):
+                    if decision.get("lane") == "backup" and source_result.stats.get("backup_status") == "failed":
+                        raise RuntimeError(
+                            format_empty_combined_message(source_result.stats, source_result.brief_path)
+                        )
+                    update_scheduled_run(
+                        decision,
+                        "NO_NEW_CONTENT",
+                        stats=source_result.stats,
+                        db_path=DEFAULT_DB_PATH,
+                    )
+                    print(f"Run {decision['run_id']}: NO_NEW_CONTENT")
+                    print(format_combined_stats(source_result.stats, source_result.brief_path))
+                    return 0
+
+                source_stats = source_result.stats
+                cards_result = generate_image_cards(
+                    "combined",
+                    limit=None,
+                    output_dir=run_dir / "visual",
+                    source_brief_path=source_result.brief_path,
+                    style_settings=visual,
+                )
+            update_scheduled_run(decision, "PUBLISHING", stats=source_stats, db_path=DEFAULT_DB_PATH)
+            publish_ok, publish_lines = _publish_scheduled_cards(
+                cards_result["cards"],
+                slot,
+                decision,
+                settings,
+                publish_plan=publish_plan,
+            )
+            update_scheduled_run(
+                decision,
+                "SUCCEEDED" if publish_ok else "FAILED",
+                stats={**source_stats, "publish_ok": publish_ok},
+                error=None if publish_ok else "one_or_more_publish_actions_failed",
+                db_path=DEFAULT_DB_PATH,
+            )
+            print(format_combined_stats(source_stats, brief_path))
+            print(f"Rendered cards: {cards_result['items']} -> {cards_result['output_dir']}")
+            for line in publish_lines:
+                print(line)
+            return 0 if publish_ok else 1
+    except Exception as exc:
+        if decision and decision.get("action") == "selected":
+            update_scheduled_run(
+                decision,
+                "FAILED",
+                error=str(exc),
+                db_path=DEFAULT_DB_PATH,
+                required=False,
+            )
+        logger.exception("Scheduled CLI run failed")
+        print(f"Scheduled run failed: {exc}")
+        return 1
+
+
+def _resume_scheduled_output(run_dir, run_id, _visual_settings):
+    brief_path = run_dir / "combined_brief.json"
+    if not brief_path.exists():
+        raise FileNotFoundError(f"Cannot resume publishing; run brief is missing: {brief_path}")
+    try:
+        payload = json.loads(brief_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Cannot resume publishing; run brief is invalid: {brief_path}") from exc
+    if str(payload.get("run_id") or "") != run_id:
+        raise ValueError(f"Cannot resume publishing; run_id mismatch in {brief_path}")
+    publish_plan = payload.get("publish_plan")
+    if not isinstance(publish_plan, dict) or publish_plan.get("version") != 1:
+        raise ValueError(f"Cannot resume publishing; publish plan is missing from {brief_path}")
+    visual_dir = run_dir / "visual"
+    try:
+        cards_result = load_image_cards_result(visual_dir)
+    except (FileNotFoundError, ValueError) as exc:
+        raise ValueError(
+            f"Cannot resume publishing; frozen card manifest is missing or invalid: {visual_dir}"
+        ) from exc
+    stats = dict(payload.get("stats") or {})
+    stats["resumed_from_state"] = "PUBLISHING"
+    return stats, cards_result, publish_plan
+
+
+def _publish_scheduled_cards(
+    cards,
+    brief_label,
+    decision,
+    settings,
+    dry_run=False,
+    publish_plan=None,
+    fence_run=True,
+    terminal_fence=False,
+):
+    env = load_ai_env()
+    publish = publish_plan or build_publish_plan(
+        settings.get("publish") or {},
+        facebook_page_id=env.get("FACEBOOK_PAGE_ID", ""),
+        dry_run=dry_run,
+    )
+    if publish.get("dry_run"):
+        return True, ["Dry-run: external publishing skipped."]
+
+    lines = []
+    ok = True
+    run_id = decision["run_id"]
+    owner = decision["owner"]
+    chat_ids = list(publish.get("telegram_chat_ids") or [])
+    if publish.get("send_telegram"):
+        token = str(env.get("TELEGRAM_BOT_TOKEN") or "").strip()
+        if not token or not chat_ids:
+            ok = False
+            lines.append("Telegram skipped: token or chat destination is missing.")
+        else:
+            intro = _render_telegram_intro_text(publish.get("telegram_intro_text") or "{date}", brief_label)
+            for chat_id in chat_ids:
+                claims = claim_delivery_cards(
+                    run_id,
+                    cards,
+                    "telegram",
+                    str(chat_id),
+                    owner,
+                    db_path=DEFAULT_DB_PATH,
+                    fence_run=fence_run,
+                    terminal_fence=terminal_fence,
+                )
+                selected = claims["claimed"]
+                blockers = delivery_claim_blockers(claims)
+                if blockers:
+                    ok = False
+                    lines.append(f"Telegram {chat_id}: delivery requires attention - {', '.join(blockers)}")
+                if not selected:
+                    reasons = sorted({str(item.get("reason") or "unknown") for item in claims["skipped"]})
+                    lines.append(f"Telegram {chat_id}: skipped by delivery ledger - {', '.join(reasons)}")
+                    continue
+                try:
+                    if intro:
+                        send_message(token, chat_id, intro)
+                    sent = send_photos(token, chat_id, selected)
+                    finish_delivery_cards(
+                        run_id,
+                        selected,
+                        "telegram",
+                        str(chat_id),
+                        owner,
+                        succeeded=True,
+                        result={"sent_photos": len(sent)},
+                        db_path=DEFAULT_DB_PATH,
+                    )
+                    mark_items_published(selected, telegram_chat_id=str(chat_id), db_path=DEFAULT_DB_PATH)
+                    lines.append(f"Telegram {chat_id}: sent {len(sent)} photos.")
+                except Exception as exc:
+                    finish_delivery_cards(
+                        run_id,
+                        selected,
+                        "telegram",
+                        str(chat_id),
+                        owner,
+                        succeeded=False,
+                        error=exc,
+                        db_path=DEFAULT_DB_PATH,
+                    )
+                    ok = False
+                    lines.append(f"Telegram {chat_id}: failed - {exc}")
+
+    if publish.get("post_facebook"):
+        page_id = str(publish.get("facebook_page_id") or "").strip()
+        token = str(env.get("FACEBOOK_PAGE_ACCESS_TOKEN") or "").strip()
+        facebook_dry_run = bool(publish.get("facebook_dry_run", True))
+        if not page_id or not token:
+            ok = False
+            lines.append("Facebook skipped: page id or access token is missing.")
+        elif facebook_dry_run:
+            lines.append("Facebook configuration is dry-run; external post skipped.")
+        else:
+            claims = claim_delivery_cards(
+                run_id,
+                cards,
+                "facebook_page",
+                page_id,
+                owner,
+                db_path=DEFAULT_DB_PATH,
+                fence_run=fence_run,
+                terminal_fence=terminal_fence,
+            )
+            selected = claims["claimed"]
+            blockers = delivery_claim_blockers(claims)
+            if blockers:
+                ok = False
+                lines.append(f"Facebook: delivery requires attention - {', '.join(blockers)}")
+            if not selected:
+                reasons = sorted({str(item.get("reason") or "unknown") for item in claims["skipped"]})
+                lines.append(f"Facebook: skipped by delivery ledger - {', '.join(reasons)}")
+            else:
+                try:
+                    message = render_facebook_intro_text(publish.get("facebook_intro_text"), brief_label)
+                    result = publish_photo_post(page_id, token, selected, message, dry_run=False)
+                    post_id = str(result.get("post_id") or "")
+                    finish_delivery_cards(
+                        run_id,
+                        selected,
+                        "facebook_page",
+                        page_id,
+                        owner,
+                        succeeded=True,
+                        result={"post_id": post_id},
+                        db_path=DEFAULT_DB_PATH,
+                    )
+                    mark_items_published(
+                        selected,
+                        facebook_page_id=page_id,
+                        facebook_post_id=post_id,
+                        db_path=DEFAULT_DB_PATH,
+                    )
+                    lines.append(f"Facebook published: {post_id or 'unknown post id'}")
+                except Exception as exc:
+                    finish_delivery_cards(
+                        run_id,
+                        selected,
+                        "facebook_page",
+                        page_id,
+                        owner,
+                        succeeded=False,
+                        error=exc,
+                        db_path=DEFAULT_DB_PATH,
+                    )
+                    ok = False
+                    lines.append(f"Facebook failed: {exc}")
+
+    if publish.get("post_facebook_groups"):
+        validation = validate_group_config(publish.get("facebook_groups") or [])
+        if not validation["ready"]:
+            ok = False
+            lines.append("Facebook Groups skipped: invalid configuration.")
+        else:
+            group_guard = FacebookGroupDeliveryGuard(
+                run_id,
+                cards,
+                owner,
+                db_path=DEFAULT_DB_PATH,
+                fence_run=fence_run,
+                terminal_fence=terminal_fence,
+            )
+            try:
+                result = publish_to_groups(
+                    cards,
+                    validation["groups"],
+                    publish.get("facebook_intro_text"),
+                    caption_renderer=lambda template, label: render_facebook_intro_text(template, brief_label=label),
+                    brief_label=brief_label,
+                    dry_run=bool(publish.get("facebook_group_dry_run", True)),
+                    delay_min_seconds=int(publish.get("facebook_group_delay_min_seconds") or 900),
+                    delay_max_seconds=int(publish.get("facebook_group_delay_max_seconds") or 1800),
+                    max_groups_per_brief=int(publish.get("facebook_group_max_per_brief") or 2),
+                    max_groups_per_day=int(publish.get("facebook_group_max_per_day") or 4),
+                    queue_expiry_hours=int(publish.get("facebook_group_queue_expiry_hours") or 12),
+                    manual=terminal_fence,
+                    before_group_publish=group_guard.before_publish,
+                    after_group_publish=group_guard.after_publish,
+                )
+                counts = result.get("counts") or {}
+                unresolved_group_results = []
+                if terminal_fence:
+                    for item in result.get("results") or []:
+                        status = str(item.get("status") or "").lower()
+                        message = str(item.get("message") or "")
+                        safely_skipped = status == "skipped" and message in {
+                            "Already delivered",
+                            "delivery ledger already succeeded",
+                        }
+                        if status in {"failed", "needs_login", "queued"} or (
+                            status == "skipped" and not safely_skipped
+                        ):
+                            unresolved_group_results.append(
+                                f"{item.get('group_name') or 'group'}:{status or 'unknown'}"
+                            )
+                group_ok = (
+                    not counts.get("failed")
+                    and not counts.get("needs_login")
+                    and not group_guard.blockers
+                    and not unresolved_group_results
+                )
+                ok = ok and group_ok
+                if (
+                    not bool(publish.get("facebook_group_dry_run", True))
+                    and int(counts.get("published") or 0) + int(counts.get("pending") or 0) > 0
+                ):
+                    mark_items_published(cards, db_path=DEFAULT_DB_PATH)
+                lines.append(
+                    "Facebook Groups: "
+                    f"published={counts.get('published', 0)} pending={counts.get('pending', 0)} "
+                    f"failed={counts.get('failed', 0)} needs_login={counts.get('needs_login', 0)}"
+                )
+                if group_guard.blockers:
+                    lines.append(
+                        "Facebook Groups delivery requires attention: "
+                        + ", ".join(sorted(set(group_guard.blockers)))
+                    )
+                if unresolved_group_results:
+                    lines.append(
+                        "Facebook Groups retry remains incomplete: "
+                        + ", ".join(unresolved_group_results)
+                    )
+            except Exception as exc:
+                ok = False
+                lines.append(f"Facebook Groups failed: {exc}")
+
+    if not any(
+        [publish.get("send_telegram"), publish.get("post_facebook"), publish.get("post_facebook_groups")]
+    ):
+        lines.append("No external publish action is enabled.")
+    return ok, lines
+
+
+def _render_telegram_intro_text(template, brief_label):
+    raw = str(template or "{date}")
+    rendered = render_facebook_intro_text(raw, brief_label)
+    if "{brief_label}" not in raw:
+        label_text = facebook_brief_label_text(brief_label)
+        if label_text not in rendered:
+            rendered = f"{label_text}\n{rendered}"
+    return rendered
 
 
 def _run_scan(args):

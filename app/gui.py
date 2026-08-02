@@ -10,8 +10,20 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 import requests
 
-from app.config import ROOT_DIR, get_latest_json_url, load_version
+from app.config import ROOT_DIR, get_latest_json_url, load_version, validate_runtime_seeds
 from app.logger import logger
+from app.services.business_logic import (
+    build_publish_plan,
+    claim_delivery_cards,
+    delivery_claim_blockers,
+    FacebookGroupDeliveryGuard,
+    finish_delivery_cards,
+    maintain_news_run_lease,
+    news_run_directory_name,
+    scheduled_datetime,
+    select_scheduled_lane,
+    update_scheduled_run,
+)
 from app.services.pipeline import (
     DEFAULT_SOURCE_MASTER,
     build_fetch_plan,
@@ -38,7 +50,7 @@ from app.services.combined_brief_source import (
     build_combined_brief,
     format_empty_combined_message,
     format_combined_stats,
-    get_sheet_run_status,
+    write_json_atomic,
 )
 from app.services.facebook_publisher import check_page, publish_photo_post, validate_cards_publish_safety
 from app.services.facebook_group_publisher import (
@@ -56,9 +68,21 @@ from app.services.facebook_group_publisher import (
 )
 from app.services.retention import cleanup_runtime_artifacts, cleanup_update_artifacts
 from app.services.source_master import ALLOWED_VALUES, append_manual_source
-from app.services.storage import DEFAULT_DB_PATH, count_rows, init_db, mark_items_published
+from app.services.storage import (
+    DEFAULT_DB_PATH,
+    count_rows,
+    init_db,
+    list_publish_deliveries,
+    mark_items_published,
+    recover_expired_news_runs,
+    recover_stale_publish_deliveries,
+)
 from app.services.telegram_publisher import check_bot, check_chat, send_message, send_photos
-from app.services.visual_brief_renderer import DEFAULT_VISUAL_BRIEF_DIR, generate_image_cards
+from app.services.visual_brief_renderer import (
+    DEFAULT_VISUAL_BRIEF_DIR,
+    generate_image_cards,
+    load_image_cards_result,
+)
 from app.update_manager import download_update, get_update_status
 from app.updater_launcher import launch_updater
 
@@ -71,6 +95,7 @@ LATEST_BRIEF_JSON = BRIEF_DIR / "latest_brief.json"
 
 class AppGUI:
     def __init__(self):
+        validate_runtime_seeds()
         metadata = load_version()
         self.metadata = metadata
         self.settings = load_runtime_settings()
@@ -80,7 +105,23 @@ class AppGUI:
         self.stop_requested = False
         self.update_check_running = False
         self.last_schedule_key = None
+        self.active_news_run = None
         self.action_buttons = []
+
+        recovered_runs = recover_expired_news_runs(DEFAULT_DB_PATH)
+        recovered_deliveries = recover_stale_publish_deliveries(DEFAULT_DB_PATH)
+        review_deliveries = list_publish_deliveries(DEFAULT_DB_PATH, status="needs_review")
+        self.startup_orchestration_warning = ""
+        if review_deliveries:
+            self.startup_orchestration_warning = (
+                f"Attention: {len(review_deliveries)} delivery item(s) need manual review. "
+                "Run `news-status` for details."
+            )
+        elif recovered_runs or recovered_deliveries:
+            self.startup_orchestration_warning = (
+                f"Recovered {recovered_runs} expired run lease(s) and "
+                f"{recovered_deliveries} delivery lease(s)."
+            )
 
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
@@ -107,7 +148,7 @@ class AppGUI:
         visual = self.settings["visual"]
         publish = self.settings["publish"]
 
-        self.status_var = ctk.StringVar(value="Ready")
+        self.status_var = ctk.StringVar(value=self.startup_orchestration_warning or "Ready")
         self.next_run_var = ctk.StringVar(value="Next run: calculating")
         self.summary_var = ctk.StringVar(value="No scan running")
         self.auto_run_var = ctk.BooleanVar(value=bool(scan.get("auto_run_enabled", False)))
@@ -624,6 +665,7 @@ class AppGUI:
                 "retry_attempts": self._int_var(self.ai_retry_attempts_var, 2),
             },
             "visual": self._visual_settings(),
+            "orchestration": dict(self.settings.get("orchestration") or {}),
             "publish": {
                 "create_markdown": self.create_markdown_var.get(),
                 "create_json": self.create_json_var.get(),
@@ -646,7 +688,8 @@ class AppGUI:
                 "facebook_group_dry_run": self.facebook_group_dry_run_var.get(),
             },
         }
-        save_runtime_settings(self.settings)
+        self.settings = save_runtime_settings(self.settings)
+        self.timezone_offset_var.set("+7")
         env_values = {
             "AI_PROVIDER": "chain",
             "AI_PROVIDER_CHAIN": "gemini,groq,openrouter",
@@ -672,7 +715,16 @@ class AppGUI:
 
     def _run_scan_now(self):
         self._save_settings()
-        self._run_background("Waiting for scheduled news scan", self._task_wait_for_scheduled_scan)
+        label, _scheduled = self._latest_started_schedule()
+        if not label:
+            next_run = self._next_scheduled_run()
+            message = "No news slot has started yet today."
+            if next_run:
+                message += f" Next slot: {next_run.strftime('%Y-%m-%d %H:%M')} Asia/Bangkok."
+            messagebox.showinfo("Run Now", message, parent=self.root)
+            return
+        self.scan_label_var.set(label)
+        self._run_background(f"Running {label} news orchestration", lambda: self._task_run_scheduled_brief(label))
 
     def _task_wait_for_scheduled_scan(self):
         due_label, due_key = self._due_schedule()
@@ -708,6 +760,240 @@ class AppGUI:
         self.scan_label_var.set(label)
         output, ok = self._task_run_scan(label)
         return f"{wait_message}\n\n{output}", ok
+
+    def _task_run_scheduled_brief(self, label):
+        orchestration = dict(self.settings.get("orchestration") or {})
+        scheduled = scheduled_datetime(label, now=self._schedule_now(), schedule_times=self._schedule_times())
+        decision = select_scheduled_lane(
+            label,
+            self.sheet_url_var.get().strip(),
+            scheduled_at=scheduled,
+            schedule_times=self._schedule_times(),
+            orchestration=orchestration,
+            db_path=DEFAULT_DB_PATH,
+            sleep_fn=self._sleep_with_controls,
+            wait_callback=self._scheduled_primary_wait_update,
+        )
+        if decision.get("action") == "terminal":
+            reconciliation = (
+                ((decision.get("record") or {}).get("stats") or {}).get("publish_reconciliation") or {}
+            )
+            reconciled = reconciliation.get("status") == "succeeded"
+            return (
+                f"Run {decision.get('run_id')} already finished with state "
+                f"{decision.get('state')}"
+                f"{' (publishing reconciled)' if reconciled else ''}. "
+                "No duplicate work was started.",
+                decision.get("state") != "FAILED" or reconciled,
+            )
+        if decision.get("action") != "selected":
+            return (
+                f"Run {decision.get('run_id')} is owned by another process "
+                f"({decision.get('reason') or 'active lease'}).",
+                True,
+            )
+
+        self.active_news_run = decision
+        try:
+            with maintain_news_run_lease(decision, db_path=DEFAULT_DB_PATH):
+                if decision.get("state") == "PUBLISHING":
+                    result = self._resume_orchestrated_cards_result(decision, label)
+                else:
+                    update_scheduled_run(
+                        decision,
+                        "RENDERING",
+                        stats={"lane": decision["lane"], "selection_reason": decision.get("reason", "")},
+                        db_path=DEFAULT_DB_PATH,
+                    )
+                    result = self._generate_orchestrated_cards_result(decision, label)
+                stats = dict(result["source_stats"])
+                if not result.get("cards_result"):
+                    if decision.get("lane") == "backup" and stats.get("backup_status") == "failed":
+                        raise RuntimeError(format_empty_combined_message(stats, result["brief_path"]))
+                    update_scheduled_run(
+                        decision,
+                        "NO_NEW_CONTENT",
+                        stats=stats,
+                        db_path=DEFAULT_DB_PATH,
+                    )
+                    return self._format_orchestrated_no_content(decision, stats, result["brief_path"]), True
+
+                lines = [
+                    f"Run: {decision['run_id']}",
+                    f"Selected lane: {decision['lane']}",
+                    f"Selection reason: {decision.get('reason') or ''}",
+                    "",
+                    format_combined_stats(stats, result["brief_path"]),
+                    "",
+                    self._format_card_result(result["cards_result"]),
+                ]
+                update_scheduled_run(decision, "PUBLISHING", stats=stats, db_path=DEFAULT_DB_PATH)
+                completion_lines, completion_ok = self._run_selected_completion_actions(
+                    result,
+                    run_id=decision["run_id"],
+                    run_owner=decision["owner"],
+                    publish_plan=result.get("publish_plan"),
+                )
+                if completion_lines:
+                    lines.extend(["", *completion_lines])
+                else:
+                    lines.extend(["", "No publish action selected; render completed without external delivery."])
+                update_scheduled_run(
+                    decision,
+                    "SUCCEEDED" if completion_ok else "FAILED",
+                    stats={**stats, "publish_ok": completion_ok},
+                    error=None if completion_ok else "one_or_more_publish_actions_failed",
+                    db_path=DEFAULT_DB_PATH,
+                )
+                return "\n".join(lines), completion_ok
+        except Exception as exc:
+            update_scheduled_run(
+                decision,
+                "FAILED",
+                error=str(exc),
+                db_path=DEFAULT_DB_PATH,
+                required=False,
+            )
+            raise
+        finally:
+            self.active_news_run = None
+
+    def _generate_orchestrated_cards_result(self, decision, label):
+        run_dir = ROOT_DIR / "output" / "runs" / news_run_directory_name(decision["run_id"])
+        brief_path = run_dir / "combined_brief.json"
+        publish_plan = self._scheduled_publish_plan()
+        primary = decision["lane"] == "primary"
+        source_result = build_combined_brief(
+            source_mode="sheet",
+            sheet_url=self.sheet_url_var.get().strip() if primary else "",
+            sheet_limit=None,
+            app_limit=None,
+            card_limit=None,
+            brief_path=brief_path,
+            db_path=DEFAULT_DB_PATH,
+            exclude_vietnam=self._exclude_vietnam_sources(),
+            sheet_snapshot=decision.get("snapshot") if primary else None,
+            expected_run_id=decision["run_id"] if primary else None,
+            allow_backup=not primary,
+        )
+        source_result.stats["run_id"] = decision["run_id"]
+        source_result.stats["selected_lane"] = decision["lane"]
+        source_result.stats["selection_reason"] = decision.get("reason") or ""
+        source_result.payload["run_id"] = decision["run_id"]
+        source_result.payload["scan_label"] = label
+        source_result.payload["selected_lane"] = decision["lane"]
+        source_result.payload["stats"] = source_result.stats
+        source_result.payload["publish_plan"] = publish_plan
+        write_json_atomic(source_result.brief_path, source_result.payload)
+
+        if not source_result.payload.get("items"):
+            return {
+                "brief_path": source_result.brief_path,
+                "source_stats": source_result.stats,
+                "cards_result": None,
+                "brief_label": label,
+                "run_id": decision["run_id"],
+                "run_owner": decision["owner"],
+                "publish_plan": publish_plan,
+            }
+
+        cards_result = generate_image_cards(
+            "combined",
+            limit=None,
+            output_dir=run_dir / "visual",
+            source_brief_path=source_result.brief_path,
+            style_settings=self._visual_settings(),
+        )
+        return {
+            "brief_path": source_result.brief_path,
+            "source_stats": source_result.stats,
+            "cards_result": cards_result,
+            "brief_label": label,
+            "run_id": decision["run_id"],
+            "run_owner": decision["owner"],
+            "publish_plan": publish_plan,
+        }
+
+    def _resume_orchestrated_cards_result(self, decision, label):
+        run_dir = ROOT_DIR / "output" / "runs" / news_run_directory_name(decision["run_id"])
+        brief_path = run_dir / "combined_brief.json"
+        if not brief_path.exists():
+            raise FileNotFoundError(f"Cannot resume publishing; run brief is missing: {brief_path}")
+        try:
+            payload = json.loads(brief_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Cannot resume publishing; run brief is invalid: {brief_path}") from exc
+        if str(payload.get("run_id") or "") != decision["run_id"]:
+            raise ValueError(f"Cannot resume publishing; run_id mismatch in {brief_path}")
+        publish_plan = payload.get("publish_plan")
+        if not isinstance(publish_plan, dict) or publish_plan.get("version") != 1:
+            raise ValueError(f"Cannot resume publishing; publish plan is missing from {brief_path}")
+        visual_dir = run_dir / "visual"
+        try:
+            cards_result = load_image_cards_result(visual_dir)
+        except (FileNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"Cannot resume publishing; frozen card manifest is missing or invalid: {visual_dir}"
+            ) from exc
+        stats = dict(payload.get("stats") or {})
+        stats["resumed_from_state"] = "PUBLISHING"
+        return {
+            "brief_path": brief_path,
+            "source_stats": stats,
+            "cards_result": cards_result,
+            "brief_label": label,
+            "run_id": decision["run_id"],
+            "run_owner": decision["owner"],
+            "publish_plan": publish_plan,
+        }
+
+    def _scheduled_publish_plan(self):
+        publish = {
+            "send_telegram": self._var_bool("send_telegram_var", False),
+            "telegram_intro_text": self.telegram_intro_text_var.get().strip() or "{date}",
+            "post_facebook": self._var_bool("post_facebook_var", False),
+            "facebook_intro_text": self.facebook_intro_text_var.get().strip() or DEFAULT_FACEBOOK_INTRO_TEXT,
+            "facebook_dry_run": self._var_bool("facebook_dry_run_var", True),
+            "post_facebook_groups": self._var_bool("post_facebook_groups_var", False),
+            "facebook_groups": [dict(group) for group in self.facebook_groups],
+            "facebook_group_delay_min_seconds": self._int_var(self.facebook_group_delay_min_var, 900),
+            "facebook_group_delay_max_seconds": self._int_var(self.facebook_group_delay_max_var, 1800),
+            "facebook_group_max_per_brief": self._int_var(self.facebook_group_max_per_brief_var, 2),
+            "facebook_group_max_per_day": self._int_var(self.facebook_group_max_per_day_var, 4),
+            "facebook_group_queue_expiry_hours": self._int_var(self.facebook_group_queue_expiry_var, 12),
+            "facebook_group_dry_run": self._var_bool("facebook_group_dry_run_var", True),
+        }
+        return build_publish_plan(
+            publish,
+            telegram_chat_ids=self._telegram_chat_ids(),
+            facebook_page_id=self.facebook_page_id_var.get().strip(),
+            dry_run=False,
+        )
+
+    def _scheduled_primary_wait_update(self, status):
+        self._checkpoint("wait for primary Sheet run")
+        message = (
+            f"Waiting for primary run {status['run_id']}.\n"
+            f"Reason: {status['reason']}\n"
+            f"Deadline: {status['deadline']}\n"
+            f"Next check in {int(status['wait_seconds'])} seconds."
+        )
+        logger.info(message.replace("\n", " "))
+        if hasattr(self, "root") and hasattr(self, "output_box"):
+            self.root.after(0, self._set_text, self.output_box, message, True)
+            self.root.after(0, self.summary_var.set, f"Waiting for primary {status['run_id']}")
+
+    @staticmethod
+    def _format_orchestrated_no_content(decision, stats, brief_path):
+        return "\n\n".join(
+            [
+                (
+                    f"Run {decision['run_id']} finished with NO_NEW_CONTENT. "
+                    "The selected lane was not replaced and no retry loop was started."
+                ),
+                format_combined_stats(stats, brief_path),
+            ]
+        )
 
     def _task_run_scan(self, label):
         self._checkpoint("refresh trends")
@@ -875,6 +1161,21 @@ class AppGUI:
 
         output_dir = manifest_path.parent
         source_brief = manifest.get("source_brief_json") or ""
+        source_payload = {}
+        if source_brief:
+            try:
+                source_payload = json.loads(Path(source_brief).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                source_payload = {}
+        run_id = str(manifest.get("run_id") or source_payload.get("run_id") or "").strip()
+        selected_lane = str(
+            manifest.get("selected_lane") or source_payload.get("selected_lane") or ""
+        ).strip()
+        publish_plan = source_payload.get("publish_plan")
+        source_mode = str(source_payload.get("source_mode") or "").strip().lower()
+        preview_only = bool(manifest.get("preview_only") or source_payload.get("preview_only"))
+        if source_mode in {"sheet", "combined"} and not run_id:
+            preview_only = True
         brief_label = self._brief_label_from_render_manifest(manifest)
         stats = {
             "source_mode": "latest_rendered",
@@ -901,13 +1202,21 @@ class AppGUI:
             "brief_label": brief_label,
             "latest_rendered": True,
             "generated_at": manifest.get("generated_at"),
+            "run_id": run_id,
+            "selected_lane": selected_lane,
+            "preview_only": preview_only,
+            "publish_plan": publish_plan if isinstance(publish_plan, dict) else None,
         }
 
     def _latest_visual_manifest_path(self):
-        root = Path(DEFAULT_VISUAL_BRIEF_DIR)
-        if not root.exists():
-            return None
-        manifests = [path for path in root.rglob("manifest.json") if path.is_file()]
+        roots = [Path(DEFAULT_VISUAL_BRIEF_DIR), ROOT_DIR / "output" / "runs"]
+        manifests = [
+            path
+            for root in roots
+            if root.exists()
+            for path in root.rglob("manifest.json")
+            if path.is_file()
+        ]
         if not manifests:
             return None
         return max(manifests, key=lambda path: path.stat().st_mtime)
@@ -987,6 +1296,13 @@ class AppGUI:
         self._run_background("Generating and sending combined cards", self._task_generate_and_send_combined_cards)
 
     def _task_generate_and_send_combined_cards(self):
+        source_mode = self.visual_source_mode_var.get().strip().lower()
+        if source_mode in {"sheet", "combined"}:
+            label, _scheduled = self._latest_started_schedule()
+            if not label:
+                return "No news slot has started yet today; no future run was claimed.", False
+            return self._task_run_scheduled_brief(label)
+
         refresh_result = self._refresh_app_source_if_selected()
         result = self._retry_gui_step(
             "generate_combined_image_cards",
@@ -1007,37 +1323,79 @@ class AppGUI:
             lines.extend(["", "Không có tác vụ hoàn thành nào được tích chọn. Ảnh đã được render nhưng chưa đăng."])
         return "\n".join(lines), completion_ok
 
-    def _run_selected_completion_actions(self, result):
+    def _run_selected_completion_actions(self, result, run_id=None, run_owner=None, publish_plan=None):
         cards = result["cards_result"]["cards"]
         brief_label = result.get("brief_label")
+        plan = publish_plan if isinstance(publish_plan, dict) else None
         lines = []
         ok = True
-        if self._var_bool("send_telegram_var", False):
+        send_telegram_enabled = bool(plan.get("send_telegram")) if plan else self._var_bool("send_telegram_var", False)
+        if send_telegram_enabled:
+            if run_id and run_owner:
+                send_action = lambda: self._task_send_cards(
+                    cards,
+                    brief_label,
+                    run_id=run_id,
+                    run_owner=run_owner,
+                    chat_ids=plan.get("telegram_chat_ids") if plan else None,
+                    intro_template=plan.get("telegram_intro_text") if plan else None,
+                    fence_run=True,
+                )
+            else:
+                send_action = lambda: self._task_send_cards(cards, brief_label)
             output, action_ok = self._retry_gui_step(
                 "send_telegram",
-                lambda: self._task_send_cards(cards, brief_label),
+                send_action,
             )
             lines.append(output)
             ok = ok and action_ok
-        if self._var_bool("post_facebook_var", False):
-            output, action_ok = self._retry_gui_step(
-                "post_facebook",
-                lambda: self._task_post_facebook_cards(
+        post_facebook_enabled = bool(plan.get("post_facebook")) if plan else self._var_bool("post_facebook_var", False)
+        if post_facebook_enabled:
+            facebook_dry_run = bool(plan.get("facebook_dry_run")) if plan else self._var_bool("facebook_dry_run_var", True)
+            if run_id and run_owner:
+                facebook_action = lambda: self._task_post_facebook_cards(
+                    cards,
+                    brief_label,
+                    dry_run=facebook_dry_run,
+                    run_id=run_id,
+                    run_owner=run_owner,
+                    page_id_override=plan.get("facebook_page_id") if plan else None,
+                    intro_text_override=plan.get("facebook_intro_text") if plan else None,
+                    fence_run=True,
+                )
+            else:
+                facebook_action = lambda: self._task_post_facebook_cards(
                     cards,
                     brief_label,
                     dry_run=self._var_bool("facebook_dry_run_var", True),
-                ),
+                )
+            output, action_ok = self._retry_gui_step(
+                "post_facebook",
+                facebook_action,
             )
             lines.append(output)
             ok = ok and action_ok
-        if self._var_bool("post_facebook_groups_var", False):
-            output, action_ok = self._retry_gui_step(
-                "post_facebook_groups",
-                lambda: self._task_post_facebook_groups_cards(
+        post_groups_enabled = bool(plan.get("post_facebook_groups")) if plan else self._var_bool("post_facebook_groups_var", False)
+        if post_groups_enabled:
+            if plan:
+                groups_action = lambda: self._task_post_facebook_groups_cards(
+                    cards,
+                    brief_label,
+                    dry_run=bool(plan.get("facebook_group_dry_run")),
+                    publish_plan=plan,
+                    run_id=run_id,
+                    run_owner=run_owner,
+                    fence_run=bool(run_id and run_owner),
+                )
+            else:
+                groups_action = lambda: self._task_post_facebook_groups_cards(
                     cards,
                     brief_label,
                     dry_run=self._var_bool("facebook_group_dry_run_var", True),
-                ),
+                )
+            output, action_ok = self._retry_gui_step(
+                "post_facebook_groups",
+                groups_action,
             )
             lines.append(output)
             ok = ok and action_ok
@@ -1091,27 +1449,30 @@ class AppGUI:
 
     def _generate_combined_cards_result(self, test_mode=False):
         source_mode = self.visual_source_mode_var.get().strip().lower()
+        if not test_mode and source_mode in {"sheet", "combined"}:
+            raise RuntimeError(
+                "Sheet publishing must run through the news-run coordinator. "
+                "Use Run Now or Generate & Send."
+            )
         sheet_url = self.sheet_url_var.get().strip()
         sheet_limit = None if source_mode == "sheet" else self._optional_limit(self.sheet_limit_var, self.sheet_limit_max_var)
         card_limit = None if source_mode == "sheet" else self._optional_limit(self.card_limit_var, self.card_limit_max_var)
-        while True:
-            sheet_ready = {} if test_mode else self._wait_for_sheet_if_needed(source_mode)
-            source_result = build_combined_brief(
-                source_mode=source_mode,
-                sheet_url=sheet_url,
-                sheet_limit=sheet_limit,
-                app_limit=self._optional_limit(self.app_limit_var, self.app_limit_max_var),
-                card_limit=card_limit,
-                brief_path=DEFAULT_COMBINED_BRIEF_PATH,
-                exclude_vietnam=self._exclude_vietnam_sources(),
-            )
-            if sheet_ready:
-                source_result.stats.setdefault("sheet_source", {}).update(sheet_ready)
-            if source_result.payload.get("items"):
-                break
-            if test_mode or source_mode != "sheet":
-                raise RuntimeError(format_empty_combined_message(source_result.stats, source_result.brief_path))
-            self._wait_for_fresh_sheet_items(source_result)
+        source_result = build_combined_brief(
+            source_mode=source_mode,
+            sheet_url=sheet_url,
+            sheet_limit=sheet_limit,
+            app_limit=self._optional_limit(self.app_limit_var, self.app_limit_max_var),
+            card_limit=card_limit,
+            brief_path=DEFAULT_COMBINED_BRIEF_PATH,
+            exclude_vietnam=self._exclude_vietnam_sources(),
+        )
+        if test_mode and source_mode in {"sheet", "combined"}:
+            source_result.payload["preview_only"] = True
+            source_result.stats["preview_only"] = True
+            source_result.payload["stats"] = source_result.stats
+            write_json_atomic(source_result.brief_path, source_result.payload)
+        if not source_result.payload.get("items"):
+            raise RuntimeError(format_empty_combined_message(source_result.stats, source_result.brief_path))
 
         cards_result = generate_image_cards(
             "combined",
@@ -1126,24 +1487,6 @@ class AppGUI:
             "cards_result": cards_result,
             "brief_label": brief_label,
         }
-
-    def _wait_for_fresh_sheet_items(self, source_result):
-        self._checkpoint("wait for fresh Google Sheet items")
-        stats = source_result.stats
-        sheet_source = stats.get("sheet_source") or {}
-        message = (
-            "Google Sheet đã đúng khung giờ nhưng chưa có tin mới để render.\n"
-            f"Sheet L1: {sheet_source.get('run_marker', '')} ({sheet_source.get('run_label', '')})\n"
-            f"Dòng Sheet đã đọc: {stats.get('raw_total', 0)}\n"
-            f"Tin đã đăng bị bỏ qua: {stats.get('already_published', 0)}\n"
-            f"Tin mới đủ điều kiện render: {stats.get('selected_total', 0)}\n"
-            "Chờ 60 giây rồi kiểm tra lại."
-        )
-        logger.info(message.replace("\n", " "))
-        if hasattr(self, "root") and hasattr(self, "output_box"):
-            self.root.after(0, self._set_text, self.output_box, message, True)
-            self.root.after(0, self.summary_var.set, "Waiting for fresh Google Sheet items")
-        self._sleep_with_controls(60)
 
     def _format_card_result(self, result):
         return "\n".join([
@@ -1353,36 +1696,120 @@ class AppGUI:
             result = self._retry_gui_step("load_latest_rendered_image_cards", self._latest_rendered_cards_result)
         except Exception as exc:
             return self._format_latest_rendered_cards_error("Telegram", exc), False
+        publish_error = self._render_publish_error(result, "Telegram")
+        if publish_error:
+            return f"{self._format_selected_source_cards_result(result)}\n\n{publish_error}", False
+        run_id = result.get("run_id")
+        run_owner = self._manual_delivery_owner() if run_id else None
+        if run_id:
+            send_action = lambda: self._task_send_cards(
+                result["cards_result"]["cards"],
+                result.get("brief_label"),
+                run_id=run_id,
+                run_owner=run_owner,
+            )
+        else:
+            send_action = lambda: self._task_send_cards(
+                result["cards_result"]["cards"], result.get("brief_label")
+            )
         output, ok = self._retry_gui_step(
             "send_telegram",
-            lambda: self._task_send_cards(result["cards_result"]["cards"], result.get("brief_label")),
+            send_action,
         )
         return f"{self._format_selected_source_cards_result(result)}\n\n{output}", ok
 
-    def _task_send_cards(self, cards, brief_label=None):
+    def _task_send_cards(
+        self,
+        cards,
+        brief_label=None,
+        run_id=None,
+        run_owner=None,
+        chat_ids=None,
+        intro_template=None,
+        fence_run=False,
+    ):
         token = self.telegram_bot_token_var.get().strip()
-        chat_ids = self._telegram_chat_ids()
+        chat_ids = list(chat_ids) if chat_ids is not None else self._telegram_chat_ids()
         if not token or not chat_ids:
             return "Telegram skipped: Bot token or Chat IDs is empty.", False
         lines = []
         ok = True
         total_sent = 0
         successful_chat_ids = []
-        intro_text = self._telegram_intro_text(brief_label)
+        published_cards = []
+        published_keys = set()
+        intro_text = self._telegram_intro_text(brief_label, template=intro_template)
         for chat_id in chat_ids:
+            delivery_cards = list(cards or [])
+            if run_id and run_owner:
+                claims = claim_delivery_cards(
+                    run_id,
+                    delivery_cards,
+                    "telegram",
+                    str(chat_id),
+                    run_owner,
+                    db_path=DEFAULT_DB_PATH,
+                    fence_run=fence_run,
+                )
+                delivery_cards = claims["claimed"]
+                blockers = delivery_claim_blockers(claims)
+                if blockers:
+                    ok = False
+                    lines.append(f"{chat_id}: delivery requires attention - {', '.join(blockers)}")
+                if not delivery_cards:
+                    reasons = ", ".join(sorted({str(item["reason"]) for item in claims["skipped"]})) or "already handled"
+                    lines.append(f"{chat_id}: skipped by delivery ledger - {reasons}")
+                    continue
             try:
                 if intro_text:
                     send_message(token, chat_id, intro_text)
-                sent = send_photos(token, chat_id, cards)
+                sent = send_photos(token, chat_id, delivery_cards)
                 total_sent += len(sent)
                 successful_chat_ids.append(chat_id)
+                for card in delivery_cards:
+                    key = (
+                        card.get("item_key")
+                        or card.get("canonical_url")
+                        or card.get("card_path")
+                        if isinstance(card, dict)
+                        else str(card)
+                    )
+                    key = str(key or id(card))
+                    if key not in published_keys:
+                        published_keys.add(key)
+                        published_cards.append(card)
+                if run_id and run_owner:
+                    finish_delivery_cards(
+                        run_id,
+                        delivery_cards,
+                        "telegram",
+                        str(chat_id),
+                        run_owner,
+                        succeeded=True,
+                        result={"sent_photos": len(sent)},
+                        db_path=DEFAULT_DB_PATH,
+                    )
                 intro_label = "with intro text" if intro_text else "without intro text"
                 lines.append(f"{chat_id}: sent photos {len(sent)} {intro_label}")
             except Exception as exc:
                 ok = False
+                if run_id and run_owner:
+                    finish_delivery_cards(
+                        run_id,
+                        delivery_cards,
+                        "telegram",
+                        str(chat_id),
+                        run_owner,
+                        succeeded=False,
+                        error=exc,
+                        db_path=DEFAULT_DB_PATH,
+                    )
                 lines.append(f"{chat_id}: send failed - {exc}")
         if successful_chat_ids:
-            saved = mark_items_published(cards, telegram_chat_id=", ".join(successful_chat_ids))
+            saved = mark_items_published(
+                published_cards,
+                telegram_chat_id=", ".join(successful_chat_ids),
+            )
             lines.append(f"Published ledger updated: {saved} items")
         lines.insert(0, f"Telegram total sent photos: {total_sent}")
         return "\n".join(lines), ok
@@ -1939,11 +2366,25 @@ class AppGUI:
         result, error = self._generate_facebook_cards_or_error()
         if error:
             return error, False
-        output, ok = self._task_post_facebook_cards(
-            result["cards_result"]["cards"],
-            result.get("brief_label"),
-            dry_run=False,
-        )
+        publish_error = self._render_publish_error(result, "Facebook")
+        if publish_error:
+            return f"{self._format_selected_source_cards_result(result)}\n\n{publish_error}", False
+        run_id = result.get("run_id")
+        run_owner = self._manual_delivery_owner() if run_id else None
+        if run_id:
+            output, ok = self._task_post_facebook_cards(
+                result["cards_result"]["cards"],
+                result.get("brief_label"),
+                dry_run=False,
+                run_id=run_id,
+                run_owner=run_owner,
+            )
+        else:
+            output, ok = self._task_post_facebook_cards(
+                result["cards_result"]["cards"],
+                result.get("brief_label"),
+                dry_run=False,
+            )
         return f"{self._format_selected_source_cards_result(result)}\n\n{output}", ok
 
     def _generate_facebook_cards_or_error(self):
@@ -1961,8 +2402,20 @@ class AppGUI:
         message = str(exc or "").strip() or exc.__class__.__name__
         return f"{channel} skipped: no valid latest rendered image cards.\n{message}"
 
-    def _task_post_facebook_cards(self, cards, brief_label=None, dry_run=None):
-        page_id = self.facebook_page_id_var.get().strip()
+    def _task_post_facebook_cards(
+        self,
+        cards,
+        brief_label=None,
+        dry_run=None,
+        run_id=None,
+        run_owner=None,
+        page_id_override=None,
+        intro_text_override=None,
+        fence_run=False,
+    ):
+        page_id = str(
+            page_id_override if page_id_override is not None else self.facebook_page_id_var.get()
+        ).strip()
         token = self.facebook_page_access_token_var.get().strip()
         if not page_id or not token:
             return "Facebook skipped: Page ID or Page access token is empty.", False
@@ -1972,10 +2425,46 @@ class AppGUI:
             return "Facebook skipped: publish safety failed.\n" + self._format_errors(safety["errors"]), False
 
         effective_dry_run = self.facebook_dry_run_var.get() if dry_run is None else bool(dry_run)
-        message = self._facebook_intro_text(brief_label)
+        publish_cards = list(cards or [])
+        claim_blockers = []
+        if run_id and run_owner and not effective_dry_run:
+            claims = claim_delivery_cards(
+                run_id,
+                publish_cards,
+                "facebook_page",
+                page_id,
+                run_owner,
+                db_path=DEFAULT_DB_PATH,
+                fence_run=fence_run,
+            )
+            publish_cards = claims["claimed"]
+            claim_blockers = delivery_claim_blockers(claims)
+            if not publish_cards:
+                reasons = ", ".join(sorted({str(item["reason"]) for item in claims["skipped"]})) or "already handled"
+                return f"Facebook skipped by delivery ledger: {reasons}", not claim_blockers
+        message = (
+            render_facebook_intro_text(
+                intro_text_override,
+                brief_label=brief_label,
+                now=self._vietnam_now(),
+            )
+            if intro_text_override is not None
+            else self._facebook_intro_text(brief_label)
+        )
         try:
-            result = publish_photo_post(page_id, token, cards, message, dry_run=effective_dry_run)
+            result = publish_photo_post(page_id, token, publish_cards, message, dry_run=effective_dry_run)
         except Exception as exc:
+            if run_id and run_owner and not effective_dry_run:
+                finish_delivery_cards(
+                    run_id,
+                    publish_cards,
+                    "facebook_page",
+                    page_id,
+                    run_owner,
+                    succeeded=False,
+                    error=exc,
+                    db_path=DEFAULT_DB_PATH,
+                )
             uploaded = getattr(exc, "uploaded_photo_ids", None)
             suffix = f"\nUploaded photo IDs before failure: {', '.join(uploaded)}" if uploaded else ""
             return f"Facebook post failed:\n{self._format_facebook_error(exc, token)}{suffix}", False
@@ -1998,7 +2487,18 @@ class AppGUI:
             return "\n".join(lines), True
 
         post_id = result.get("post_id") or ""
-        saved = mark_items_published(cards, facebook_page_id=page_id, facebook_post_id=post_id)
+        if run_id and run_owner:
+            finish_delivery_cards(
+                run_id,
+                publish_cards,
+                "facebook_page",
+                page_id,
+                run_owner,
+                succeeded=True,
+                result={"post_id": post_id, "fallback": bool(result.get("fallback"))},
+                db_path=DEFAULT_DB_PATH,
+            )
+        saved = mark_items_published(publish_cards, facebook_page_id=page_id, facebook_post_id=post_id)
         mode = "fallback single-photo posts" if result.get("fallback") else "multi-photo post"
         photo_descriptions = result.get("photo_descriptions") or []
         lines = [
@@ -2008,7 +2508,9 @@ class AppGUI:
             f"Photo descriptions with source links: {len(photo_descriptions)}",
             f"Published ledger updated: {saved} items",
         ]
-        return "\n".join(lines), True
+        if claim_blockers:
+            lines.append(f"Delivery requires attention: {', '.join(claim_blockers)}")
+        return "\n".join(lines), not claim_blockers
 
     def _preview_facebook_groups(self):
         self._save_settings()
@@ -2023,6 +2525,10 @@ class AppGUI:
             result = self._retry_gui_step("load_latest_rendered_image_cards", self._latest_rendered_cards_result)
         except Exception as exc:
             return self._format_latest_rendered_cards_error("Facebook Groups", exc), False
+        if not dry_run:
+            publish_error = self._render_publish_error(result, "Facebook Groups")
+            if publish_error:
+                return f"{self._format_selected_source_cards_result(result)}\n\n{publish_error}", False
         output, ok = self._task_post_facebook_groups_cards(
             result["cards_result"]["cards"],
             result.get("brief_label"),
@@ -2031,27 +2537,87 @@ class AppGUI:
         )
         return f"{self._format_selected_source_cards_result(result)}\n\n{output}", ok
 
-    def _task_post_facebook_groups_cards(self, cards, brief_label=None, dry_run=None, manual=False):
-        validation = validate_group_config(self.facebook_groups)
+    @staticmethod
+    def _render_publish_error(result, channel):
+        if result.get("preview_only"):
+            return (
+                f"{channel} skipped: this Sheet/combined render is preview-only. "
+                "Use Run Now or run-scheduled so a run_id and delivery ledger are claimed first."
+            )
+        return ""
+
+    @staticmethod
+    def _manual_delivery_owner():
+        return f"gui-manual:{os.getpid()}:{threading.get_ident()}"
+
+    def _task_post_facebook_groups_cards(
+        self,
+        cards,
+        brief_label=None,
+        dry_run=None,
+        manual=False,
+        publish_plan=None,
+        run_id=None,
+        run_owner=None,
+        fence_run=False,
+    ):
+        plan = publish_plan if isinstance(publish_plan, dict) else None
+        groups = plan.get("facebook_groups") if plan else self.facebook_groups
+        validation = validate_group_config(groups)
         if not validation["ready"]:
             return "Facebook Groups skipped: invalid configuration.\n" + self._format_errors(validation["errors"]), False
         effective_dry_run = self.facebook_group_dry_run_var.get() if dry_run is None else bool(dry_run)
+        group_guard = None
+        if run_id and run_owner:
+            group_guard = FacebookGroupDeliveryGuard(
+                run_id,
+                cards,
+                run_owner,
+                db_path=DEFAULT_DB_PATH,
+                fence_run=fence_run,
+            )
         try:
             result = publish_to_groups(
                 cards,
                 validation["groups"],
-                self.facebook_intro_text_var.get().strip() or DEFAULT_FACEBOOK_INTRO_TEXT,
+                (
+                    plan.get("facebook_intro_text")
+                    if plan
+                    else self.facebook_intro_text_var.get().strip() or DEFAULT_FACEBOOK_INTRO_TEXT
+                ),
                 caption_renderer=lambda template, label: render_facebook_intro_text(template, brief_label=label),
                 brief_label=brief_label,
                 dry_run=effective_dry_run,
-                delay_min_seconds=self._int_var(self.facebook_group_delay_min_var, 900),
-                delay_max_seconds=self._int_var(self.facebook_group_delay_max_var, 1800),
-                max_groups_per_brief=self._int_var(self.facebook_group_max_per_brief_var, 2),
-                max_groups_per_day=self._int_var(self.facebook_group_max_per_day_var, 4),
-                queue_expiry_hours=self._int_var(self.facebook_group_queue_expiry_var, 12),
+                delay_min_seconds=(
+                    int(plan.get("facebook_group_delay_min_seconds") or 900)
+                    if plan
+                    else self._int_var(self.facebook_group_delay_min_var, 900)
+                ),
+                delay_max_seconds=(
+                    int(plan.get("facebook_group_delay_max_seconds") or 1800)
+                    if plan
+                    else self._int_var(self.facebook_group_delay_max_var, 1800)
+                ),
+                max_groups_per_brief=(
+                    int(plan.get("facebook_group_max_per_brief") or 2)
+                    if plan
+                    else self._int_var(self.facebook_group_max_per_brief_var, 2)
+                ),
+                max_groups_per_day=(
+                    int(plan.get("facebook_group_max_per_day") or 4)
+                    if plan
+                    else self._int_var(self.facebook_group_max_per_day_var, 4)
+                ),
+                queue_expiry_hours=(
+                    int(plan.get("facebook_group_queue_expiry_hours") or 12)
+                    if plan
+                    else self._int_var(self.facebook_group_queue_expiry_var, 12)
+                ),
                 manual=manual,
                 progress_callback=self._facebook_group_progress,
                 sleep_fn=self._sleep_with_controls,
+                before_group_publish=group_guard.before_publish if group_guard else None,
+                after_group_publish=group_guard.after_publish if group_guard else None,
             )
         except Exception as exc:
             return f"Facebook Groups failed:\n{exc}", False
@@ -2087,6 +2653,11 @@ class AppGUI:
         for item in result["results"]:
             detail = f" - {item['message']}" if item.get("message") else ""
             lines.append(f"- {item['group_name']}: {item['status']}{detail}")
+        if group_guard and group_guard.blockers:
+            lines.append(
+                "Delivery requires attention: "
+                + ", ".join(sorted(set(group_guard.blockers)))
+            )
         if counts["needs_login"]:
             lines.extend(
                 [
@@ -2099,7 +2670,11 @@ class AppGUI:
             saved = mark_items_published(cards)
             lines.append(f"Published ledger updated: {saved} items")
         self._refresh_facebook_group_status()
-        ok = counts["failed"] == 0 and counts["needs_login"] == 0
+        ok = (
+            counts["failed"] == 0
+            and counts["needs_login"] == 0
+            and not (group_guard and group_guard.blockers)
+        )
         return "\n".join(lines), ok
 
     def _check_api_key(self):
@@ -2166,7 +2741,10 @@ class AppGUI:
             if due_label and due_key != self.last_schedule_key:
                 self.last_schedule_key = due_key
                 self.scan_label_var.set(due_label)
-                self._run_background(f"Scheduled {due_label} scan", lambda: self._task_run_scan(due_label))
+                self._run_background(
+                    f"Scheduled {due_label} orchestration",
+                    lambda: self._task_run_scheduled_brief(due_label),
+                )
         if not self.task_running and self.facebook_group_auto_resume_var.get():
             queue_status = get_group_queue_status(
                 max_groups_per_day=self._int_var(self.facebook_group_max_per_day_var, 4)
@@ -2183,74 +2761,33 @@ class AppGUI:
 
     def _due_schedule(self):
         now = self._schedule_now()
+        orchestration = dict(self.settings.get("orchestration") or {})
+        catch_up_seconds = max(60, int(orchestration.get("catch_up_window_minutes", 120)) * 60)
+        due = []
         for time_text in self._schedule_times():
             hour, minute = [int(part) for part in time_text.split(":", 1)]
             scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             age_seconds = (now - scheduled).total_seconds()
-            if 0 <= age_seconds < 60:
+            if 0 <= age_seconds < catch_up_seconds:
                 label = self._scan_label_for_time(scheduled)
-                return label, f"{scheduled.date()}-{time_text}"
+                due.append((scheduled, label, f"{scheduled.date()}-{time_text}"))
+        if due:
+            _scheduled, label, key = max(due, key=lambda item: item[0])
+            return label, key
         return None, None
 
-    def _wait_for_sheet_if_needed(self, source_mode):
-        if str(source_mode or "").strip().lower() != "sheet":
-            return {}
-        sheet_url = self.sheet_url_var.get().strip()
-        if not sheet_url:
-            return {}
-
-        expected_label = self._current_scan_label()
-        while True:
-            self._checkpoint("wait for Google Sheet L1")
-            now = self._vietnam_now()
-            sheet_error = ""
-            try:
-                status = get_sheet_run_status(sheet_url)
-                marker = status.get("run_marker", "")
-                sheet_label = status.get("run_label", "")
-            except ValueError as exc:
-                return {
-                    "run_marker": "",
-                    "run_label": "invalid",
-                    "expected_run_label": expected_label,
-                    "vietnam_now": now.strftime("%Y-%m-%d %H:%M:%S +07"),
-                    "sheet_ready": False,
-                    "sheet_error": str(exc),
-                }
-            except Exception as exc:
-                return {
-                    "run_marker": "",
-                    "run_label": "error",
-                    "expected_run_label": expected_label,
-                    "vietnam_now": now.strftime("%Y-%m-%d %H:%M:%S +07"),
-                    "sheet_ready": False,
-                    "sheet_error": str(exc),
-                }
-            ready = sheet_label == expected_label
-            wait_status = {
-                "run_marker": marker,
-                "run_label": sheet_label,
-                "expected_run_label": expected_label,
-                "vietnam_now": now.strftime("%Y-%m-%d %H:%M:%S +07"),
-                "sheet_ready": ready,
-            }
-            if sheet_error:
-                wait_status["sheet_error"] = sheet_error
-            if ready:
-                return wait_status
-
-            message = (
-                "Google Sheet chưa sẵn sàng cho khung tin hiện tại.\n"
-                f"Giờ Việt Nam: {wait_status['vietnam_now']} ({expected_label})\n"
-                f"Sheet L1: {marker} ({sheet_label})\n"
-                f"{'Lỗi L1: ' + sheet_error + chr(10) if sheet_error else ''}"
-                "Chờ 60 giây rồi kiểm tra lại."
-            )
-            logger.info(message.replace("\n", " "))
-            if hasattr(self, "root") and hasattr(self, "output_box"):
-                self.root.after(0, self._set_text, self.output_box, message, True)
-                self.root.after(0, self.summary_var.set, "Waiting for Google Sheet L1")
-            self._sleep_with_controls(60)
+    def _latest_started_schedule(self):
+        now = self._schedule_now()
+        started = []
+        for time_text in self._schedule_times():
+            hour, minute = [int(part) for part in time_text.split(":", 1)]
+            scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if scheduled <= now:
+                started.append((scheduled, self._scan_label_for_time(scheduled)))
+        if not started:
+            return None, None
+        scheduled, label = max(started, key=lambda item: item[0])
+        return label, scheduled
 
     def _update_next_run_label(self):
         if hasattr(self, "auto_run_var") and not self.auto_run_var.get():
@@ -2452,16 +2989,10 @@ class AppGUI:
         return values or ["07:15", "19:15"]
 
     def _timezone_options(self):
-        return [f"{offset:+d}" for offset in range(-12, 15)]
+        return ["+7"]
 
     def _timezone_offset_text(self):
-        raw = self.timezone_offset_var.get() if hasattr(self, "timezone_offset_var") else "+7"
-        try:
-            offset = int(str(raw).strip().replace("UTC", ""))
-        except (TypeError, ValueError):
-            offset = 7
-        offset = max(-12, min(14, offset))
-        return f"{offset:+d}"
+        return "+7"
 
     def _schedule_timezone(self):
         return timezone(timedelta(hours=int(self._timezone_offset_text())))
@@ -2658,8 +3189,10 @@ class AppGUI:
     def _brief_label_text(self, brief_label=None):
         return facebook_brief_label_text(brief_label or self._current_scan_label(), now=self._vietnam_now())
 
-    def _telegram_intro_text(self, brief_label=None):
-        template = (self.telegram_intro_text_var.get() or "{date}").strip()
+    def _telegram_intro_text(self, brief_label=None, template=None):
+        template = (
+            template if template is not None else self.telegram_intro_text_var.get() or "{date}"
+        ).strip()
         if not template:
             return ""
         now = self._vietnam_now()

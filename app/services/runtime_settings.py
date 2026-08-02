@@ -11,6 +11,9 @@ from app.config import ROOT_DIR
 SETTINGS_PATH = ROOT_DIR / "config" / "runtime_settings.json"
 ENV_PATH = ROOT_DIR / ".env"
 VIETNAM_TIMEZONE = timezone(timedelta(hours=7))
+CANONICAL_TIMEZONE = "Asia/Bangkok"
+CANONICAL_SCAN_TIMES = ("07:15", "19:15")
+LEGACY_DEFAULT_SCAN_TIMES = ("07:30", "19:30")
 
 LEGACY_FACEBOOK_INTRO_TEXT = "{brief_label}\n{date}\n\nNguon duoc ghi tren tung anh.\nMaritime Intelligence Hub"
 FACEBOOK_HASHTAGS = [
@@ -48,7 +51,9 @@ RECENT_DEFAULT_FACEBOOK_INTRO_TEXT = "\n".join(
         "Nhớ ấn Follow và thêm trang vào Yêu thích để không bỏ sót bất kỳ bản tin quan trọng nào nha!",
     ]
 )
-DEFAULT_FACEBOOK_INTRO_TEXT = PREVIOUS_DEFAULT_FACEBOOK_INTRO_TEXT
+DEFAULT_FACEBOOK_INTRO_TEXT = PREVIOUS_DEFAULT_FACEBOOK_INTRO_TEXT.replace("07:30", "07:15").replace(
+    "19:30", "19:15"
+)
 
 
 DEFAULT_SETTINGS = {
@@ -59,10 +64,19 @@ DEFAULT_SETTINGS = {
         "brief_limit": 12,
         "keywords": "port congestion, freight rate, vessel accident, Vietnam logistics",
         "runs_per_day": 2,
-        "times": ["07:30", "19:30"],
+        "times": list(CANONICAL_SCAN_TIMES),
+        "timezone": CANONICAL_TIMEZONE,
         "timezone_offset": "+7",
         "retry_attempts": 2,
         "preferred_sources": [],
+    },
+    "orchestration": {
+        "lane_policy": "primary_then_backup",
+        "primary_timeout_minutes": 30,
+        "poll_interval_seconds": 60,
+        "catch_up_window_minutes": 120,
+        "lease_seconds": 300,
+        "heartbeat_seconds": 30,
     },
     "ai": {
         "provider": "chain",
@@ -127,7 +141,8 @@ def load_runtime_settings(path=SETTINGS_PATH):
     if path.exists():
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
-            _deep_update(settings, loaded)
+            if isinstance(loaded, dict):
+                _deep_update(settings, loaded)
         except (OSError, json.JSONDecodeError):
             pass
     _normalize_runtime_settings(settings)
@@ -136,7 +151,7 @@ def load_runtime_settings(path=SETTINGS_PATH):
 
 def save_runtime_settings(settings, path=SETTINGS_PATH):
     merged = _deep_copy(DEFAULT_SETTINGS)
-    _deep_update(merged, settings or {})
+    _deep_update(merged, settings if isinstance(settings, dict) else {})
     _normalize_runtime_settings(merged)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,7 +228,9 @@ def _deep_copy(value):
 
 
 def _deep_update(target, source):
-    for key, value in (source or {}).items():
+    if not isinstance(source, dict):
+        return
+    for key, value in source.items():
         if isinstance(value, dict) and isinstance(target.get(key), dict):
             _deep_update(target[key], value)
         else:
@@ -221,7 +238,38 @@ def _deep_update(target, source):
 
 
 def _normalize_runtime_settings(settings):
-    publish = settings.setdefault("publish", {})
+    scan = settings.get("scan")
+    if not isinstance(scan, dict):
+        scan = _deep_copy(DEFAULT_SETTINGS["scan"])
+        settings["scan"] = scan
+    scan["times"] = _normalize_scan_times(scan.get("times"))
+    scan["runs_per_day"] = len(scan["times"])
+    scan["timezone"] = CANONICAL_TIMEZONE
+    scan["timezone_offset"] = "+7"
+
+    orchestration = settings.get("orchestration")
+    if not isinstance(orchestration, dict):
+        orchestration = _deep_copy(DEFAULT_SETTINGS["orchestration"])
+        settings["orchestration"] = orchestration
+    orchestration["lane_policy"] = "primary_then_backup"
+    orchestration["primary_timeout_minutes"] = _bounded_int(
+        orchestration.get("primary_timeout_minutes"), 1, 240, 30
+    )
+    orchestration["poll_interval_seconds"] = _bounded_int(
+        orchestration.get("poll_interval_seconds"), 1, 300, 60
+    )
+    orchestration["catch_up_window_minutes"] = _bounded_int(
+        orchestration.get("catch_up_window_minutes"), 1, 1440, 120
+    )
+    orchestration["lease_seconds"] = _bounded_int(orchestration.get("lease_seconds"), 30, 3600, 300)
+    orchestration["heartbeat_seconds"] = _bounded_int(
+        orchestration.get("heartbeat_seconds"), 1, orchestration["lease_seconds"] - 1, 30
+    )
+
+    publish = settings.get("publish")
+    if not isinstance(publish, dict):
+        publish = _deep_copy(DEFAULT_SETTINGS["publish"])
+        settings["publish"] = publish
     if _is_legacy_facebook_template(publish.get("facebook_intro_text")):
         publish["facebook_intro_text"] = DEFAULT_FACEBOOK_INTRO_TEXT
     groups = publish.get("facebook_groups")
@@ -248,6 +296,7 @@ def _facebook_template_or_default(template):
 def _is_legacy_facebook_template(template):
     return str(template or "").strip() in {
         LEGACY_FACEBOOK_INTRO_TEXT,
+        PREVIOUS_DEFAULT_FACEBOOK_INTRO_TEXT,
         RECENT_DEFAULT_FACEBOOK_INTRO_TEXT,
     }
 
@@ -267,3 +316,40 @@ def _non_negative_int(value, default):
         return max(0, int(value))
     except (TypeError, ValueError):
         return default
+
+
+def _bounded_int(value, minimum, maximum, default):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if parsed < minimum or parsed > maximum:
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _normalize_scan_times(value):
+    if isinstance(value, str):
+        candidates = value.replace(";", ",").split(",")
+    elif isinstance(value, (list, tuple)):
+        candidates = value
+    else:
+        candidates = []
+
+    normalized = []
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        try:
+            hour_text, minute_text = text.split(":", 1)
+            hour, minute = int(hour_text), int(minute_text)
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            continue
+        formatted = f"{hour:02d}:{minute:02d}"
+        if formatted not in normalized:
+            normalized.append(formatted)
+
+    if tuple(normalized) == LEGACY_DEFAULT_SCAN_TIMES or not normalized:
+        return list(CANONICAL_SCAN_TIMES)
+    return normalized

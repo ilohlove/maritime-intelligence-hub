@@ -2,17 +2,18 @@ import csv
 import hashlib
 import html
 import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass
-from datetime import datetime
-from difflib import SequenceMatcher
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
 
-from app.config import ROOT_DIR
+from app.config import ROOT_DIR, ensure_runtime_seed
 from app.services.brief_writer import build_brief_item, validate_publish_items
 from app.services.storage import (
     DEFAULT_DB_PATH,
@@ -20,15 +21,25 @@ from app.services.storage import (
     get_brief_candidates,
     list_published_item_keys,
 )
-from app.services.backup_source_collector import collect_backup_news
-from app.services.source_policy import filter_sources, normalize_filter_flag, vietnam_source_reason
+from app.services.backup_source_collector import DEFAULT_BACKUP_FEED_MASTER, collect_backup_news
+from app.services.source_policy import normalize_filter_flag, vietnam_source_reason
 from app.services.source_master import load_sources
 
 
 DEFAULT_COMBINED_BRIEF_PATH = ROOT_DIR / "output" / "briefs" / "combined_brief.json"
+DEFAULT_SOURCE_MASTER = ensure_runtime_seed("NEWS_SOURCE_MASTER.csv")
 REQUEST_TIMEOUT = 30
-FUZZY_TITLE_THRESHOLD = 0.88
 SHEET_RUN_MARKER_COLUMN_INDEX = 11
+SHEET_COMPLETED_AT_COLUMN_INDEX = 12
+SHEET_RUN_ID_COLUMN_INDEX = 13
+SHEET_STATUS_COLUMN_INDEX = 14
+SHEET_ROW_COUNT_COLUMN_INDEX = 15
+SHEET_ERROR_CODE_COLUMN_INDEX = 16
+SHEET_DATA_COLUMN_COUNT = 11
+SHEET_RUN_ID_PATTERN = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2}):(?P<slot>morning|evening)$")
+ISO_DATE_TIME_PREFIX_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]")
+SHEET_PROTOCOL_STATUSES = {"RUNNING", "COMPLETED", "FAILED"}
+VIETNAM_TIMEZONE = timezone(timedelta(hours=7))
 HTML_HREF_PATTERN = re.compile(r"""href\s*=\s*["'](?P<url>https?://[^"']+)["']""", re.IGNORECASE)
 MARKDOWN_LINK_PATTERN = re.compile(r"\[[^\]]*\]\((?P<url>https?://[^)\s]+)\)")
 PLAIN_URL_PATTERN = re.compile(r"https?://[^\s<>()\]\[\"']+")
@@ -52,6 +63,9 @@ def build_combined_brief(
     session=None,
     exclude_vietnam=False,
     backup_feed_master=None,
+    sheet_snapshot=None,
+    expected_run_id=None,
+    allow_backup=True,
 ):
     session = session or requests.Session()
     source_mode = (source_mode or "combined").strip().lower()
@@ -64,23 +78,50 @@ def build_combined_brief(
     effective_sheet_limit = None if source_mode == "sheet" else sheet_limit
     sheet_error = ""
     try:
-        sheet_data = load_sheet_data(sheet_url, limit=effective_sheet_limit, session=session) if use_sheet else {}
+        if use_sheet and sheet_snapshot is not None:
+            sheet_data = dict(sheet_snapshot)
+        elif use_sheet:
+            sheet_data = load_sheet_data(sheet_url, limit=effective_sheet_limit, session=session)
+        else:
+            sheet_data = {}
     except Exception as exc:
         sheet_error = str(exc)
-        sheet_data = {"items": [], "run_marker": "", "run_label": ""}
+        sheet_data = empty_sheet_snapshot()
+
+    sheet_evaluation = {}
+    if use_sheet and sheet_data.get("protocol_version") == "v1":
+        sheet_evaluation = evaluate_sheet_snapshot(
+            sheet_data,
+            expected_run_id=expected_run_id or sheet_data.get("run_id"),
+        )
+        sheet_data["evaluation"] = sheet_evaluation
+        if sheet_evaluation["state"] != "ready":
+            sheet_data["items"] = []
     sheet_items = sheet_data.get("items", []) if use_sheet else []
+    if effective_sheet_limit is not None:
+        sheet_items = sheet_items[: max(1, int(effective_sheet_limit))]
     if normalize_filter_flag(exclude_vietnam):
         sheet_items = [item for item in sheet_items if not vietnam_source_reason(item)]
         app_items = [item for item in app_items if not vietnam_source_reason(item)]
     backup_items = []
     backup_results = []
     fallback_reason = ""
-    if use_sheet and source_mode in {"sheet", "combined"} and not sheet_items:
+    protocol_blocks_automatic_backup = (
+        sheet_data.get("protocol_version") == "v1"
+        and sheet_evaluation.get("state") in {"ready", "waiting", "invalid"}
+    )
+    if (
+        allow_backup
+        and use_sheet
+        and source_mode in {"sheet", "combined"}
+        and not sheet_items
+        and not protocol_blocks_automatic_backup
+    ):
         fallback_reason = sheet_error or "sheet_empty"
         try:
             backup_results = collect_backup_news(
-                feed_master=backup_feed_master or ROOT_DIR / "BACKUP_FEED_MASTER.csv",
-                official_sources=load_sources(ROOT_DIR / "NEWS_SOURCE_MASTER.csv")[0],
+                feed_master=backup_feed_master or DEFAULT_BACKUP_FEED_MASTER,
+                official_sources=load_sources(DEFAULT_SOURCE_MASTER)[0],
                 limit_per_source=effective_sheet_limit or 10,
                 db_path=db_path,
                 session=session,
@@ -90,30 +131,38 @@ def build_combined_brief(
                 backup_items.extend(result.get("items") or [])
         except Exception as exc:
             fallback_reason = f"{fallback_reason}; backup_error={exc}"
-    raw_items = app_items + sheet_items
-    if source_mode == "sheet":
-        filtered_items, stats = select_unpublished_sheet_items(raw_items, db_path=db_path)
-    else:
-        filtered_items, stats = filter_publishable_items(raw_items, db_path=db_path)
+    normalized_backup_items = [_backup_item_to_brief(item) for item in backup_items]
+    raw_items = app_items + sheet_items + normalized_backup_items
+    filtered_items, stats = filter_publishable_items(raw_items, db_path=db_path)
     stats["source_mode"] = source_mode
     stats["fallback_reason"] = fallback_reason
-    stats["backup_total"] = len(backup_items)
     stats["backup_results"] = backup_results
-    if backup_items:
-        backup_items = [_backup_item_to_brief(item) for item in backup_items]
-        backup_filtered, backup_stats = filter_publishable_items(backup_items, db_path=db_path)
-        filtered_items.extend(backup_filtered)
-        stats["selected_total"] = len(filtered_items)
-        stats["raw_total"] += backup_stats["raw_total"]
+    backup_attempted = bool(fallback_reason)
+    backup_ok_sources = sum(1 for result in backup_results if result.get("status", "ok") == "ok")
+    backup_failed_sources = sum(1 for result in backup_results if result.get("status", "ok") != "ok")
+    stats["backup_status"] = (
+        "not_used" if not backup_attempted else "ok" if backup_ok_sources else "failed"
+    )
+    stats["backup_ok_sources"] = backup_ok_sources
+    stats["backup_failed_sources"] = backup_failed_sources
     if use_app:
         stats["app_db"] = app_diagnostics
     if use_sheet:
         sheet_diagnostics["loaded_items"] = len(sheet_items)
         sheet_diagnostics["run_marker"] = sheet_data.get("run_marker", "")
         sheet_diagnostics["run_label"] = sheet_data.get("run_label", "")
+        sheet_diagnostics["protocol_version"] = sheet_data.get("protocol_version", "")
+        sheet_diagnostics["started_at"] = sheet_data.get("started_at", "")
+        sheet_diagnostics["completed_at"] = sheet_data.get("completed_at", "")
+        sheet_diagnostics["run_id"] = sheet_data.get("run_id", "")
+        sheet_diagnostics["status"] = sheet_data.get("status", "")
+        sheet_diagnostics["row_count"] = sheet_data.get("row_count")
+        sheet_diagnostics["error_code"] = sheet_data.get("error_code", "")
+        sheet_diagnostics["evaluation"] = sheet_evaluation
         stats["sheet_source"] = sheet_diagnostics
     effective_card_limit = None if source_mode == "sheet" else card_limit
     selected_items = filtered_items if effective_card_limit is None else filtered_items[: max(1, int(effective_card_limit))]
+    stats["output_total"] = len(selected_items)
 
     payload = {
         "brief_type": "combined",
@@ -127,8 +176,7 @@ def build_combined_brief(
     }
 
     path = Path(brief_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(path, payload)
     return CombinedSourceResult(payload=payload, brief_path=path, stats=stats)
 
 
@@ -177,24 +225,48 @@ def load_sheet_items(sheet_url, limit=None, session=None):
 
 
 def load_sheet_data(sheet_url, limit=None, session=None):
-    if not str(sheet_url or "").strip():
-        return {"items": [], "run_marker": "", "run_label": ""}
-    session = session or requests.Session()
-    csv_text = fetch_sheet_csv_text(sheet_url, session=session)
-    run_marker, rows = parse_sheet_csv(csv_text)
-    items = []
-    for index, row in enumerate(rows, start=1):
-        item = sheet_row_to_item(row, index)
-        if not item:
-            continue
-        items.append(item)
-        if limit is not None and len(items) >= max(1, int(limit)):
-            break
+    snapshot = load_sheet_snapshot(sheet_url, session=session)
+    if snapshot["protocol_version"] == "legacy" and snapshot["run_marker"] and not snapshot["run_label"]:
+        sheet_run_label(snapshot["run_marker"])
+    if limit is not None:
+        snapshot["items"] = snapshot["items"][: max(1, int(limit))]
+    return snapshot
+
+
+def empty_sheet_snapshot():
     return {
-        "items": items,
-        "run_marker": run_marker,
-        "run_label": sheet_run_label(run_marker) if str(run_marker or "").strip() else "",
+        "protocol_version": "",
+        "started_at": "",
+        "completed_at": "",
+        "run_id": "",
+        "status": "",
+        "row_count": None,
+        "row_count_raw": "",
+        "error_code": "",
+        "run_marker": "",
+        "run_label": "",
+        "data_row_count": 0,
+        "usable_row_count": 0,
+        "invalid_row_count": 0,
+        "rows": [],
+        "items": [],
     }
+
+
+def load_sheet_snapshot(sheet_url, session=None):
+    """Fetch and parse protocol markers and article rows from one CSV response."""
+    if not str(sheet_url or "").strip():
+        return empty_sheet_snapshot()
+    csv_text = fetch_sheet_csv_text(sheet_url, session=session)
+    return parse_sheet_snapshot(csv_text)
+
+
+def fetch_sheet_snapshot(sheet_url, session=None, expected_run_id=None):
+    """Compatibility loader that optionally attaches a coordinator evaluation."""
+    snapshot = load_sheet_snapshot(sheet_url, session=session)
+    if expected_run_id is not None:
+        snapshot["evaluation"] = evaluate_sheet_snapshot(snapshot, expected_run_id)
+    return snapshot
 
 
 def fetch_sheet_csv_text(sheet_url, session=None):
@@ -206,20 +278,225 @@ def fetch_sheet_csv_text(sheet_url, session=None):
 
 
 def parse_sheet_csv(csv_text):
-    text = csv_text or ""
-    raw_rows = list(csv.reader(StringIO(text)))
-    run_marker = ""
-    if raw_rows and len(raw_rows[0]) > SHEET_RUN_MARKER_COLUMN_INDEX:
-        run_marker = str(raw_rows[0][SHEET_RUN_MARKER_COLUMN_INDEX] or "").strip()
-    rows = list(csv.DictReader(StringIO(text)))
-    return run_marker, rows
+    snapshot = parse_sheet_snapshot(csv_text)
+    return snapshot["run_marker"], snapshot["rows"]
+
+
+def parse_sheet_snapshot(csv_text):
+    """Parse article rows (A:K) and protocol-v1 metadata (L:Q) atomically."""
+    raw_rows = list(csv.reader(StringIO(csv_text or "")))
+    if not raw_rows:
+        return empty_sheet_snapshot()
+
+    header = raw_rows[0]
+    marker_values = [
+        _cell(header, SHEET_RUN_MARKER_COLUMN_INDEX),
+        _cell(header, SHEET_COMPLETED_AT_COLUMN_INDEX),
+        _cell(header, SHEET_RUN_ID_COLUMN_INDEX),
+        _cell(header, SHEET_STATUS_COLUMN_INDEX),
+        _cell(header, SHEET_ROW_COUNT_COLUMN_INDEX),
+        _cell(header, SHEET_ERROR_CODE_COLUMN_INDEX),
+    ]
+    started_at, completed_at, run_id, status, row_count_raw, error_code = marker_values
+    rows = _sheet_data_rows(raw_rows)
+    items = []
+    for index, row in enumerate(rows, start=1):
+        item = sheet_row_to_item(row, index)
+        if item:
+            items.append(item)
+
+    protocol_version = _sheet_protocol_version(marker_values)
+    run_label = _snapshot_run_label(run_id, started_at)
+    row_count = int(row_count_raw) if re.fullmatch(r"\d+", row_count_raw) else None
+    snapshot = {
+        "protocol_version": protocol_version,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "run_id": run_id,
+        "status": status.upper(),
+        "row_count": row_count,
+        "row_count_raw": row_count_raw,
+        "error_code": error_code,
+        # Legacy names remain available to existing GUI and diagnostics code.
+        "run_marker": started_at,
+        "run_label": run_label,
+        "data_row_count": len(rows),
+        "usable_row_count": len(items),
+        "invalid_row_count": len(rows) - len(items),
+        "rows": rows,
+        "items": items,
+    }
+    return snapshot
+
+
+def evaluate_sheet_snapshot(snapshot, expected_run_id=None):
+    """Return coordinator readiness without trusting stale or partial Sheet data."""
+    snapshot = snapshot or {}
+    run_id = str(snapshot.get("run_id") or "").strip()
+    status = str(snapshot.get("status") or "").strip().upper()
+    expected = str(expected_run_id or "").strip()
+    base = {
+        "state": "invalid",
+        "reason": "snapshot_invalid",
+        "valid": False,
+        "ready": False,
+        "terminal": False,
+        "run_id": run_id,
+        "expected_run_id": expected,
+        "status": status,
+        "errors": [],
+    }
+
+    if snapshot.get("protocol_version") != "v1":
+        base["reason"] = "protocol_not_v1"
+        base["errors"] = ["Sheet snapshot does not contain protocol-v1 markers in L1:Q1."]
+        return base
+
+    run_match = SHEET_RUN_ID_PATTERN.fullmatch(run_id)
+    if not run_match:
+        base["reason"] = "invalid_run_id"
+        base["errors"] = ["N1 must use run_id YYYY-MM-DD:morning|evening."]
+        return base
+    if expected and not SHEET_RUN_ID_PATTERN.fullmatch(expected):
+        base["reason"] = "invalid_expected_run_id"
+        base["errors"] = ["Expected run_id must use YYYY-MM-DD:morning|evening."]
+        return base
+    if expected and run_id != expected:
+        base.update(state="waiting", reason="run_id_mismatch", valid=True)
+        return base
+
+    errors = []
+    started = _parse_aware_iso_timestamp(snapshot.get("started_at"), "L1 started_at", errors, required=True)
+    completed = _parse_aware_iso_timestamp(
+        snapshot.get("completed_at"),
+        "M1 completed_at",
+        errors,
+        required=status == "COMPLETED",
+    )
+    if status not in SHEET_PROTOCOL_STATUSES:
+        errors.append("O1 status must be RUNNING, COMPLETED, or FAILED.")
+    if started:
+        vietnam_started = started.astimezone(VIETNAM_TIMEZONE)
+        if vietnam_started.date().isoformat() != run_match.group("date"):
+            errors.append("N1 run_id date must match the Vietnam date in L1 started_at.")
+        expected_slot = "morning" if vietnam_started.hour < 12 else "evening"
+        if expected_slot != run_match.group("slot"):
+            errors.append("N1 run_id slot must match the Vietnam time in L1 started_at.")
+    if started and completed and completed < started:
+        errors.append("M1 completed_at cannot be earlier than L1 started_at.")
+
+    row_count_raw = snapshot.get("row_count_raw")
+    if row_count_raw is None:
+        row_count_raw = snapshot.get("row_count")
+    row_count_text = str(row_count_raw if row_count_raw is not None else "").strip()
+    row_count = int(row_count_text) if re.fullmatch(r"\d+", row_count_text) else None
+    error_code = str(snapshot.get("error_code") or "").strip()
+
+    if status == "RUNNING":
+        if str(snapshot.get("completed_at") or "").strip():
+            errors.append("M1 completed_at must be empty while O1 is RUNNING.")
+        if row_count_text:
+            errors.append("P1 row_count must be empty while O1 is RUNNING.")
+        if error_code:
+            errors.append("Q1 error_code must be empty while O1 is RUNNING.")
+    elif status == "COMPLETED":
+        if row_count is None:
+            errors.append("P1 row_count must be a non-negative integer when O1 is COMPLETED.")
+        else:
+            data_count = int(snapshot.get("data_row_count", len(snapshot.get("rows") or [])))
+            usable_count = int(snapshot.get("usable_row_count", len(snapshot.get("items") or [])))
+            if row_count != data_count:
+                errors.append(f"P1 row_count is {row_count}, but the snapshot contains {data_count} data rows.")
+            if row_count != usable_count:
+                errors.append(f"P1 row_count is {row_count}, but only {usable_count} rows are usable.")
+        if error_code:
+            errors.append("Q1 error_code must be empty when O1 is COMPLETED.")
+    elif status == "FAILED" and not error_code:
+        errors.append("Q1 error_code is required when O1 is FAILED.")
+
+    if errors:
+        base["errors"] = errors
+        return base
+
+    base["valid"] = True
+    if status == "COMPLETED":
+        base.update(state="ready", reason="completed", ready=True, terminal=True)
+    elif status == "FAILED":
+        base.update(state="failed", reason=error_code, terminal=True)
+    else:
+        base.update(state="waiting", reason="run_in_progress")
+    return base
+
+
+def validate_sheet_snapshot(snapshot, expected_run_id=None):
+    """Alias retained for callers that use validation-oriented naming."""
+    return evaluate_sheet_snapshot(snapshot, expected_run_id)
+
+
+def _cell(row, index):
+    return str(row[index] if index < len(row) else "").strip()
+
+
+def _sheet_data_rows(raw_rows):
+    headers = [_cell(raw_rows[0], index) for index in range(min(SHEET_DATA_COLUMN_COUNT, len(raw_rows[0])))]
+    rows = []
+    for values in raw_rows[1:]:
+        data_values = [_cell(values, index) for index in range(SHEET_DATA_COLUMN_COUNT)]
+        if not any(data_values):
+            continue
+        rows.append({header: data_values[index] for index, header in enumerate(headers) if header})
+    return rows
+
+
+def _sheet_protocol_version(marker_values):
+    started_at, completed_at, run_id, status, row_count, error_code = marker_values
+    if any((completed_at, run_id, status, row_count, error_code)) or ISO_DATE_TIME_PREFIX_PATTERN.match(started_at):
+        return "v1"
+    return "legacy" if started_at else ""
+
+
+def _snapshot_run_label(run_id, started_at):
+    match = SHEET_RUN_ID_PATTERN.fullmatch(str(run_id or "").strip())
+    if match:
+        return match.group("slot")
+    try:
+        return sheet_run_label(started_at) if str(started_at or "").strip() else ""
+    except ValueError:
+        return ""
+
+
+def _parse_aware_iso_timestamp(value, field_name, errors, required=False):
+    text = str(value or "").strip()
+    if not text:
+        if required:
+            errors.append(f"{field_name} is required and must be ISO-8601 with a timezone.")
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        errors.append(f"{field_name} must be ISO-8601 with a timezone.")
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        errors.append(f"{field_name} must include a timezone offset.")
+        return None
+    return parsed
 
 
 def get_sheet_run_status(sheet_url, session=None):
-    csv_text = fetch_sheet_csv_text(sheet_url, session=session)
-    run_marker, _rows = parse_sheet_csv(csv_text)
-    run_label = sheet_run_label(run_marker)
-    return {"run_marker": run_marker, "run_label": run_label}
+    snapshot = load_sheet_snapshot(sheet_url, session=session)
+    if snapshot["protocol_version"] == "legacy" and snapshot["run_marker"] and not snapshot["run_label"]:
+        sheet_run_label(snapshot["run_marker"])
+    return {
+        "run_marker": snapshot["run_marker"],
+        "run_label": snapshot["run_label"],
+        "started_at": snapshot["started_at"],
+        "completed_at": snapshot["completed_at"],
+        "run_id": snapshot["run_id"],
+        "status": snapshot["status"],
+        "row_count": snapshot["row_count"],
+        "error_code": snapshot["error_code"],
+        "protocol_version": snapshot["protocol_version"],
+    }
 
 
 def sheet_run_label(value):
@@ -249,7 +526,7 @@ def sheet_row_to_item(row, index):
     impact_note = first_value(row, "Why it matters (Vietnamese)", "Why it matters")
     original_url = normalize_source_url(first_value(row, "Source URL"))
     source_name = first_value(row, "Source")
-    if not title or not original_url:
+    if not title or not _valid_http_url(original_url):
         return None
 
     item = {
@@ -280,6 +557,7 @@ def filter_publishable_items(items, db_path=DEFAULT_DB_PATH):
     stats = {
         "app_total": sum(1 for item in items if item.get("source_type") == "app"),
         "sheet_total": sum(1 for item in items if item.get("source_type") == "sheet"),
+        "backup_total": sum(1 for item in items if item.get("source_type") == "backup"),
         "raw_total": len(items),
         "already_published": 0,
         "duplicate_removed": 0,
@@ -316,26 +594,7 @@ def filter_publishable_items(items, db_path=DEFAULT_DB_PATH):
 
 
 def select_unpublished_sheet_items(items, db_path=DEFAULT_DB_PATH):
-    published = published_lookup(db_path=db_path)
-    selected = []
-    already_published = 0
-    for item in items:
-        if is_published(item, published):
-            already_published += 1
-            continue
-        selected.append(item)
-
-    stats = {
-        "app_total": sum(1 for item in items if item.get("source_type") == "app"),
-        "sheet_total": sum(1 for item in items if item.get("source_type") == "sheet"),
-        "raw_total": len(items),
-        "already_published": already_published,
-        "duplicate_removed": 0,
-        "eligible_total": len(selected),
-        "selected_total": len(selected),
-        "duplicate_groups": [],
-    }
-    return selected, stats
+    return filter_publishable_items(items, db_path=db_path)
 
 
 def dedupe_groups(items):
@@ -362,10 +621,6 @@ def is_duplicate(left, right):
     right_hash = right.get("title_hash")
     if left_hash and right_hash and left_hash == right_hash:
         return True
-    left_title = normalize_title(left.get("title"))
-    right_title = normalize_title(right.get("title"))
-    if left_title and right_title:
-        return SequenceMatcher(None, left_title, right_title).ratio() >= FUZZY_TITLE_THRESHOLD
     return False
 
 
@@ -457,6 +712,11 @@ def normalize_source_url(value):
     return text
 
 
+def _valid_http_url(value):
+    parsed = urlparse(str(value or "").strip())
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
 def normalize_title(value):
     text = str(value or "").lower()
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
@@ -489,6 +749,32 @@ def has_vietnamese_marks(value):
     return 1 if re.search(r"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]", str(value or "").lower()) else 0
 
 
+def write_json_atomic(path, payload):
+    """Write JSON beside its destination and atomically replace the old brief."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_name = temporary.name
+            json.dump(payload, temporary, ensure_ascii=False, indent=2)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, target)
+    finally:
+        if temporary_name and os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
 def format_combined_stats(stats, brief_path=None):
     lines = [
         "Combined source check",
@@ -501,6 +787,10 @@ def format_combined_stats(stats, brief_path=None):
         f"Eligible after published filter: {stats.get('eligible_total', 0)}",
         f"Selected after dedupe: {stats.get('selected_total', 0)}",
         f"Backup items: {stats.get('backup_total', 0)}",
+        (
+            f"Backup status: {stats.get('backup_status', 'not_used')} "
+            f"(ok={stats.get('backup_ok_sources', 0)}, failed={stats.get('backup_failed_sources', 0)})"
+        ),
         f"Fallback reason: {stats.get('fallback_reason', '') or 'none'}",
     ]
     app_db = stats.get("app_db") or {}

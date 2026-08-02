@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+## v1.1.4 - 2026-08-02
+
+- Add run-scoped primary/backup coordination with Sheet protocol v1, SQLite leases, lane locking, atomic artifacts, and headless scheduling.
+- Add idempotent per-destination delivery claims, crash-safe publish resume, frozen publish plans, and audited manual review resolution.
+- Fence Facebook Group browser posts across processes and serialize terminal-run retries with audited reconciliation and fail-closed frozen artifacts.
+- Reserve Facebook Group daily quota atomically and serialize additive SQLite migration across concurrent process startup.
+- Standardize the production schedule at 07:15 and 19:15 in Asia/Bangkok and bundle both source-master CSV files.
+
 ## v1.1.3 - 2026-07-26
 
 - Fall back automatically from Google Sheets to approved maritime RSS, Google News RSS, and self-hosted RSSHub feeds.

@@ -1,15 +1,14 @@
 {
-  "version": "1.1.5",
-  "release_date": "2026-08-02",
-  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.1.5/BV-maritime-intelligence-hub.exe",
+  "version": "1.1.6",
+  "release_date": "2026-08-04",
+  "download_url": "https://github.com/ilohlove/maritime-intelligence-hub/releases/download/v1.1.6/BV-maritime-intelligence-hub.exe",
   "changelog": [
-    "Add strict Vietnamese enrichment and quality gates for primary and backup news before rendering or publishing.",
-    "Add explicit Tại sao quan trọng card sections, complete visual manifests, editorial ranking, and cross-source dedupe.",
-    "Coordinate primary Google Sheets and backup feeds with one run_id, a 30-minute deadline, and a permanently latched source lane.",
-    "Validate the L:Q Sheet completion protocol and stop cleanly with NO_NEW_CONTENT instead of rendering stale or already-published news.",
-    "Prevent duplicate Telegram, Facebook Page, and Facebook Group delivery with SQLite leases, per-destination claims, and audited recovery.",
-    "Add headless scheduled, status, review-resolution, and controlled publish-retry commands with atomic run-scoped artifacts.",
-    "Standardize the production schedule at 07:15 and 19:15 Asia/Bangkok and bundle both source masters plus Playwright Chromium."
+    "Make Google Sheets the authoritative primary lane with 07:30/19:30 targets, conditional five-minute grace, and bounded stability verification.",
+    "Accept ISO or HH:MM L1/M1 markers while treating N1:Q1 as diagnostics and preventing replay with separate content and snapshot fingerprints.",
+    "Preserve every valid Sheet row in source order, including Vietnamese sources, without item limits, AI rewriting, ranking, or semantic dedupe.",
+    "Improve Vietnamese quality checks for substantive one-sentence summaries and dotted numeric values.",
+    "Add an isolated preview-only news test outside the schedule and clearer coordinator diagnostics in GUI and CLI.",
+    "Remove the visible impact label while preserving the impact block, and fix scheduled GUI trigger propagation."
   ],
   "force_update": false
 }

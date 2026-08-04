@@ -72,7 +72,9 @@ DEFAULT_SETTINGS = {
     },
     "orchestration": {
         "lane_policy": "primary_then_backup",
-        "primary_timeout_minutes": 30,
+        "primary_target_minutes": 15,
+        "primary_running_grace_minutes": 5,
+        "sheet_stability_seconds": 10,
         "poll_interval_seconds": 60,
         "catch_up_window_minutes": 120,
         "lease_seconds": 300,
@@ -252,9 +254,16 @@ def _normalize_runtime_settings(settings):
         orchestration = _deep_copy(DEFAULT_SETTINGS["orchestration"])
         settings["orchestration"] = orchestration
     orchestration["lane_policy"] = "primary_then_backup"
-    orchestration["primary_timeout_minutes"] = _bounded_int(
-        orchestration.get("primary_timeout_minutes"), 1, 240, 30
+    orchestration["primary_target_minutes"] = _bounded_int(
+        orchestration.get("primary_target_minutes"), 1, 240, 15
     )
+    orchestration["primary_running_grace_minutes"] = _bounded_int(
+        orchestration.get("primary_running_grace_minutes"), 1, 60, 5
+    )
+    orchestration["sheet_stability_seconds"] = _bounded_int(
+        orchestration.get("sheet_stability_seconds"), 1, 300, 10
+    )
+    orchestration.pop("primary_timeout_minutes", None)
     orchestration["poll_interval_seconds"] = _bounded_int(
         orchestration.get("poll_interval_seconds"), 1, 300, 60
     )

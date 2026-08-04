@@ -16,6 +16,8 @@ SQLITE_BUSY_TIMEOUT_MS = 5000
 DEFAULT_LEASE_SECONDS = 300
 RUN_STATES = {
     "WAIT_PRIMARY",
+    "WAIT_SHEET",
+    "SHEET_STABILIZING",
     "PRIMARY_SELECTED",
     "BACKUP_SELECTED",
     "RENDERING",
@@ -1332,7 +1334,7 @@ def claim_news_run(
     db_path=DEFAULT_DB_PATH,
     *,
     lease_seconds=DEFAULT_LEASE_SECONDS,
-    initial_state="WAIT_PRIMARY",
+    initial_state="WAIT_SHEET",
     now=None,
 ):
     """Atomically create or acquire a non-terminal scheduled news run.

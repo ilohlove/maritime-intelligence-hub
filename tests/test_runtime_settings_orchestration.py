@@ -25,7 +25,9 @@ class RuntimeOrchestrationSettingsTests(unittest.TestCase):
             settings["orchestration"],
             {
                 "lane_policy": "primary_then_backup",
-                "primary_timeout_minutes": 30,
+                "primary_target_minutes": 15,
+                "primary_running_grace_minutes": 5,
+                "sheet_stability_seconds": 10,
                 "poll_interval_seconds": 60,
                 "catch_up_window_minutes": 120,
                 "lease_seconds": 300,
@@ -77,12 +79,31 @@ class RuntimeOrchestrationSettingsTests(unittest.TestCase):
 
         self.assertEqual(saved["scan"]["times"], ["08:05", "20:10"])
         self.assertEqual(saved["scan"]["runs_per_day"], 2)
-        self.assertEqual(saved["orchestration"]["primary_timeout_minutes"], 30)
+        self.assertEqual(saved["orchestration"]["primary_target_minutes"], 15)
+        self.assertEqual(saved["orchestration"]["primary_running_grace_minutes"], 5)
+        self.assertEqual(saved["orchestration"]["sheet_stability_seconds"], 10)
+        self.assertNotIn("primary_timeout_minutes", saved["orchestration"])
         self.assertEqual(saved["orchestration"]["poll_interval_seconds"], 15)
         self.assertEqual(saved["orchestration"]["catch_up_window_minutes"], 120)
         self.assertEqual(saved["orchestration"]["heartbeat_seconds"], 20)
         self.assertEqual(saved["orchestration"]["lease_seconds"], 300)
         self.assertEqual(reloaded, saved)
+
+    def test_legacy_timeout_key_loads_but_is_saved_as_canonical_settings(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "runtime_settings.json"
+            path.write_text(
+                json.dumps({"orchestration": {"primary_timeout_minutes": 30}}),
+                encoding="utf-8",
+            )
+
+            loaded = load_runtime_settings(path)
+            saved = save_runtime_settings(loaded, path)
+
+        self.assertEqual(saved["orchestration"]["primary_target_minutes"], 15)
+        self.assertEqual(saved["orchestration"]["primary_running_grace_minutes"], 5)
+        self.assertEqual(saved["orchestration"]["sheet_stability_seconds"], 10)
+        self.assertNotIn("primary_timeout_minutes", saved["orchestration"])
 
     def test_non_object_json_falls_back_to_complete_defaults(self):
         with tempfile.TemporaryDirectory() as temp_dir:

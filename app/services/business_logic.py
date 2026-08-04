@@ -1,14 +1,21 @@
 import json
 import os
+import re
 import socket
 import threading
 import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 from app.logger import logger
-from app.services.combined_brief_source import evaluate_sheet_snapshot, fetch_sheet_snapshot
+from app.services.combined_brief_source import (
+    evaluate_sheet_snapshot,
+    fetch_sheet_snapshot,
+    sheet_content_fingerprint,
+    sheet_snapshot_fingerprint,
+)
 from app.services.pipeline import validate_sources
 from app.services.storage import (
     DEFAULT_DB_PATH,
@@ -17,6 +24,7 @@ from app.services.storage import (
     claim_publish_delivery,
     heartbeat_news_run,
     heartbeat_terminal_news_run_lease,
+    list_news_runs,
     mark_items_published,
     mark_publish_delivery_failed,
     mark_publish_delivery_needs_review,
@@ -29,7 +37,9 @@ from app.services.storage import (
 VIETNAM_TIMEZONE = timezone(timedelta(hours=7))
 DEFAULT_ORCHESTRATION = {
     "lane_policy": "primary_then_backup",
-    "primary_timeout_minutes": 30,
+    "primary_target_minutes": 15,
+    "primary_running_grace_minutes": 5,
+    "sheet_stability_seconds": 10,
     "poll_interval_seconds": 60,
     "catch_up_window_minutes": 120,
     "lease_seconds": 300,
@@ -164,13 +174,14 @@ def select_scheduled_lane(
     scheduled = scheduled_at or scheduled_datetime(slot, now=first_now, schedule_times=schedule_times)
     scheduled = _aware_datetime(scheduled, VIETNAM_TIMEZONE)
     run_id = build_news_run_id(slot, scheduled)
-    deadline = scheduled + timedelta(minutes=settings["primary_timeout_minutes"])
+    target_deadline = scheduled + timedelta(minutes=settings["primary_target_minutes"])
+    hard_deadline = target_deadline + timedelta(minutes=settings["primary_running_grace_minutes"])
     worker = str(owner or _worker_id())
 
     claim = claim_news_run(
         run_id,
         worker,
-        deadline,
+        hard_deadline,
         db_path=db_path,
         lease_seconds=settings["lease_seconds"],
         now=first_now,
@@ -186,10 +197,19 @@ def select_scheduled_lane(
     )
     if not claim.get("acquired"):
         return _decision_from_record(claim, worker, action="terminal" if claim.get("state") in TERMINAL_RUN_STATES else "busy")
-    deadline = _aware_datetime(claim.get("deadline") or deadline, timezone.utc)
+    persisted_deadline = _aware_datetime(claim.get("deadline") or hard_deadline, timezone.utc)
+    hard_deadline = min(hard_deadline.astimezone(timezone.utc), persisted_deadline.astimezone(timezone.utc))
+    target_deadline = min(target_deadline.astimezone(timezone.utc), hard_deadline)
     if claim.get("lane"):
         return _decision_from_record(claim, worker, action="selected", reason="lane_already_latched")
 
+    stored_stats = dict(claim.get("stats") or {})
+    observed_running = bool(stored_stats.get("sheet_observed_running"))
+    candidate_hash = str(stored_stats.get("sheet_candidate_hash") or "")
+    candidate_since = _optional_aware_datetime(stored_stats.get("sheet_candidate_since"))
+    verification_deadline = _optional_aware_datetime(stored_stats.get("sheet_verification_deadline"))
+    previous_hash, previous_content_hash = _latest_primary_sheet_fingerprints(slot, run_id, db_path)
+    freshness_start = _previous_slot_datetime(scheduled, schedule_times)
     latest_snapshot = None
     latest_evaluation = None
     while True:
@@ -203,30 +223,119 @@ def select_scheduled_lane(
         )
 
         if not str(sheet_url or "").strip():
-            latest_evaluation = {"state": "failed", "reason": "sheet_url_missing"}
+            latest_evaluation = {"state": "invalid", "reason": "sheet_url_missing", "errors": []}
         else:
             try:
                 latest_snapshot = snapshot_loader(sheet_url, expected_run_id=run_id)
-                latest_evaluation = latest_snapshot.get("evaluation") or snapshot_evaluator(latest_snapshot, run_id)
+                latest_evaluation = _evaluate_sheet_for_run(
+                    snapshot_evaluator,
+                    latest_snapshot,
+                    run_id,
+                    scheduled,
+                    hard_deadline,
+                )
+                latest_snapshot["evaluation"] = dict(latest_evaluation or {})
             except Exception as exc:
                 latest_snapshot = None
-                latest_evaluation = {"state": "waiting", "reason": f"sheet_unavailable:{_safe_error(exc)}"}
+                latest_evaluation = {
+                    "state": "invalid",
+                    "reason": f"sheet_unavailable:{_safe_error(exc)}",
+                    "errors": [],
+                }
 
         evaluation_state = str((latest_evaluation or {}).get("state") or "invalid").lower()
         evaluation_reason = str((latest_evaluation or {}).get("reason") or "snapshot_invalid")
+        if evaluation_state == "waiting" and evaluation_reason == "run_in_progress":
+            observed_running = True
+
+        snapshot_hash = str((latest_evaluation or {}).get("snapshot_hash") or "")
+        content_hash = str((latest_evaluation or {}).get("content_hash") or "")
+        marker_mode = str((latest_evaluation or {}).get("marker_mode") or "")
+        latest_article_at = ""
+        effective_deadline = hard_deadline if observed_running else target_deadline
         if evaluation_state == "ready":
-            completed_at = _aware_datetime(latest_snapshot.get("completed_at"), timezone.utc)
-            if completed_at.astimezone(timezone.utc) > deadline.astimezone(timezone.utc):
-                return _latch_lane(
-                    run_id,
-                    worker,
-                    "backup",
-                    None,
-                    "primary_completed_after_deadline",
-                    current,
-                    settings,
-                    db_path,
+            completed_at = _optional_aware_datetime((latest_evaluation or {}).get("completed_at_utc"))
+            snapshot_replayed = bool(previous_hash and snapshot_hash == previous_hash)
+            content_replayed = bool(previous_content_hash and content_hash == previous_content_hash)
+            fresh_enough, latest_article_at = _sheet_has_fresh_article(latest_snapshot, freshness_start)
+            needs_freshness = marker_mode == "legacy_time" and (
+                not observed_running or not previous_content_hash
+            )
+            if completed_at is None:
+                evaluation_state = "invalid"
+                evaluation_reason = "m1_completion_time_missing"
+            elif completed_at > effective_deadline:
+                evaluation_state = "invalid"
+                evaluation_reason = (
+                    "primary_completed_after_hard_deadline"
+                    if observed_running
+                    else "primary_completed_after_target"
                 )
+            elif completed_at > current:
+                evaluation_state = "invalid"
+                evaluation_reason = "m1_completion_time_in_future"
+            elif snapshot_replayed:
+                evaluation_state = "invalid"
+                evaluation_reason = "snapshot_hash_replayed"
+            elif content_replayed:
+                evaluation_state = "invalid"
+                evaluation_reason = "sheet_content_hash_replayed"
+            elif needs_freshness and not fresh_enough:
+                evaluation_state = "invalid"
+                evaluation_reason = "legacy_snapshot_has_no_fresh_article"
+            elif snapshot_hash != candidate_hash:
+                if verification_deadline is not None and current >= verification_deadline:
+                    evaluation_state = "invalid"
+                    evaluation_reason = "sheet_snapshot_changed_during_verification"
+                else:
+                    candidate_hash = snapshot_hash
+                    candidate_since = current
+                    if verification_deadline is None:
+                        verification_deadline = max(
+                            effective_deadline,
+                            current + timedelta(seconds=settings["sheet_stability_seconds"]),
+                        )
+                    evaluation_state = "stabilizing"
+                    evaluation_reason = "sheet_snapshot_stabilizing"
+            elif candidate_since is None:
+                candidate_since = current
+                if verification_deadline is None:
+                    verification_deadline = max(
+                        effective_deadline,
+                        current + timedelta(seconds=settings["sheet_stability_seconds"]),
+                    )
+                evaluation_state = "stabilizing"
+                evaluation_reason = "sheet_snapshot_stabilizing"
+            elif (current - candidate_since).total_seconds() < settings["sheet_stability_seconds"]:
+                evaluation_state = "stabilizing"
+                evaluation_reason = "sheet_snapshot_stabilizing"
+
+        if evaluation_state not in {"ready", "stabilizing"}:
+            candidate_hash = ""
+            candidate_since = None
+            if current < effective_deadline:
+                verification_deadline = None
+
+        decision_deadline = max(
+            effective_deadline,
+            verification_deadline or effective_deadline,
+        )
+        observation_stats = _sheet_observation_stats(
+            latest_snapshot,
+            latest_evaluation,
+            target_deadline,
+            hard_deadline,
+            observed_running,
+            candidate_hash,
+            candidate_since,
+            verification_deadline,
+            previous_hash,
+            previous_content_hash,
+            latest_article_at,
+            stable=evaluation_state == "ready",
+        )
+
+        if evaluation_state == "ready" and current <= decision_deadline:
             return _latch_lane(
                 run_id,
                 worker,
@@ -236,39 +345,62 @@ def select_scheduled_lane(
                 current,
                 settings,
                 db_path,
-            )
-        if evaluation_state == "failed":
-            return _latch_lane(
-                run_id,
-                worker,
-                "backup",
-                None,
-                f"primary_failed:{evaluation_reason}",
-                current,
-                settings,
-                db_path,
-            )
-        if current >= deadline.astimezone(timezone.utc):
-            return _latch_lane(
-                run_id,
-                worker,
-                "backup",
-                None,
-                f"primary_timeout:{evaluation_reason}",
-                current,
-                settings,
-                db_path,
+                diagnostics=observation_stats,
             )
 
+        if current >= decision_deadline:
+            fallback_reason = (
+                "primary_hard_deadline" if observed_running else "primary_target_deadline"
+            )
+            if evaluation_reason:
+                fallback_reason = f"{fallback_reason}:{evaluation_reason}"
+            observation_stats["fallback_reason"] = fallback_reason
+            return _latch_lane(
+                run_id,
+                worker,
+                "backup",
+                None,
+                fallback_reason,
+                current,
+                settings,
+                db_path,
+                diagnostics=observation_stats,
+            )
+
+        wait_state = "SHEET_STABILIZING" if evaluation_state == "stabilizing" else "WAIT_SHEET"
+        updated = update_news_run_state(
+            run_id,
+            worker,
+            wait_state,
+            db_path=db_path,
+            stats=observation_stats,
+            lease_seconds=settings["lease_seconds"],
+            now=current,
+        )
+        if updated is None:
+            return {"run_id": run_id, "owner": worker, "lane": None, "action": "busy", "reason": "lease_lost"}
+
+        next_boundary = decision_deadline
+        if evaluation_state == "stabilizing" and candidate_since is not None:
+            next_boundary = min(
+                next_boundary,
+                candidate_since + timedelta(seconds=settings["sheet_stability_seconds"]),
+            )
         wait_seconds = min(
             settings["poll_interval_seconds"],
-            max(0.0, (deadline.astimezone(timezone.utc) - current).total_seconds()),
+            settings["heartbeat_seconds"],
+            max(0.0, (next_boundary - current).total_seconds()),
         )
         wait_status = {
             "run_id": run_id,
-            "state": evaluation_state,
+            "state": wait_state,
             "reason": evaluation_reason,
-            "deadline": deadline.isoformat(),
+            "errors": list((latest_evaluation or {}).get("errors") or [])[:8],
+            "diagnostics": list((latest_evaluation or {}).get("diagnostics") or [])[:8],
+            "target_deadline": target_deadline.isoformat(),
+            "hard_deadline": hard_deadline.isoformat(),
+            "verification_deadline": verification_deadline.isoformat() if verification_deadline else "",
+            "deadline": decision_deadline.isoformat(),
             "wait_seconds": wait_seconds,
         }
         log_news_event("primary_wait", **wait_status)
@@ -668,7 +800,138 @@ class FacebookGroupDeliveryGuard:
             self.blockers.append(f"{destination}:delivery_owner_lost")
 
 
-def _latch_lane(run_id, owner, lane, snapshot, reason, now, settings, db_path):
+def _evaluate_sheet_for_run(evaluator, snapshot, run_id, scheduled, hard_deadline):
+    try:
+        return evaluator(
+            snapshot,
+            run_id,
+            expected_started_at=scheduled,
+            hard_deadline=hard_deadline,
+        )
+    except TypeError as exc:
+        message = str(exc)
+        if "unexpected keyword" not in message and "positional" not in message:
+            raise
+        return evaluator(snapshot, run_id)
+
+
+def _sheet_observation_stats(
+    snapshot,
+    evaluation,
+    target_deadline,
+    hard_deadline,
+    observed_running,
+    candidate_hash,
+    candidate_since,
+    verification_deadline,
+    previous_hash,
+    previous_content_hash,
+    latest_article_at,
+    *,
+    stable,
+):
+    snapshot = snapshot or {}
+    evaluation = evaluation or {}
+    return {
+        "marker_mode": evaluation.get("marker_mode") or snapshot.get("marker_mode") or "",
+        "sheet_l1": snapshot.get("started_at") or "",
+        "sheet_m1": snapshot.get("completed_at") or "",
+        "sheet_content_hash": evaluation.get("content_hash") or sheet_content_fingerprint(snapshot),
+        "sheet_snapshot_hash": evaluation.get("snapshot_hash") or sheet_snapshot_fingerprint(snapshot),
+        "sheet_stable": bool(stable),
+        "primary_target_deadline": target_deadline.isoformat(),
+        "primary_hard_deadline": hard_deadline.isoformat(),
+        "sheet_row_count": int(snapshot.get("data_row_count") or 0),
+        "sheet_usable_count": int(snapshot.get("usable_row_count") or 0),
+        "sheet_observed_running": bool(observed_running),
+        "sheet_candidate_hash": candidate_hash or "",
+        "sheet_candidate_since": candidate_since.isoformat() if candidate_since else "",
+        "sheet_verification_deadline": verification_deadline.isoformat() if verification_deadline else "",
+        "previous_sheet_snapshot_hash": previous_hash or "",
+        "previous_sheet_content_hash": previous_content_hash or "",
+        "latest_sheet_article_at": latest_article_at or "",
+        "sheet_evaluation_state": evaluation.get("state") or "invalid",
+        "sheet_evaluation_reason": evaluation.get("reason") or "snapshot_invalid",
+        "sheet_diagnostics": list(evaluation.get("diagnostics") or [])[:20],
+        "sheet_errors": list(evaluation.get("errors") or [])[:20],
+    }
+
+
+def _latest_primary_sheet_fingerprints(slot, current_run_id, db_path):
+    suffix = f":{_slot(slot)}"
+    for record in list_news_runs(db_path=db_path, limit=100):
+        if record.get("run_id") == current_run_id or not str(record.get("run_id") or "").endswith(suffix):
+            continue
+        if record.get("lane") != "primary":
+            continue
+        stats = record.get("stats") or {}
+        snapshot_hash = str(stats.get("sheet_snapshot_hash") or "").strip()
+        content_hash = str(stats.get("sheet_content_hash") or "").strip()
+        if snapshot_hash or content_hash:
+            return snapshot_hash, content_hash
+    return "", ""
+
+
+def _previous_slot_datetime(scheduled, schedule_times):
+    scheduled = _aware_datetime(scheduled, VIETNAM_TIMEZONE).astimezone(VIETNAM_TIMEZONE)
+    candidates = []
+    for day_offset in (0, -1):
+        day = scheduled.date() + timedelta(days=day_offset)
+        for value in _normalized_schedule_times(schedule_times):
+            hour, minute = [int(part) for part in value.split(":", 1)]
+            candidate = datetime.combine(day, datetime.min.time(), tzinfo=VIETNAM_TIMEZONE).replace(
+                hour=hour, minute=minute
+            )
+            if candidate < scheduled:
+                candidates.append(candidate)
+    return max(candidates) if candidates else scheduled - timedelta(hours=12)
+
+
+def _sheet_has_fresh_article(snapshot, freshness_start):
+    parsed_values = []
+    for item in (snapshot or {}).get("items") or []:
+        parsed = _parse_sheet_article_datetime(item.get("published_at"))
+        if parsed:
+            parsed_values.append(parsed)
+    if not parsed_values:
+        for row in (snapshot or {}).get("rows") or []:
+            parsed = _parse_sheet_article_datetime((row or {}).get("Date"))
+            if parsed:
+                parsed_values.append(parsed)
+    if not parsed_values:
+        return False, ""
+    latest = max(parsed_values).astimezone(VIETNAM_TIMEZONE)
+    return latest >= freshness_start.astimezone(VIETNAM_TIMEZONE), latest.isoformat()
+
+
+def _parse_sheet_article_datetime(value):
+    text = " ".join(str(value or "").strip().split())
+    if not text:
+        return None
+    normalized = re.sub(r"\s+(ICT|UTC\+?7)$", "+07:00", text, flags=re.IGNORECASE)
+    normalized = normalized.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(text)
+        except (TypeError, ValueError):
+            parsed = None
+    if parsed is None:
+        for pattern in ("%d/%m/%Y %H:%M", "%d/%m/%Y", "%Y/%m/%d %H:%M", "%Y/%m/%d"):
+            try:
+                parsed = datetime.strptime(text, pattern)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=VIETNAM_TIMEZONE)
+    return parsed
+
+
+def _latch_lane(run_id, owner, lane, snapshot, reason, now, settings, db_path, diagnostics=None):
     selected = select_news_run_lane(
         run_id,
         owner,
@@ -682,13 +945,11 @@ def _latch_lane(run_id, owner, lane, snapshot, reason, now, settings, db_path):
     if not selected.get("lane_selected"):
         return _decision_from_record(selected, owner, action="busy")
 
-    stats = {
-        "selection_reason": reason,
-        "sheet_status": (snapshot or {}).get("status", ""),
-        "sheet_row_count": (snapshot or {}).get("row_count"),
-        "sheet_usable_count": (snapshot or {}).get("usable_row_count", 0),
-    }
-    update_news_run_state(
+    stats = {**dict(diagnostics or {}), "selection_reason": reason}
+    stats.setdefault("sheet_status", (snapshot or {}).get("status", ""))
+    stats.setdefault("sheet_row_count", (snapshot or {}).get("data_row_count", 0))
+    stats.setdefault("sheet_usable_count", (snapshot or {}).get("usable_row_count", 0))
+    updated = update_news_run_state(
         run_id,
         owner,
         selected["state"],
@@ -697,7 +958,7 @@ def _latch_lane(run_id, owner, lane, snapshot, reason, now, settings, db_path):
         lease_seconds=settings["lease_seconds"],
         now=now,
     )
-    decision = _decision_from_record(selected, owner, action="selected", reason=reason)
+    decision = _decision_from_record(updated or selected, owner, action="selected", reason=reason)
     decision.update(
         {
             "snapshot": snapshot if lane == "primary" else None,
@@ -725,9 +986,22 @@ def _decision_from_record(record, owner, action, reason=None):
 
 def _orchestration_settings(values):
     merged = dict(DEFAULT_ORCHESTRATION)
-    merged.update(values or {})
+    supplied = dict(values or {})
+    merged.update(supplied)
     merged["lane_policy"] = str(merged.get("lane_policy") or "primary_then_backup").strip().lower()
-    merged["primary_timeout_minutes"] = _bounded_int(merged.get("primary_timeout_minutes"), 1, 240, 30)
+    if "primary_target_minutes" not in supplied and "primary_timeout_minutes" in supplied:
+        legacy_timeout = _bounded_int(supplied.get("primary_timeout_minutes"), 1, 240, 15)
+        merged["primary_target_minutes"] = min(15, legacy_timeout)
+    merged["primary_target_minutes"] = _bounded_int(
+        merged.get("primary_target_minutes"), 1, 240, 15
+    )
+    merged["primary_running_grace_minutes"] = _bounded_int(
+        merged.get("primary_running_grace_minutes"), 1, 60, 5
+    )
+    merged["sheet_stability_seconds"] = _bounded_int(
+        merged.get("sheet_stability_seconds"), 1, 300, 10
+    )
+    merged.pop("primary_timeout_minutes", None)
     merged["poll_interval_seconds"] = _bounded_int(merged.get("poll_interval_seconds"), 1, 300, 60)
     merged["catch_up_window_minutes"] = _bounded_int(merged.get("catch_up_window_minutes"), 1, 1440, 120)
     merged["lease_seconds"] = _bounded_int(merged.get("lease_seconds"), 30, 3600, 300)
@@ -778,6 +1052,13 @@ def _aware_datetime(value, default_timezone):
     if result.tzinfo is None:
         result = result.replace(tzinfo=default_timezone)
     return result
+
+
+def _optional_aware_datetime(value):
+    try:
+        return _aware_datetime(value, timezone.utc) if str(value or "").strip() else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _bounded_int(value, minimum, maximum, default):

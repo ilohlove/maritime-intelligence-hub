@@ -25,6 +25,16 @@ class ScheduledCliTests(unittest.TestCase):
         self.assertEqual(scheduled.call_args.args[0].slot, "morning")
         self.assertTrue(scheduled.call_args.args[0].dry_run)
 
+    def test_auto_slot_does_not_claim_when_auto_run_is_disabled(self):
+        args = SimpleNamespace(slot="auto", dry_run=True)
+        with patch("app.cli.validate_runtime_seeds"):
+            with patch("app.cli.load_runtime_settings", return_value=_settings()) as settings:
+                with patch("app.cli.select_scheduled_lane") as select:
+                    code = _run_scheduled(args)
+
+        self.assertEqual(code, 0)
+        select.assert_not_called()
+
     def test_parser_routes_status_and_delivery_resolution_commands(self):
         with patch("app.cli._news_status", return_value=0) as status:
             status_code = run_cli(["news-status", "--run-id", "2026-08-01:morning"])
@@ -114,7 +124,17 @@ class ScheduledCliTests(unittest.TestCase):
     def test_dry_run_renders_to_windows_safe_run_directory(self):
         args = SimpleNamespace(slot="morning", dry_run=True)
         source_result = SimpleNamespace(
-            payload={"items": [{"title": "Tin", "original_url": "https://example.com"}], "stats": {}},
+            payload={
+                "items": [{
+                    "title": "Cảng biển tăng năng lực khai thác",
+                    "summary": "Các cảng biển khu vực tăng năng lực khai thác trong ngày hôm nay. Doanh nghiệp cần theo dõi lịch tàu và thời gian thông quan.",
+                    "impact_note": "Thay đổi này có thể ảnh hưởng lịch tàu, năng lực bốc dỡ và chi phí logistics trong khu vực.",
+                    "source_name": "Test Source",
+                    "original_url": "https://example.com",
+                    "quality_status": "accepted",
+                }],
+                "stats": {},
+            },
             stats={"selected_total": 1},
             brief_path=Path("combined_brief.json"),
         )
@@ -345,7 +365,9 @@ def _settings():
         "scan": {"times": ["07:15", "19:15"]},
         "visual": {"sheet_url": "https://docs.google.com/spreadsheets/d/test/edit"},
         "orchestration": {
-            "primary_timeout_minutes": 30,
+            "primary_target_minutes": 15,
+            "primary_running_grace_minutes": 5,
+            "sheet_stability_seconds": 10,
             "poll_interval_seconds": 60,
             "catch_up_window_minutes": 120,
         },

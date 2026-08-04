@@ -198,11 +198,15 @@ def validate_publish_items(items, strict=False):
             errors.append(f"Item {index}: missing source_name")
         if not item.get("original_url"):
             errors.append(f"Item {index}: missing original_url")
+        if strict and not item.get("title"):
+            errors.append(f"Item {index}: missing title")
+        if strict and not item.get("summary"):
+            errors.append(f"Item {index}: missing summary")
         if len(item.get("summary") or "") > 900:
             errors.append(f"Item {index}: summary is too long")
         if strict and not item.get("impact_note"):
             errors.append(f"Item {index}: missing why-important impact_note")
-        if strict and item.get("quality_status") == "rejected":
+        if strict and item.get("quality_status") != "accepted":
             errors.append(f"Item {index}: failed content quality gate")
         if _looks_like_full_article(item.get("summary") or ""):
             errors.append(f"Item {index}: summary may be too close to full article length")

@@ -26,6 +26,7 @@ from app.services.combined_brief_source import (
     build_combined_brief,
     format_empty_combined_message,
     format_combined_stats,
+    validate_brief_payload,
     write_json_atomic,
 )
 from app.services.evernote_summarizer import summarize_article_id_with_evernote, summarize_candidates_with_evernote
@@ -63,6 +64,7 @@ from app.services.storage import (
     release_terminal_news_run_lease,
     resolve_publish_delivery,
 )
+from app.services.test_runner import run_program_news_test
 from app.services.telegram_publisher import send_message, send_photos
 from app.services.visual_brief_renderer import generate_image_cards, load_image_cards_result
 
@@ -158,6 +160,14 @@ def run_cli(argv=None):
     scheduled_parser = subparsers.add_parser("run-scheduled")
     scheduled_parser.add_argument("--slot", default="auto", choices=["auto", "morning", "evening"])
     scheduled_parser.add_argument("--dry-run", action="store_true")
+
+    test_news_parser = subparsers.add_parser(
+        "test-news",
+        help="Fetch configured program news outside the schedule and render an isolated preview",
+    )
+    test_news_parser.add_argument("--limit-per-source", type=int, default=10)
+    test_news_parser.add_argument("--card-limit", type=int, default=12)
+    test_news_parser.add_argument("--open-preview", action="store_true")
 
     status_parser = subparsers.add_parser("news-status")
     status_parser.add_argument("--run-id")
@@ -319,6 +329,8 @@ def run_cli(argv=None):
 
     if args.command == "run-scheduled":
         return _run_scheduled(args)
+    if args.command == "test-news":
+        return _run_program_news_test(args)
 
     if args.command == "news-status":
         return _news_status(args)
@@ -370,11 +382,19 @@ def _news_status(args):
     if not runs:
         print("No news runs found.")
     for run in runs:
-        reconciliation = (run.get("stats") or {}).get("publish_reconciliation") or {}
+        stats = run.get("stats") or {}
+        reconciliation = stats.get("publish_reconciliation") or {}
         print(
             f"{run['run_id']} | state={run['state']} | lane={run.get('lane') or '-'} | "
             f"owner={run.get('owner') or '-'} | deadline={run.get('deadline') or '-'} | "
-            f"reconciliation={reconciliation.get('status') or '-'}"
+            f"reconciliation={reconciliation.get('status') or '-'} | "
+            f"marker={stats.get('marker_mode') or '-'} | "
+            f"L1={stats.get('sheet_l1') or '-'} | M1={stats.get('sheet_m1') or '-'} | "
+            f"target={stats.get('primary_target_deadline') or '-'} | "
+            f"hard={stats.get('primary_hard_deadline') or '-'} | "
+            f"verify={stats.get('sheet_verification_deadline') or '-'} | "
+            f"stable={stats.get('sheet_stable', False)} | rows={stats.get('sheet_row_count', 0)} | "
+            f"fallback={stats.get('fallback_reason') or '-'}"
         )
     for delivery in deliveries:
         print(
@@ -508,7 +528,11 @@ def _run_scheduled(args):
     visual = settings.get("visual") or {}
     orchestration = settings.get("orchestration") or {}
     now_vietnam = datetime.now(timezone(timedelta(hours=7)))
+    trigger = "cli_auto" if args.slot == "auto" else "cli_manual"
     if args.slot == "auto":
+        if not bool(scan.get("auto_run_enabled", False)):
+            print("Auto run is disabled; no scheduled run was claimed.")
+            return 0
         slot, scheduled = due_scheduled_slot(
             now_vietnam,
             scan.get("times"),
@@ -536,7 +560,7 @@ def _run_scheduled(args):
             orchestration=orchestration,
             db_path=DEFAULT_DB_PATH,
             wait_callback=lambda status: print(
-                f"Waiting for {status['run_id']}: {status['reason']} "
+                f"{status.get('state') or 'WAIT_SHEET'} {status['run_id']}: {status['reason']} "
                 f"({int(status['wait_seconds'])}s)"
             ),
         )
@@ -585,6 +609,9 @@ def _run_scheduled(args):
                     run_id=decision["run_id"],
                     selected_lane=decision["lane"],
                     production=True,
+                    execution_mode="scheduled",
+                    preview_only=False,
+                    trigger=trigger,
                 )
                 source_result.stats.update(
                     {
@@ -598,10 +625,22 @@ def _run_scheduled(args):
                         "run_id": decision["run_id"],
                         "scan_label": slot,
                         "selected_lane": decision["lane"],
+                        "execution_mode": "scheduled",
+                        "trigger": trigger,
                         "stats": source_result.stats,
                         "publish_plan": publish_plan,
                     }
                 )
+                validation = validate_brief_payload(
+                    source_result.payload,
+                    expected_run_id=decision["run_id"],
+                    expected_lane=decision["lane"],
+                    require_publishable=True,
+                )
+                if source_result.payload.get("items") and not validation["ready"]:
+                    raise RuntimeError("Production brief quality gate failed: " + "; ".join(validation["errors"][:8]))
+                if not source_result.payload.get("items") and source_result.stats.get("quality_rejected", 0):
+                    raise RuntimeError(format_empty_combined_message(source_result.stats, source_result.brief_path))
                 write_json_atomic(source_result.brief_path, source_result.payload)
                 if not source_result.payload.get("items"):
                     if decision.get("lane") == "backup" and source_result.stats.get("backup_status") == "failed":
@@ -660,6 +699,33 @@ def _run_scheduled(args):
         return 1
 
 
+def _run_program_news_test(args):
+    validate_runtime_seeds()
+    settings = load_runtime_settings()
+    scan = settings.get("scan") or {}
+    visual = settings.get("visual") or {}
+    try:
+        result = run_program_news_test(
+            limit_per_source=max(1, int(args.limit_per_source or scan.get("limit_per_source") or 10)),
+            card_limit=max(1, int(args.card_limit or visual.get("card_limit") or 12)),
+            exclude_vietnam=visual.get("exclude_vietnam_sources", False),
+            style_settings=visual,
+            open_preview=bool(args.open_preview),
+        )
+        print(f"Program test: {result['status']}")
+        print(f"Test ID: {result['test_id']}")
+        print(format_combined_stats(result["source_stats"], result["brief_path"]))
+        if result.get("cards_result"):
+            print(f"Rendered cards: {result['cards_result']['items']} -> {result['cards_result']['output_dir']}")
+        else:
+            print("No preview cards were generated.")
+        return 0
+    except Exception as exc:
+        logger.exception("Program news test failed")
+        print(f"Program news test failed: {exc}")
+        return 1
+
+
 def _resume_scheduled_output(run_dir, run_id, _visual_settings):
     brief_path = run_dir / "combined_brief.json"
     if not brief_path.exists():
@@ -673,6 +739,9 @@ def _resume_scheduled_output(run_dir, run_id, _visual_settings):
     publish_plan = payload.get("publish_plan")
     if not isinstance(publish_plan, dict) or publish_plan.get("version") != 1:
         raise ValueError(f"Cannot resume publishing; publish plan is missing from {brief_path}")
+    validation = validate_brief_payload(payload, expected_run_id=run_id, require_publishable=True)
+    if not validation["ready"]:
+        raise ValueError("Cannot resume publishing; frozen brief failed validation: " + "; ".join(validation["errors"][:8]))
     visual_dir = run_dir / "visual"
     try:
         cards_result = load_image_cards_result(visual_dir)

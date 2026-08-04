@@ -235,14 +235,16 @@ def validate_ai_provider_payload(payload):
         value = payload.get(key)
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"AI response is missing a valid {key}")
+    category = payload.get("category")
+    if not isinstance(category, str) or not category.strip():
+        raise ValueError("AI response is missing a valid category")
     score = payload.get("importance_score")
-    if score is not None:
-        try:
-            numeric_score = int(score)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("AI importance_score must be an integer") from exc
-        if not 1 <= numeric_score <= 10:
-            raise ValueError("AI importance_score must be from 1 to 10")
+    try:
+        numeric_score = int(score)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AI importance_score must be an integer") from exc
+    if not 1 <= numeric_score <= 10:
+        raise ValueError("AI importance_score must be from 1 to 10")
     for key in ("headline", "summary", "impact_note"):
         if _looks_unaccented_vietnamese(payload.get(key)):
             raise ValueError(f"AI response contains unaccented Vietnamese in {key}")
@@ -372,8 +374,9 @@ def normalize_ai_payload(payload, article, prompt_version, model_name, allow_fal
         "commercial_relevance": _bounded_int(payload.get("commercial_relevance"), 0, 4),
         "operational_impact": _bounded_int(payload.get("operational_impact"), 0, 3),
         "vietnam_relevance": _bounded_int(payload.get("vietnam_relevance"), 0, 2),
-        "source_name": payload.get("source_name") or article.get("source_name"),
-        "original_url": payload.get("original_url") or article.get("url"),
+        # Attribution is collector-owned; never accept model mutations.
+        "source_name": article.get("source_name"),
+        "original_url": article.get("url"),
         "prompt_version": prompt_version,
         "model_name": model_name,
         "token_usage": int(payload.get("token_usage") or 0),

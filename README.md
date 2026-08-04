@@ -96,6 +96,7 @@ python -m app.main run-scan --priority P1 --label morning
 python -m app.main run-scan --priority P1 --label evening
 python -m app.main run-pipeline --priority P1 --label morning
 python -m app.main run-scheduled --slot auto --dry-run
+python -m app.main test-news --limit-per-source 10 --card-limit 12
 python -m app.main self-test
 ```
 
@@ -133,24 +134,24 @@ Runtime data is intentionally ignored by git:
 
 The MVP uses live RSS collection where feeds can be discovered, approved HTML metadata collection, trend-aware hotness scoring, configurable AI summarization with a mock fallback, and file-based publishing outputs.
 
-The normal operating model is a scheduled scan at `07:15` and `19:15` in `Asia/Bangkok`. Each scan has one stable ID such as `2026-08-01:morning`. SQLite ownership prevents two app processes or a restart from fetching, rendering, or publishing that slot twice.
+The normal operating model starts monitoring at `07:15` and `19:15` in `Asia/Bangkok`, with decision targets at `07:30` and `19:30`. Each scan has one stable ID such as `2026-08-01:morning`. SQLite ownership prevents two app processes or a restart from fetching, rendering, or publishing that slot twice.
 
 ### Reliable primary/backup orchestration
 
-The Google Sheet AI agent is the primary lane. The app waits up to 30 minutes and polls every 60 seconds. It selects backup only after primary reports `FAILED` or reaches the deadline; `M1` must also prove completion occurred by that deadline. An empty completed primary run ends as `NO_NEW_CONTENT`. Once selected, a lane cannot be replaced or mixed with the other lane.
+Google Sheets is the authoritative primary lane. The app selects it as soon as a completed snapshot is valid and remains identical across two reads 10 seconds apart. At `07:30`/`19:30`, an invalid, stale, or unavailable Sheet falls back to the app/AI lane. Only a run observed with the expected `L1` and an empty `M1` may complete through `07:35`/`19:35`. A snapshot whose `M1` is already inside its applicable deadline may use one bounded 10-second post-deadline verification window, including restart/catch-up runs. Once selected, a lane cannot be replaced or mixed with the other lane.
 
 The Sheet keeps article data in `A:K` and publishes this control record in row 1:
 
 | Cell | Value |
 | --- | --- |
-| `L1` | `started_at` ISO-8601 with timezone |
-| `M1` | `completed_at` ISO-8601 with timezone; blank while running |
-| `N1` | `run_id` (`YYYY-MM-DD:morning|evening`) |
-| `O1` | `RUNNING`, `COMPLETED`, or `FAILED` |
-| `P1` | completed article-row count |
-| `Q1` | short error code on failure |
+| `L1` | start marker: timezone-aware ISO-8601 or `HH:MM` |
+| `M1` | completion marker in the same format; blank while running |
+| `N1` | optional diagnostic `run_id` (`YYYY-MM-DD:morning|evening`) |
+| `O1` | optional diagnostic status |
+| `P1` | optional diagnostic row count |
+| `Q1` | optional short diagnostic error code |
 
-The agent writes `RUNNING` and clears completion fields first, replaces all article rows, then writes `COMPLETED`, `M1`, and `P1` last. The app accepts only a matching, internally consistent snapshot, so yesterday's rows cannot be rendered while today's agent is still running.
+The external agent must write `L1` and clear `M1` before replacing `A:K`, then write `M1` last. `N1:Q1` never block an otherwise valid snapshot. The app persists both `content_hash(A:K)` for replay prevention and `snapshot_hash(A:K+L:M)` for stability; `HH:MM` additionally requires fresh article-time evidence when the transition cannot be proven. Every primary row must contain Vietnamese title, summary, impact, source, and URL. Primary keeps Sheet order and all valid rows, bypassing source filters, limits, AI rewriting, backup ranking, and semantic dedupe; only exact published duplicates and repeated URLs are suppressed with row diagnostics.
 
 Use `AI_AGENT_SHEET_PROTOCOL.md` as the authoritative instruction block when updating the external scheduled AI agent.
 
@@ -164,7 +165,9 @@ Runtime defaults live in `config/runtime_settings.json` and are normalized by th
   },
   "orchestration": {
     "lane_policy": "primary_then_backup",
-    "primary_timeout_minutes": 30,
+    "primary_target_minutes": 15,
+    "primary_running_grace_minutes": 5,
+    "sheet_stability_seconds": 10,
     "poll_interval_seconds": 60,
     "catch_up_window_minutes": 120,
     "lease_seconds": 300,
@@ -173,7 +176,11 @@ Runtime defaults live in `config/runtime_settings.json` and are normalized by th
 }
 ```
 
-The legacy default pair `07:30,19:30` is migrated automatically. Other valid custom schedules are preserved.
+The legacy default pair `07:30,19:30` is migrated automatically to the monitoring starts. The legacy `primary_timeout_minutes` key is accepted on load but removed when canonical settings are saved. Other valid custom schedules are preserved.
+
+### Chạy thử lấy tin ngoài lịch
+
+`test-news` và nút **Chạy thử lấy tin** trong GUI chạy bộ thu thập nguồn chương trình bất kỳ lúc nào. Chế độ này dùng quality gate như production nhưng tạo preview-only trong `output/previews/program_tests/`, database cô lập và không claim scheduled run, không ghi publish ledger, không gửi Telegram/Facebook. Dùng `Check Sources` hoặc `Generate Test` riêng khi cần kiểm tra Google Sheet/nguồn đang chọn.
 
 ### Headless scheduler
 
@@ -186,11 +193,11 @@ python -m app.main run-scheduled --slot evening --dry-run
 python -m app.main news-status --run-id 2026-08-01:morning
 ```
 
-`--slot auto` resolves the most recent due slot within the 120-minute catch-up window. Explicit `morning` or `evening` selects an already-started Vietnam-calendar-day slot; a future slot is not claimed. `--dry-run` executes selection and output preparation without external publishing and remains part of the frozen run plan after a restart. Repeating a command for the same slot reuses the same `run_id` and cannot create a second delivery. Exit code `0` means success, no new content, no due slot, or work already owned/completed; exit code `1` means the selected or previously terminal run failed.
+`--slot auto` resolves the most recent due slot within the 120-minute catch-up window only when `scan.auto_run_enabled` is true. Explicit `morning` or `evening` selects an already-started Vietnam-calendar-day slot; a future slot is not claimed. `--dry-run` executes selection and output preparation without external publishing and remains part of the frozen run plan after a restart. Repeating a command for the same slot reuses the same `run_id` and cannot create a second delivery. Exit code `0` means success, no new content, auto run disabled, no due slot, or work already owned/completed; exit code `1` means the selected or previously terminal run failed.
 
 For Windows Task Scheduler, create triggers at 07:15 and 19:15, use `python` as the program, `-m app.main run-scheduled --slot auto` as arguments, and the repository directory as **Start in**. For an installed build, run `BV-maritime-intelligence-hub.exe run-scheduled --slot auto`. Keep only one configured task; the database lease is a second layer of protection, not a reason to schedule duplicate workers.
 
-Run artifacts are isolated under `output/runs/YYYY-MM-DD_morning/` or `output/runs/YYYY-MM-DD_evening/` and finalized atomically. This filesystem-safe directory key replaces the `:` in `run_id` with `_`; manifests and database rows keep the canonical ID unchanged. The brief freezes non-secret channel destinations, captions, and dry-run behavior. A process recovered from `PUBLISHING` reuses this exact brief and manifest instead of filtering or rendering again; a missing or invalid frozen manifest fails closed. `Generate Test` output from Sheet/combined mode is marked preview-only and cannot be sent by the real publish buttons.
+Run artifacts are isolated under `output/runs/YYYY-MM-DD_morning/` or `output/runs/YYYY-MM-DD_evening/` and finalized atomically. This filesystem-safe directory key replaces the `:` in `run_id` with `_`; manifests and database rows keep the canonical ID unchanged. The brief freezes non-secret channel destinations, captions, and dry-run behavior. A process recovered from `PUBLISHING` reuses this exact brief and manifest instead of filtering or rendering again; a missing or invalid frozen manifest fails closed. Preview/test artifacts are never accepted by scheduled delivery guards.
 
 If `news-status` reports `needs_review`, verify the remote channel first. Then record the audited decision without editing SQLite manually:
 

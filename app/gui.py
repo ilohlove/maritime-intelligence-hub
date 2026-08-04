@@ -50,6 +50,7 @@ from app.services.combined_brief_source import (
     build_combined_brief,
     format_empty_combined_message,
     format_combined_stats,
+    validate_brief_payload,
     write_json_atomic,
 )
 from app.services.facebook_publisher import check_page, publish_photo_post, validate_cards_publish_safety
@@ -77,6 +78,7 @@ from app.services.storage import (
     recover_expired_news_runs,
     recover_stale_publish_deliveries,
 )
+from app.services.test_runner import run_program_news_test
 from app.services.telegram_publisher import check_bot, check_chat, send_message, send_photos
 from app.services.visual_brief_renderer import (
     DEFAULT_VISUAL_BRIEF_DIR,
@@ -481,6 +483,14 @@ class AppGUI:
         test_button = ctk.CTkButton(source_actions, text="Generate Test", width=130, command=self._generate_combined_cards)
         test_button.pack(side="left", padx=(0, 8))
         self.action_buttons.append(test_button)
+        program_test_button = ctk.CTkButton(
+            source_actions,
+            text="Chạy thử lấy tin",
+            width=140,
+            command=self._run_program_news_test,
+        )
+        program_test_button.pack(side="left", padx=(0, 8))
+        self.action_buttons.append(program_test_button)
         send_button = ctk.CTkButton(source_actions, text="Generate & Send", width=150, command=self._generate_and_send_combined_cards)
         send_button.pack(side="left", padx=(0, 8))
         self.action_buttons.append(send_button)
@@ -724,7 +734,10 @@ class AppGUI:
             messagebox.showinfo("Run Now", message, parent=self.root)
             return
         self.scan_label_var.set(label)
-        self._run_background(f"Running {label} news orchestration", lambda: self._task_run_scheduled_brief(label))
+        self._run_background(
+            f"Running {label} news orchestration",
+            lambda: self._task_run_scheduled_brief(label, trigger="gui_manual"),
+        )
 
     def _task_wait_for_scheduled_scan(self):
         due_label, due_key = self._due_schedule()
@@ -761,7 +774,7 @@ class AppGUI:
         output, ok = self._task_run_scan(label)
         return f"{wait_message}\n\n{output}", ok
 
-    def _task_run_scheduled_brief(self, label):
+    def _task_run_scheduled_brief(self, label, trigger="gui_manual"):
         orchestration = dict(self.settings.get("orchestration") or {})
         scheduled = scheduled_datetime(label, now=self._schedule_now(), schedule_times=self._schedule_times())
         decision = select_scheduled_lane(
@@ -805,7 +818,7 @@ class AppGUI:
                         stats={"lane": decision["lane"], "selection_reason": decision.get("reason", "")},
                         db_path=DEFAULT_DB_PATH,
                     )
-                    result = self._generate_orchestrated_cards_result(decision, label)
+                    result = self._generate_orchestrated_cards_result(decision, label, trigger=trigger)
                 stats = dict(result["source_stats"])
                 if not result.get("cards_result"):
                     if decision.get("lane") == "backup" and stats.get("backup_status") == "failed":
@@ -858,7 +871,7 @@ class AppGUI:
         finally:
             self.active_news_run = None
 
-    def _generate_orchestrated_cards_result(self, decision, label):
+    def _generate_orchestrated_cards_result(self, decision, label, trigger="gui_manual"):
         run_dir = ROOT_DIR / "output" / "runs" / news_run_directory_name(decision["run_id"])
         brief_path = run_dir / "combined_brief.json"
         publish_plan = self._scheduled_publish_plan()
@@ -875,6 +888,12 @@ class AppGUI:
             sheet_snapshot=decision.get("snapshot") if primary else None,
             expected_run_id=decision["run_id"] if primary else None,
             allow_backup=not primary,
+            run_id=decision["run_id"],
+            selected_lane=decision["lane"],
+            production=True,
+            execution_mode="scheduled",
+            preview_only=False,
+            trigger=trigger,
         )
         source_result.stats["run_id"] = decision["run_id"]
         source_result.stats["selected_lane"] = decision["lane"]
@@ -882,8 +901,20 @@ class AppGUI:
         source_result.payload["run_id"] = decision["run_id"]
         source_result.payload["scan_label"] = label
         source_result.payload["selected_lane"] = decision["lane"]
+        source_result.payload["execution_mode"] = "scheduled"
+        source_result.payload["trigger"] = trigger
         source_result.payload["stats"] = source_result.stats
         source_result.payload["publish_plan"] = publish_plan
+        validation = validate_brief_payload(
+            source_result.payload,
+            expected_run_id=decision["run_id"],
+            expected_lane=decision["lane"],
+            require_publishable=True,
+        )
+        if source_result.payload.get("items") and not validation["ready"]:
+            raise RuntimeError("Production brief quality gate failed: " + "; ".join(validation["errors"][:8]))
+        if not source_result.payload.get("items") and source_result.stats.get("quality_rejected", 0):
+            raise RuntimeError(format_empty_combined_message(source_result.stats, source_result.brief_path))
         write_json_atomic(source_result.brief_path, source_result.payload)
 
         if not source_result.payload.get("items"):
@@ -936,6 +967,14 @@ class AppGUI:
                 f"Cannot resume publishing; frozen card manifest is missing or invalid: {visual_dir}"
             ) from exc
         stats = dict(payload.get("stats") or {})
+        validation = validate_brief_payload(
+            payload,
+            expected_run_id=decision["run_id"],
+            expected_lane=decision.get("lane") or "",
+            require_publishable=True,
+        )
+        if not validation["ready"]:
+            raise ValueError("Cannot resume publishing; frozen brief failed validation: " + "; ".join(validation["errors"][:8]))
         stats["resumed_from_state"] = "PUBLISHING"
         return {
             "brief_path": brief_path,
@@ -972,16 +1011,24 @@ class AppGUI:
 
     def _scheduled_primary_wait_update(self, status):
         self._checkpoint("wait for primary Sheet run")
+        details = list(status.get("errors") or []) + list(status.get("diagnostics") or [])
         message = (
-            f"Waiting for primary run {status['run_id']}.\n"
+            f"{status.get('state') or 'WAIT_SHEET'} — {status['run_id']}.\n"
             f"Reason: {status['reason']}\n"
-            f"Deadline: {status['deadline']}\n"
+            f"Details: {'; '.join(details) or 'none'}\n"
+            f"Target: {status.get('target_deadline') or '-'}\n"
+            f"Hard deadline: {status.get('hard_deadline') or status['deadline']}\n"
+            f"Verification deadline: {status.get('verification_deadline') or '-'}\n"
             f"Next check in {int(status['wait_seconds'])} seconds."
         )
         logger.info(message.replace("\n", " "))
         if hasattr(self, "root") and hasattr(self, "output_box"):
             self.root.after(0, self._set_text, self.output_box, message, True)
-            self.root.after(0, self.summary_var.set, f"Waiting for primary {status['run_id']}")
+            self.root.after(
+                0,
+                self.summary_var.set,
+                f"{status.get('state') or 'WAIT_SHEET'}: {status['run_id']}",
+            )
 
     @staticmethod
     def _format_orchestrated_no_content(decision, stats, brief_path):
@@ -1278,6 +1325,28 @@ class AppGUI:
         title = "Fetching app news and generating image cards" if source_mode == "app" else "Generating combined image cards"
         self._run_background(title, self._task_generate_combined_cards)
 
+    def _run_program_news_test(self):
+        self._save_settings()
+        self._run_background("Chạy thử lấy tin chương trình", self._task_run_program_news_test)
+
+    def _task_run_program_news_test(self):
+        result = run_program_news_test(
+            limit_per_source=self._int_var(self.limit_var, 10),
+            card_limit=self._optional_limit(self.card_limit_var, self.card_limit_max_var) or 12,
+            exclude_vietnam=self._exclude_vietnam_sources(),
+            style_settings=self._visual_settings(),
+        )
+        lines = [
+            f"Program test: {result['status']}",
+            f"Test ID: {result['test_id']}",
+            format_combined_stats(result["source_stats"], result["brief_path"]),
+        ]
+        if result.get("cards_result"):
+            lines.extend(["", self._format_card_result(result["cards_result"])])
+        else:
+            lines.append("No preview cards were generated.")
+        return "\n".join(lines), result["status"] != "FAILED"
+
     def _task_generate_combined_cards(self):
         refresh_result = self._refresh_app_source_if_selected()
         result = self._generate_combined_cards_result(test_mode=True)
@@ -1305,7 +1374,7 @@ class AppGUI:
             label, _scheduled = self._latest_started_schedule()
             if not label:
                 return "No news slot has started yet today; no future run was claimed.", False
-            return self._task_run_scheduled_brief(label)
+            return self._task_run_scheduled_brief(label, trigger="gui_manual")
 
         refresh_result = self._refresh_app_source_if_selected()
         result = self._retry_gui_step(
@@ -2751,7 +2820,7 @@ class AppGUI:
                 self.scan_label_var.set(due_label)
                 self._run_background(
                     f"Scheduled {due_label} orchestration",
-                    lambda: self._task_run_scheduled_brief(due_label),
+                    lambda: self._task_run_scheduled_brief(due_label, trigger="gui_auto"),
                 )
         if not self.task_running and self.facebook_group_auto_resume_var.get():
             queue_status = get_group_queue_status(

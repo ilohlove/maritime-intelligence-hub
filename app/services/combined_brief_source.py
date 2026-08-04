@@ -41,6 +41,7 @@ SHEET_ERROR_CODE_COLUMN_INDEX = 16
 SHEET_DATA_COLUMN_COUNT = 11
 SHEET_RUN_ID_PATTERN = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2}):(?P<slot>morning|evening)$")
 ISO_DATE_TIME_PREFIX_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]")
+TIME_ONLY_PATTERN = re.compile(r"^(?P<hour>\d{1,2}):(?P<minute>\d{2})$")
 SHEET_PROTOCOL_STATUSES = {"RUNNING", "COMPLETED", "FAILED"}
 VIETNAM_TIMEZONE = timezone(timedelta(hours=7))
 HTML_HREF_PATTERN = re.compile(r"""href\s*=\s*["'](?P<url>https?://[^"']+)["']""", re.IGNORECASE)
@@ -72,11 +73,16 @@ def build_combined_brief(
     run_id="",
     selected_lane="",
     production=False,
+    execution_mode="",
+    preview_only=None,
+    trigger="",
+    backup_limit_per_source=None,
 ):
     session = session or requests.Session()
     source_mode = (source_mode or "combined").strip().lower()
     use_app = source_mode in {"app", "combined"}
     use_sheet = source_mode in {"sheet", "combined"}
+    primary_sheet = bool(production and selected_lane == "primary")
 
     app_diagnostics = get_brief_candidate_diagnostics(db_path=db_path, brief_type="morning") if use_app else {}
     sheet_diagnostics = sheet_lookup(sheet_url) if use_sheet else {}
@@ -95,25 +101,30 @@ def build_combined_brief(
         sheet_data = empty_sheet_snapshot()
 
     sheet_evaluation = {}
-    if use_sheet and sheet_data.get("protocol_version") == "v1":
-        sheet_evaluation = evaluate_sheet_snapshot(
-            sheet_data,
-            expected_run_id=expected_run_id or sheet_data.get("run_id"),
+    if use_sheet and (sheet_data.get("marker_mode") or sheet_data.get("started_at")):
+        sheet_evaluation = (
+            dict(sheet_data.get("evaluation") or {})
+            if primary_sheet and sheet_data.get("evaluation")
+            else evaluate_sheet_snapshot(
+                sheet_data,
+                expected_run_id=expected_run_id or sheet_data.get("run_id"),
+            )
         )
         sheet_data["evaluation"] = sheet_evaluation
-        if sheet_evaluation["state"] != "ready":
+        if sheet_evaluation["state"] != "ready" and primary_sheet:
             sheet_data["items"] = []
     sheet_items = sheet_data.get("items", []) if use_sheet else []
     if effective_sheet_limit is not None:
         sheet_items = sheet_items[: max(1, int(effective_sheet_limit))]
     if normalize_filter_flag(exclude_vietnam):
-        sheet_items = [item for item in sheet_items if not vietnam_source_reason(item)]
+        if not primary_sheet:
+            sheet_items = [item for item in sheet_items if not vietnam_source_reason(item)]
         app_items = [item for item in app_items if not vietnam_source_reason(item)]
     backup_items = []
     backup_results = []
     fallback_reason = ""
-    protocol_blocks_automatic_backup = (
-        sheet_data.get("protocol_version") == "v1"
+    protocol_blocks_automatic_backup = bool(
+        sheet_data.get("marker_mode")
         and sheet_evaluation.get("state") in {"ready", "waiting", "invalid"}
     )
     if (
@@ -128,7 +139,7 @@ def build_combined_brief(
             backup_results = collect_backup_news(
                 feed_master=backup_feed_master or DEFAULT_BACKUP_FEED_MASTER,
                 official_sources=load_sources(DEFAULT_SOURCE_MASTER)[0],
-                limit_per_source=effective_sheet_limit or 10,
+                limit_per_source=backup_limit_per_source or effective_sheet_limit or 10,
                 db_path=db_path,
                 session=session,
                 exclude_vietnam=exclude_vietnam,
@@ -138,8 +149,14 @@ def build_combined_brief(
         except Exception as exc:
             fallback_reason = f"{fallback_reason}; backup_error={exc}"
     normalized_backup_items = [_backup_item_to_brief(item) for item in backup_items]
+    stale_backup_removed = 0
+    if production and selected_lane == "backup":
+        normalized_backup_items, stale_backup_removed = filter_recent_backup_items(normalized_backup_items)
     raw_items = app_items + sheet_items + normalized_backup_items
-    filtered_items, stats = filter_publishable_items(raw_items, db_path=db_path)
+    if primary_sheet:
+        filtered_items, stats = filter_primary_sheet_items(sheet_items, db_path=db_path)
+    else:
+        filtered_items, stats = filter_publishable_items(raw_items, db_path=db_path)
     if source_mode == "app" and not production:
         for item in filtered_items:
             item["editorial_score"] = calculate_editorial_score(item)
@@ -148,7 +165,21 @@ def build_combined_brief(
             key=lambda item: (int(item.get("editorial_score") or 0), str(item.get("published_at") or "")),
             reverse=True,
         )
-    if production:
+    if primary_sheet:
+        for item in filtered_items:
+            item["quality_status"] = "accepted"
+            item["quality_errors"] = []
+            item["ai_provider"] = item.get("ai_provider") or "sheet"
+            item["editorial_score"] = calculate_editorial_score(item)
+        stats.update(
+            {
+                "enriched_total": 0,
+                "quality_rejected": 0,
+                "quality_rejections": [],
+                "quality_gate_ready": bool(filtered_items),
+            }
+        )
+    elif production:
         filtered_items, quality_stats = enrich_brief_items(
             filtered_items,
             db_path=db_path,
@@ -177,6 +208,10 @@ def build_combined_brief(
     )
     stats["backup_ok_sources"] = backup_ok_sources
     stats["backup_failed_sources"] = backup_failed_sources
+    stats["backup_stale_removed"] = stale_backup_removed
+    effective_execution_mode = execution_mode or ("scheduled" if production else "preview")
+    stats["execution_mode"] = effective_execution_mode
+    stats["trigger"] = trigger or ""
     if use_app:
         stats["app_db"] = app_diagnostics
     if use_sheet:
@@ -190,6 +225,10 @@ def build_combined_brief(
         sheet_diagnostics["status"] = sheet_data.get("status", "")
         sheet_diagnostics["row_count"] = sheet_data.get("row_count")
         sheet_diagnostics["error_code"] = sheet_data.get("error_code", "")
+        sheet_diagnostics["marker_mode"] = sheet_data.get("marker_mode", "")
+        sheet_diagnostics["content_hash"] = sheet_data.get("content_hash", "")
+        sheet_diagnostics["snapshot_hash"] = sheet_data.get("snapshot_hash", "")
+        sheet_diagnostics["row_errors"] = list(sheet_data.get("row_errors") or [])
         sheet_diagnostics["evaluation"] = sheet_evaluation
         stats["sheet_source"] = sheet_diagnostics
     effective_card_limit = None if source_mode == "sheet" else card_limit
@@ -206,7 +245,9 @@ def build_combined_brief(
         "source_mode": source_mode,
         "run_id": run_id or "",
         "selected_lane": selected_lane or "",
-        "preview_only": not production,
+        "preview_only": (bool(preview_only) if preview_only is not None else not production),
+        "execution_mode": effective_execution_mode,
+        "trigger": trigger or "",
         "stats": stats,
         "publish_safety": validate_publish_items(selected_items, strict=production),
         "items": selected_items,
@@ -255,6 +296,31 @@ def _backup_item_to_brief(item):
     normalized["title_hash"] = title_hash(normalized.get("title"))
     normalized["item_key"] = item_key(normalized)
     return normalized
+
+
+def filter_recent_backup_items(items, *, now=None, max_age_hours=48):
+    """Keep only backup items with a usable publication time in the daily window."""
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    kept = []
+    removed = 0
+    for item in items or []:
+        value = str(item.get("published_at") or "").strip().replace("Z", "+00:00")
+        try:
+            published = datetime.fromisoformat(value)
+            if published.tzinfo is None or published.utcoffset() is None:
+                raise ValueError
+            age_hours = (current - published.astimezone(timezone.utc)).total_seconds() / 3600
+        except (TypeError, ValueError):
+            removed += 1
+            continue
+        if age_hours < -1 or age_hours > max_age_hours:
+            removed += 1
+            continue
+        kept.append(item)
+    return kept, removed
 
 
 def enrich_brief_items(items, db_path=DEFAULT_DB_PATH, production=False):
@@ -365,11 +431,71 @@ def is_valid_vietnamese_item(item):
         return False
     if not all(has_vietnamese_marks(value) for value in required):
         return False
-    for sentence in re.split(r"[.!?]+", str(item.get("summary") or "")):
+    title_words = re.findall(r"[A-Za-zÀ-ỹĐđ]+", str(item.get("title") or ""))
+    if len(title_words) < 3:
+        return False
+    summary = str(item.get("summary") or "")
+    summary_sentences = _split_summary_sentences(summary)
+    if not 1 <= len(summary_sentences) <= 4:
+        return False
+    if len(re.findall(r"[A-Za-zÀ-ỹĐđ]+", summary)) < 12:
+        return False
+    if len(re.findall(r"[A-Za-zÀ-ỹĐđ]+", str(item.get("impact_note") or ""))) < 8:
+        return False
+    for sentence in summary_sentences:
         words = re.findall(r"[A-Za-zÀ-ỹĐđ]+", sentence)
         if len(words) >= 7 and not has_vietnamese_marks(sentence):
             return False
+    combined = " ".join(str(value).lower() for value in required)
+    english_hits = len(re.findall(r"\b(the|and|to|of|is|was|for|on|from|with|as|an)\b", combined))
+    vietnamese_hits = len(
+        re.findall(r"\b(các|và|là|của|cho|đã|từ|trong|với|khi|tại|sau|trên|được|đang)\b", combined)
+    )
+    if english_hits >= 3 and english_hits > max(1, vietnamese_hits * 2):
+        return False
     return len(str(item.get("summary") or "")) <= 900 and len(str(item.get("impact_note") or "")) <= 600
+
+
+def _split_summary_sentences(value):
+    """Split prose without treating dots inside numeric thousands/decimals as stops."""
+    protected = re.sub(r"(?<=\d)\.(?=\d)", "\u0000", str(value or ""))
+    return [
+        sentence.replace("\u0000", ".").strip()
+        for sentence in re.split(r"[.!?]+", protected)
+        if sentence.replace("\u0000", ".").strip()
+    ]
+
+
+def validate_brief_payload(
+    payload,
+    *,
+    expected_run_id="",
+    expected_lane="",
+    require_publishable=False,
+):
+    """Validate a rendered brief before it can be rendered or delivered."""
+    payload = payload or {}
+    errors = []
+    if expected_run_id and str(payload.get("run_id") or "") != str(expected_run_id):
+        errors.append("run_id mismatch")
+    if expected_lane and str(payload.get("selected_lane") or "") != str(expected_lane):
+        errors.append("selected_lane mismatch")
+    if require_publishable and bool(payload.get("preview_only")):
+        errors.append("preview_only payload cannot be published")
+    items = payload.get("items") or []
+    for index, item in enumerate(items, start=1):
+        if not item.get("source_name"):
+            errors.append(f"Item {index}: missing source_name")
+        if not _valid_http_url(item.get("original_url")):
+            errors.append(f"Item {index}: invalid original_url")
+        if item.get("quality_status") != "accepted":
+            errors.append(f"Item {index}: quality status is not accepted")
+        if not is_valid_vietnamese_item(item):
+            errors.append(f"Item {index}: Vietnamese content quality gate failed")
+    safety = validate_publish_items(items, strict=True)
+    if not safety.get("ready"):
+        errors.extend(safety.get("errors") or [])
+    return {"ready": not errors, "errors": errors}
 
 
 def calculate_editorial_score(item):
@@ -493,6 +619,7 @@ def load_sheet_data(sheet_url, limit=None, session=None):
 def empty_sheet_snapshot():
     return {
         "protocol_version": "",
+        "marker_mode": "",
         "started_at": "",
         "completed_at": "",
         "run_id": "",
@@ -505,6 +632,9 @@ def empty_sheet_snapshot():
         "data_row_count": 0,
         "usable_row_count": 0,
         "invalid_row_count": 0,
+        "row_errors": [],
+        "content_hash": "",
+        "snapshot_hash": "",
         "rows": [],
         "items": [],
     }
@@ -540,7 +670,7 @@ def parse_sheet_csv(csv_text):
 
 
 def parse_sheet_snapshot(csv_text):
-    """Parse article rows (A:K) and protocol-v1 metadata (L:Q) atomically."""
+    """Parse article rows (A:K), authoritative L/M markers, and diagnostic N:Q."""
     raw_rows = list(csv.reader(StringIO(csv_text or "")))
     if not raw_rows:
         return empty_sheet_snapshot()
@@ -557,16 +687,22 @@ def parse_sheet_snapshot(csv_text):
     started_at, completed_at, run_id, status, row_count_raw, error_code = marker_values
     rows = _sheet_data_rows(raw_rows)
     items = []
+    row_errors = []
     for index, row in enumerate(rows, start=1):
         item = sheet_row_to_item(row, index)
+        errors = _sheet_row_validation_errors(row, item, index)
+        if errors:
+            row_errors.extend(errors)
         if item:
             items.append(item)
 
-    protocol_version = _sheet_protocol_version(marker_values)
+    marker_mode = _sheet_marker_mode(started_at, completed_at)
+    protocol_version = "v1" if marker_mode == "iso" else "legacy" if marker_mode == "legacy_time" else ""
     run_label = _snapshot_run_label(run_id, started_at)
     row_count = int(row_count_raw) if re.fullmatch(r"\d+", row_count_raw) else None
     snapshot = {
         "protocol_version": protocol_version,
+        "marker_mode": marker_mode,
         "started_at": started_at,
         "completed_at": completed_at,
         "run_id": run_id,
@@ -580,18 +716,30 @@ def parse_sheet_snapshot(csv_text):
         "data_row_count": len(rows),
         "usable_row_count": len(items),
         "invalid_row_count": len(rows) - len(items),
+        "row_errors": row_errors,
+        "content_hash": _raw_sheet_content_hash(raw_rows),
+        "snapshot_hash": _raw_sheet_snapshot_hash(raw_rows),
         "rows": rows,
         "items": items,
     }
     return snapshot
 
 
-def evaluate_sheet_snapshot(snapshot, expected_run_id=None):
-    """Return coordinator readiness without trusting stale or partial Sheet data."""
+def evaluate_sheet_snapshot(
+    snapshot,
+    expected_run_id=None,
+    *,
+    expected_started_at=None,
+    hard_deadline=None,
+):
+    """Evaluate L1/M1 and every Sheet row; N1:Q1 are diagnostics only."""
     snapshot = snapshot or {}
     run_id = str(snapshot.get("run_id") or "").strip()
     status = str(snapshot.get("status") or "").strip().upper()
     expected = str(expected_run_id or "").strip()
+    marker_mode = str(snapshot.get("marker_mode") or "").strip() or _sheet_marker_mode(
+        snapshot.get("started_at"), snapshot.get("completed_at")
+    )
     base = {
         "state": "invalid",
         "reason": "snapshot_invalid",
@@ -601,85 +749,98 @@ def evaluate_sheet_snapshot(snapshot, expected_run_id=None):
         "run_id": run_id,
         "expected_run_id": expected,
         "status": status,
+        "marker_mode": marker_mode,
+        "content_hash": sheet_content_fingerprint(snapshot),
+        "snapshot_hash": sheet_snapshot_fingerprint(snapshot),
+        "row_count": int(snapshot.get("data_row_count") or 0),
         "errors": [],
+        "diagnostics": [],
     }
 
-    if snapshot.get("protocol_version") != "v1":
-        base["reason"] = "protocol_not_v1"
-        base["errors"] = ["Sheet snapshot does not contain protocol-v1 markers in L1:Q1."]
+    if marker_mode not in {"iso", "legacy_time"}:
+        base["reason"] = "invalid_l1_m1_markers"
+        base["errors"] = ["L1/M1 must both use timezone-aware ISO timestamps or HH:MM."]
         return base
 
     run_match = SHEET_RUN_ID_PATTERN.fullmatch(run_id)
-    if not run_match:
-        base["reason"] = "invalid_run_id"
-        base["errors"] = ["N1 must use run_id YYYY-MM-DD:morning|evening."]
-        return base
-    if expected and not SHEET_RUN_ID_PATTERN.fullmatch(expected):
+    expected_match = SHEET_RUN_ID_PATTERN.fullmatch(expected)
+    if run_id and not run_match:
+        base["diagnostics"].append("N1 run_id is malformed; ignored for lane selection.")
+    elif not run_id:
+        base["diagnostics"].append("N1 run_id is empty; ignored for lane selection.")
+    elif expected and run_id != expected:
+        base["diagnostics"].append("N1 run_id differs from the expected run; L1/M1 remain authoritative.")
+    if expected and not expected_match:
         base["reason"] = "invalid_expected_run_id"
-        base["errors"] = ["Expected run_id must use YYYY-MM-DD:morning|evening."]
-        return base
-    if expected and run_id != expected:
-        base.update(state="waiting", reason="run_id_mismatch", valid=True)
+        base["errors"].append("Expected run_id must use YYYY-MM-DD:morning|evening.")
         return base
 
-    errors = []
-    started = _parse_aware_iso_timestamp(snapshot.get("started_at"), "L1 started_at", errors, required=True)
-    completed = _parse_aware_iso_timestamp(
-        snapshot.get("completed_at"),
-        "M1 completed_at",
-        errors,
-        required=status == "COMPLETED",
+    errors = list(base.get("errors") or [])
+    expected_start = _expected_sheet_start(expected_match, expected_started_at, errors)
+    started = _parse_sheet_marker(
+        snapshot.get("started_at"), marker_mode, "L1 started_at", errors, expected_start, required=True
     )
-    if status not in SHEET_PROTOCOL_STATUSES:
-        errors.append("O1 status must be RUNNING, COMPLETED, or FAILED.")
-    if started:
-        vietnam_started = started.astimezone(VIETNAM_TIMEZONE)
-        if vietnam_started.date().isoformat() != run_match.group("date"):
-            errors.append("N1 run_id date must match the Vietnam date in L1 started_at.")
-        expected_slot = "morning" if vietnam_started.hour < 12 else "evening"
-        if expected_slot != run_match.group("slot"):
-            errors.append("N1 run_id slot must match the Vietnam time in L1 started_at.")
+    completed = _parse_sheet_marker(
+        snapshot.get("completed_at"), marker_mode, "M1 completed_at", errors, expected_start, required=False
+    )
+
+    if started and expected_start:
+        local_started = started.astimezone(VIETNAM_TIMEZONE)
+        local_expected = expected_start.astimezone(VIETNAM_TIMEZONE)
+        if local_started.date() != local_expected.date() or (
+            local_started.hour,
+            local_started.minute,
+        ) != (local_expected.hour, local_expected.minute):
+            base.update(
+                state="waiting",
+                reason="l1_slot_mismatch",
+                valid=True,
+                errors=[
+                    f"L1 is {local_started.strftime('%Y-%m-%d %H:%M')}; "
+                    f"expected {local_expected.strftime('%Y-%m-%d %H:%M')}."
+                ],
+            )
+            return base
     if started and completed and completed < started:
         errors.append("M1 completed_at cannot be earlier than L1 started_at.")
 
-    row_count_raw = snapshot.get("row_count_raw")
-    if row_count_raw is None:
-        row_count_raw = snapshot.get("row_count")
-    row_count_text = str(row_count_raw if row_count_raw is not None else "").strip()
-    row_count = int(row_count_text) if re.fullmatch(r"\d+", row_count_text) else None
-    error_code = str(snapshot.get("error_code") or "").strip()
+    _append_protocol_diagnostics(snapshot, completed is not None, base["diagnostics"])
 
-    if status == "RUNNING":
-        if str(snapshot.get("completed_at") or "").strip():
-            errors.append("M1 completed_at must be empty while O1 is RUNNING.")
-        if row_count_text:
-            errors.append("P1 row_count must be empty while O1 is RUNNING.")
-        if error_code:
-            errors.append("Q1 error_code must be empty while O1 is RUNNING.")
-    elif status == "COMPLETED":
-        if row_count is None:
-            errors.append("P1 row_count must be a non-negative integer when O1 is COMPLETED.")
-        else:
-            data_count = int(snapshot.get("data_row_count", len(snapshot.get("rows") or [])))
-            usable_count = int(snapshot.get("usable_row_count", len(snapshot.get("items") or [])))
-            if row_count != data_count:
-                errors.append(f"P1 row_count is {row_count}, but the snapshot contains {data_count} data rows.")
-            if row_count != usable_count:
-                errors.append(f"P1 row_count is {row_count}, but only {usable_count} rows are usable.")
-        if error_code:
-            errors.append("Q1 error_code must be empty when O1 is COMPLETED.")
-    elif status == "FAILED" and not error_code:
-        errors.append("Q1 error_code is required when O1 is FAILED.")
+    if hard_deadline and completed:
+        deadline = _coerce_aware_datetime(hard_deadline, errors, "hard deadline")
+        if deadline and completed.astimezone(timezone.utc) > deadline.astimezone(timezone.utc):
+            errors.append("M1 completed_at is later than the hard deadline.")
+
+    if completed:
+        data_count = int(snapshot.get("data_row_count", len(snapshot.get("rows") or [])))
+        usable_count = int(snapshot.get("usable_row_count", len(snapshot.get("items") or [])))
+        row_errors = list(snapshot.get("row_errors") or [])
+        if not row_errors:
+            for index, item in enumerate(snapshot.get("items") or [], start=1):
+                if not str(item.get("source_name") or "").strip():
+                    row_errors.append(f"Row {item.get('row_index') or index}: missing source.")
+                if not _valid_http_url(item.get("original_url")):
+                    row_errors.append(f"Row {item.get('row_index') or index}: invalid URL.")
+                if not is_valid_vietnamese_item(item):
+                    row_errors.append(
+                        f"Row {item.get('row_index') or index}: Vietnamese title, summary, or impact does not pass the quality gate."
+                    )
+        if data_count <= 0:
+            errors.append("Sheet contains no article rows.")
+        if usable_count != data_count:
+            errors.append(f"Only {usable_count} of {data_count} Sheet rows are valid.")
+        errors.extend(str(value) for value in row_errors[:20])
 
     if errors:
         base["errors"] = errors
+        base["reason"] = "completed_snapshot_invalid" if completed else "marker_invalid"
         return base
 
     base["valid"] = True
-    if status == "COMPLETED":
+    base["started_at_utc"] = started.astimezone(timezone.utc).isoformat() if started else ""
+    base["completed_at_utc"] = completed.astimezone(timezone.utc).isoformat() if completed else ""
+    if completed:
         base.update(state="ready", reason="completed", ready=True, terminal=True)
-    elif status == "FAILED":
-        base.update(state="failed", reason=error_code, terminal=True)
     else:
         base.update(state="waiting", reason="run_in_progress")
     return base
@@ -705,11 +866,94 @@ def _sheet_data_rows(raw_rows):
     return rows
 
 
-def _sheet_protocol_version(marker_values):
-    started_at, completed_at, run_id, status, row_count, error_code = marker_values
-    if any((completed_at, run_id, status, row_count, error_code)) or ISO_DATE_TIME_PREFIX_PATTERN.match(started_at):
-        return "v1"
-    return "legacy" if started_at else ""
+def _sheet_marker_mode(started_at, completed_at):
+    started_kind = _marker_kind(started_at)
+    completed_kind = _marker_kind(completed_at)
+    if started_kind == "iso" and completed_kind in {"", "iso"}:
+        return "iso"
+    if started_kind == "time" and completed_kind in {"", "time"}:
+        return "legacy_time"
+    return ""
+
+
+def _marker_kind(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if ISO_DATE_TIME_PREFIX_PATTERN.match(text):
+        return "iso"
+    return "time" if TIME_ONLY_PATTERN.fullmatch(text) else "invalid"
+
+
+def _raw_sheet_snapshot_hash(raw_rows):
+    if not raw_rows:
+        return ""
+    header = raw_rows[0]
+    payload = {
+        "a_to_k": _raw_sheet_content_matrix(raw_rows),
+        "l_to_m": [
+            _normalized_hash_cell(_cell(header, SHEET_RUN_MARKER_COLUMN_INDEX)),
+            _normalized_hash_cell(_cell(header, SHEET_COMPLETED_AT_COLUMN_INDEX)),
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _raw_sheet_content_hash(raw_rows):
+    if not raw_rows:
+        return ""
+    encoded = json.dumps(
+        _raw_sheet_content_matrix(raw_rows),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _raw_sheet_content_matrix(raw_rows):
+    matrix = [
+        [_normalized_hash_cell(_cell(raw_rows[0], index)) for index in range(SHEET_DATA_COLUMN_COUNT)]
+    ]
+    for values in raw_rows[1:]:
+        data_values = [_normalized_hash_cell(_cell(values, index)) for index in range(SHEET_DATA_COLUMN_COUNT)]
+        if any(data_values):
+            matrix.append(data_values)
+    return matrix
+
+
+def sheet_snapshot_fingerprint(snapshot):
+    if not snapshot:
+        return ""
+    existing = str((snapshot or {}).get("snapshot_hash") or "").strip()
+    if existing:
+        return existing
+    snapshot = snapshot or {}
+    rows = snapshot.get("rows") or snapshot.get("items") or []
+    payload = {
+        "a_to_k": rows,
+        "l_to_m": [
+            _normalized_hash_cell(snapshot.get("started_at")),
+            _normalized_hash_cell(snapshot.get("completed_at")),
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def sheet_content_fingerprint(snapshot):
+    if not snapshot:
+        return ""
+    existing = str(snapshot.get("content_hash") or "").strip()
+    if existing:
+        return existing
+    rows = snapshot.get("rows") or snapshot.get("items") or []
+    encoded = json.dumps(rows, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _normalized_hash_cell(value):
+    return " ".join(str(value or "").replace("\u00a0", " ").split())
 
 
 def _snapshot_run_label(run_id, started_at):
@@ -737,6 +981,73 @@ def _parse_aware_iso_timestamp(value, field_name, errors, required=False):
         errors.append(f"{field_name} must include a timezone offset.")
         return None
     return parsed
+
+
+def _expected_sheet_start(expected_match, expected_started_at, errors):
+    if expected_started_at is not None:
+        parsed = _coerce_aware_datetime(expected_started_at, errors, "expected started_at")
+        return parsed.astimezone(VIETNAM_TIMEZONE) if parsed else None
+    if not expected_match:
+        return None
+    date_value = datetime.fromisoformat(expected_match.group("date"))
+    hour, minute = (7, 15) if expected_match.group("slot") == "morning" else (19, 15)
+    return date_value.replace(hour=hour, minute=minute, tzinfo=VIETNAM_TIMEZONE)
+
+
+def _parse_sheet_marker(value, marker_mode, field_name, errors, expected_start, required=False):
+    text = str(value or "").strip()
+    if not text:
+        if required:
+            errors.append(f"{field_name} is required.")
+        return None
+    if marker_mode == "iso":
+        return _parse_aware_iso_timestamp(text, field_name, errors, required=required)
+    match = TIME_ONLY_PATTERN.fullmatch(text)
+    if not match:
+        errors.append(f"{field_name} must use HH:MM.")
+        return None
+    hour, minute = int(match.group("hour")), int(match.group("minute"))
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        errors.append(f"{field_name} must use a valid HH:MM time.")
+        return None
+    anchor = expected_start or datetime.now(VIETNAM_TIMEZONE)
+    return anchor.astimezone(VIETNAM_TIMEZONE).replace(
+        hour=hour, minute=minute, second=0, microsecond=0
+    )
+
+
+def _coerce_aware_datetime(value, errors, field_name):
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value or "").strip().replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            errors.append(f"{field_name} must be an ISO datetime.")
+            return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=VIETNAM_TIMEZONE)
+    return parsed
+
+
+def _append_protocol_diagnostics(snapshot, completed, diagnostics):
+    run_id = str(snapshot.get("run_id") or "").strip()
+    status = str(snapshot.get("status") or "").strip().upper()
+    row_count_raw = snapshot.get("row_count_raw")
+    error_code = str(snapshot.get("error_code") or "").strip()
+    expected_status = "COMPLETED" if completed else "RUNNING"
+    if not run_id:
+        diagnostics.append("N1 is empty.")
+    if status != expected_status:
+        diagnostics.append(f"O1 is {status or 'empty'}; L1/M1 indicate {expected_status}.")
+    if str(row_count_raw or "").strip():
+        expected_rows = int(snapshot.get("data_row_count") or 0)
+        if not re.fullmatch(r"\d+", str(row_count_raw).strip()) or int(row_count_raw) != expected_rows:
+            diagnostics.append("P1 row_count does not match A:K; ignored.")
+    elif completed:
+        diagnostics.append("P1 is empty; ignored.")
+    if error_code:
+        diagnostics.append("Q1 contains an error code; ignored for lane selection.")
 
 
 def get_sheet_run_status(sheet_url, session=None):
@@ -778,9 +1089,9 @@ def sheet_lookup(sheet_url):
 
 
 def sheet_row_to_item(row, index):
-    title = first_value(row, "Vietnamese translation", "Headline")
-    summary = first_value(row, "Main summary (Vietnamese)", "Main summary")
-    impact_note = first_value(row, "Why it matters (Vietnamese)", "Why it matters")
+    title = first_value(row, "Vietnamese translation")
+    summary = first_value(row, "Main summary (Vietnamese)")
+    impact_note = first_value(row, "Why it matters (Vietnamese)")
     original_url = normalize_source_url(first_value(row, "Source URL"))
     source_name = first_value(row, "Source")
     if not title or not _valid_http_url(original_url):
@@ -788,9 +1099,12 @@ def sheet_row_to_item(row, index):
 
     item = {
         "title": title,
+        "source_title": first_value(row, "Headline"),
         "published_at": first_value(row, "Date"),
         "summary": summary,
+        "source_summary": first_value(row, "Main summary"),
         "impact_note": impact_note,
+        "source_impact_note": first_value(row, "Why it matters"),
         "category": first_value(row, "Topic"),
         "importance_score": None,
         "hotness_score": None,
@@ -807,6 +1121,22 @@ def sheet_row_to_item(row, index):
     item["title_hash"] = title_hash(item["title"])
     item["item_key"] = item_key(item)
     return item
+
+
+def _sheet_row_validation_errors(row, item, index):
+    required = {
+        "Vietnamese title": first_value(row, "Vietnamese translation"),
+        "Vietnamese summary": first_value(row, "Main summary (Vietnamese)"),
+        "Vietnamese impact": first_value(row, "Why it matters (Vietnamese)"),
+        "source": first_value(row, "Source"),
+        "URL": normalize_source_url(first_value(row, "Source URL")),
+    }
+    errors = [f"Row {index}: missing {name}." for name, value in required.items() if not str(value or "").strip()]
+    if required["URL"] and not _valid_http_url(required["URL"]):
+        errors.append(f"Row {index}: invalid URL.")
+    if not errors and (not item or not is_valid_vietnamese_item(item)):
+        errors.append(f"Row {index}: Vietnamese title, summary, or impact does not pass the quality gate.")
+    return errors
 
 
 def filter_publishable_items(items, db_path=DEFAULT_DB_PATH):
@@ -848,6 +1178,61 @@ def filter_publishable_items(items, db_path=DEFAULT_DB_PATH):
     stats["eligible_total"] = len(fresh)
     stats["selected_total"] = len(selected)
     return selected, stats
+
+
+def filter_primary_sheet_items(items, db_path=DEFAULT_DB_PATH):
+    """Keep Sheet order and only suppress already-published rows or repeated URLs."""
+    published = published_lookup(db_path=db_path)
+    selected = []
+    skipped = []
+    seen_urls = set()
+    for item in items or []:
+        row_index = item.get("row_index")
+        if (
+            item.get("item_key") in published["keys"]
+            or (
+                item.get("canonical_url")
+                and item.get("canonical_url") in published["urls"]
+            )
+        ):
+            skipped.append(
+                {
+                    "row_index": row_index,
+                    "reason": "already_published_exact",
+                    "title": item.get("title") or "",
+                    "url": item.get("original_url") or "",
+                }
+            )
+            continue
+        canonical_url = item.get("canonical_url") or canonicalize_url(item.get("original_url"))
+        if canonical_url and canonical_url in seen_urls:
+            skipped.append(
+                {
+                    "row_index": row_index,
+                    "reason": "duplicate_url_in_sheet",
+                    "title": item.get("title") or "",
+                    "url": item.get("original_url") or "",
+                }
+            )
+            continue
+        if canonical_url:
+            seen_urls.add(canonical_url)
+        selected.append(item)
+
+    already_published = sum(1 for item in skipped if item["reason"] == "already_published_exact")
+    duplicate_removed = len(skipped) - already_published
+    return selected, {
+        "app_total": 0,
+        "sheet_total": len(items or []),
+        "backup_total": 0,
+        "raw_total": len(items or []),
+        "already_published": already_published,
+        "duplicate_removed": duplicate_removed,
+        "eligible_total": len(selected),
+        "selected_total": len(selected),
+        "duplicate_groups": [],
+        "sheet_skipped_rows": skipped,
+    }
 
 
 def select_unpublished_sheet_items(items, db_path=DEFAULT_DB_PATH):
@@ -1044,7 +1429,7 @@ def format_combined_stats(stats, brief_path=None):
         f"Already published removed: {stats.get('already_published', 0)}",
         f"Duplicate removed: {stats.get('duplicate_removed', 0)}",
         f"Eligible after published filter: {stats.get('eligible_total', 0)}",
-        f"Selected after dedupe: {stats.get('selected_total', 0)}",
+        f"Selected for output: {stats.get('selected_total', 0)}",
         f"AI enriched: {stats.get('enriched_total', 0)}",
         f"Quality rejected: {stats.get('quality_rejected', 0)}",
         f"Backup items: {stats.get('backup_total', 0)}",
@@ -1092,6 +1477,13 @@ def format_combined_stats(stats, brief_path=None):
             lines.append(f"- Keep: {group.get('winner')}")
             for title in group.get("removed") or []:
                 lines.append(f"  Remove: {title}")
+    if stats.get("sheet_skipped_rows"):
+        lines.append("")
+        lines.append("Skipped Sheet rows:")
+        for item in stats["sheet_skipped_rows"]:
+            lines.append(
+                f"- Row {item.get('row_index')}: {item.get('reason')} — {item.get('title') or item.get('url')}"
+            )
     return "\n".join(lines)
 
 

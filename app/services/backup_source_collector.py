@@ -164,12 +164,17 @@ def _collect_one(source, provider, limit, db_path, session):
                 resolved = _resolve_url(item["url"], session)
                 if resolved:
                     item["url"] = resolved
+            parsed_url = urlparse(str(item.get("url") or ""))
+            if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+                continue
+            if parsed_url.netloc.lower().removeprefix("www.") == "news.google.com":
+                continue
             if vietnam_source_reason(item) or (source.get("country") == "Vietnam"):
                 continue
             item["source_type"] = "backup"
             item["provider"] = provider
             item["fetched_at"] = item.get("fetched_at") or utc_now()
-            if len(item.get("description") or "") < 180 and item.get("url"):
+            if item.get("url"):
                 extracted = read_article(item["url"], session=session)
                 if extracted["text"]:
                     item["description"] = extracted["text"][:1000]
@@ -177,6 +182,8 @@ def _collect_one(source, provider, limit, db_path, session):
                 item["reader_provider"] = extracted["provider"]
                 item["reader_status"] = extracted["status"]
                 item["reader_error"] = "; ".join(extracted["errors"])
+            if len(item.get("description") or "") < 180:
+                continue
             article_id, created = upsert_article(item, db_path=db_path) if db_path else upsert_article(item)
             item["id"] = item.get("id") or article_id
             item["article_id"] = item["id"]

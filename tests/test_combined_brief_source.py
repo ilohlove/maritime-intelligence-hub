@@ -68,13 +68,16 @@ class CombinedBriefSourceTests(unittest.TestCase):
             {
                 "Date": "2026-06-22",
                 "Headline": "Trio of owners emerge behind 13-ship haul",
+                "Vietnamese translation": "Ba chủ tàu hoàn tất thương vụ đội tàu container",
                 "Source": "Splash247",
                 "Source URL": (
                     "[https://splash247.com/trio-of-owners-emerge-behind-13-ship-huangpu-wenchong-boxship-haul/]"
                     "(https://splash247.com/trio-of-owners-emerge-behind-13-ship-huangpu-wenchong-boxship-haul/)"
                 ),
                 "Main summary": "Summary",
+                "Main summary (Vietnamese)": "Tóm tắt thương vụ đội tàu container mới. Hoạt động này ảnh hưởng đến năng lực vận chuyển khu vực.",
                 "Why it matters": "Impact",
+                "Why it matters (Vietnamese)": "Thương vụ có thể thay đổi năng lực vận chuyển và lịch khai thác trong khu vực.",
             },
             1,
         )
@@ -167,7 +170,7 @@ class CombinedBriefSourceTests(unittest.TestCase):
         self.assertEqual(evaluation["reason"], "run_in_progress")
         self.assertFalse(evaluation["ready"])
 
-    def test_protocol_v1_previous_completed_run_is_still_waiting(self):
+    def test_iso_previous_completed_run_is_still_waiting(self):
         snapshot = parse_sheet_snapshot(
             _protocol_csv(
                 started_at="2026-07-31T19:15:00+07:00",
@@ -182,9 +185,9 @@ class CombinedBriefSourceTests(unittest.TestCase):
         evaluation = evaluate_sheet_snapshot(snapshot, "2026-08-01:morning")
 
         self.assertEqual(evaluation["state"], "waiting")
-        self.assertEqual(evaluation["reason"], "run_id_mismatch")
+        self.assertEqual(evaluation["reason"], "l1_slot_mismatch")
 
-    def test_protocol_v1_rejects_row_count_or_unusable_row_mismatch(self):
+    def test_diagnostic_row_count_mismatch_does_not_block_valid_sheet(self):
         snapshot = parse_sheet_snapshot(
             _protocol_csv(
                 started_at="2026-08-01T07:15:00+07:00",
@@ -198,8 +201,50 @@ class CombinedBriefSourceTests(unittest.TestCase):
 
         evaluation = evaluate_sheet_snapshot(snapshot, "2026-08-01:morning")
 
-        self.assertEqual(evaluation["state"], "invalid")
-        self.assertTrue(any("snapshot contains 1 data rows" in error for error in evaluation["errors"]))
+        self.assertEqual(evaluation["state"], "ready")
+        self.assertTrue(any("P1 row_count" in value for value in evaluation["diagnostics"]))
+
+    def test_hhmm_markers_accept_empty_diagnostics_columns(self):
+        snapshot = parse_sheet_snapshot(
+            _protocol_csv(
+                started_at="07:15",
+                completed_at="07:22",
+                run_id="",
+                status="",
+                row_count="",
+                rows=[_sheet_data_row("Current report", "https://example.com/current")],
+            )
+        )
+
+        evaluation = evaluate_sheet_snapshot(snapshot, "2026-08-03:morning")
+
+        self.assertEqual(snapshot["marker_mode"], "legacy_time")
+        self.assertEqual(evaluation["state"], "ready")
+        self.assertTrue(any("N1 is empty" in value for value in evaluation["diagnostics"]))
+
+    def test_content_hash_ignores_lm_but_snapshot_hash_includes_them(self):
+        row = _sheet_data_row("Current report", "https://example.com/current")
+        first = parse_sheet_snapshot(
+            _protocol_csv(
+                started_at="07:15",
+                completed_at="07:22",
+                run_id="",
+                status="",
+                rows=[row],
+            )
+        )
+        second = parse_sheet_snapshot(
+            _protocol_csv(
+                started_at="07:15",
+                completed_at="07:23",
+                run_id="",
+                status="",
+                rows=[row],
+            )
+        )
+
+        self.assertEqual(first["content_hash"], second["content_hash"])
+        self.assertNotEqual(first["snapshot_hash"], second["snapshot_hash"])
 
     def test_protocol_v1_rejects_malformed_source_url(self):
         snapshot = parse_sheet_snapshot(
@@ -217,9 +262,9 @@ class CombinedBriefSourceTests(unittest.TestCase):
 
         self.assertEqual(snapshot["usable_row_count"], 0)
         self.assertEqual(evaluation["state"], "invalid")
-        self.assertTrue(any("only 0 rows are usable" in error for error in evaluation["errors"]))
+        self.assertTrue(any("Only 0 of 1 Sheet rows" in error for error in evaluation["errors"]))
 
-    def test_protocol_v1_failed_snapshot_is_terminal(self):
+    def test_nq_failed_status_is_diagnostic_when_m1_is_empty(self):
         snapshot = parse_sheet_snapshot(
             _protocol_csv(
                 started_at="2026-08-01T07:15:00+07:00",
@@ -231,9 +276,10 @@ class CombinedBriefSourceTests(unittest.TestCase):
 
         evaluation = evaluate_sheet_snapshot(snapshot, "2026-08-01:morning")
 
-        self.assertEqual(evaluation["state"], "failed")
-        self.assertEqual(evaluation["reason"], "AGENT_TIMEOUT")
-        self.assertTrue(evaluation["terminal"])
+        self.assertEqual(evaluation["state"], "waiting")
+        self.assertEqual(evaluation["reason"], "run_in_progress")
+        self.assertFalse(evaluation["terminal"])
+        self.assertTrue(any("O1 is FAILED" in value for value in evaluation["diagnostics"]))
 
     def test_protocol_v1_rejects_naive_timestamp_and_wrong_slot(self):
         naive = parse_sheet_snapshot(
@@ -256,8 +302,8 @@ class CombinedBriefSourceTests(unittest.TestCase):
 
         self.assertEqual(naive_result["state"], "invalid")
         self.assertTrue(any("timezone" in error for error in naive_result["errors"]))
-        self.assertEqual(wrong_slot_result["state"], "invalid")
-        self.assertTrue(any("slot" in error for error in wrong_slot_result["errors"]))
+        self.assertEqual(wrong_slot_result["state"], "waiting")
+        self.assertEqual(wrong_slot_result["reason"], "l1_slot_mismatch")
 
     def test_generate_cards_limit_none_uses_all_items(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -463,7 +509,7 @@ class CombinedBriefSourceTests(unittest.TestCase):
         self.assertEqual(result.stats["backup_status"], "failed")
         self.assertEqual(result.stats["source_mode"], "sheet")
 
-    def test_completed_empty_primary_does_not_start_backup(self):
+    def test_completed_empty_primary_is_invalid_and_does_not_mix_backup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             snapshot = parse_sheet_snapshot(
@@ -488,7 +534,7 @@ class CombinedBriefSourceTests(unittest.TestCase):
 
         backup.assert_not_called()
         self.assertEqual(result.payload["items"], [])
-        self.assertEqual(result.stats["sheet_source"]["evaluation"]["state"], "ready")
+        self.assertEqual(result.stats["sheet_source"]["evaluation"]["state"], "invalid")
 
     def test_build_reuses_supplied_snapshot_without_second_get(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -623,13 +669,13 @@ def _sheet_data_row(title, url, date="2026-08-01"):
         "Section": "Global",
         "Topic": "Shipping",
         "Headline": title,
-        "Vietnamese translation": title,
+        "Vietnamese translation": f"Bản tin hàng hải mới về {title}",
         "Source": "Sheet Source",
         "Source URL": url,
         "Main summary": "Summary",
-        "Main summary (Vietnamese)": "Summary",
+        "Main summary (Vietnamese)": "Bản tin cung cấp thông tin hàng hải mới và yêu cầu doanh nghiệp theo dõi kế hoạch khai thác.",
         "Why it matters": "Impact",
-        "Why it matters (Vietnamese)": "Impact",
+        "Why it matters (Vietnamese)": "Thông tin này ảnh hưởng trực tiếp đến lịch tàu và chi phí vận tải biển.",
     }
 
 

@@ -86,7 +86,7 @@ def generate_image_cards(
                 "importance_score": item.get("importance_score"),
                 "hotness_score": item.get("hotness_score"),
                 "editorial_score": item.get("editorial_score"),
-                "quality_status": item.get("quality_status") or "accepted",
+                "quality_status": item.get("quality_status") or "unvalidated",
                 "source_name": item.get("source_name"),
                 "original_url": item.get("original_url"),
                 "published_at": item.get("published_at"),
@@ -307,7 +307,6 @@ def render_card_html(payload, item, index, image, style_settings=None):
     title_markup = f"<h1>{_escape(title)}</h1>" if style["show_title"] else ""
     summary_markup = f'<div class="summary">{_escape(summary)}</div>' if style["show_summary"] else ""
     impact_markup = (
-        f'<div class="impact-label">Tại sao quan trọng</div>'
         f'<div class="impact">{_escape(impact_note)}</div>'
         if style["show_impact"]
         else ""
@@ -406,14 +405,6 @@ h1 {{
   font-size: var(--summary-size);
   line-height: 1.28;
   color: #263746;
-}}
-.impact-label {{
-  margin-top: 18px;
-  font-size: 22px;
-  font-weight: 800;
-  color: var(--accent-color);
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
 }}
 .impact {{
   border-left: 7px solid var(--accent-color);
@@ -546,8 +537,11 @@ def write_manifest(run_dir, payload, source_path, cards, preview_path):
         "title": payload.get("title"),
         "generated_at": datetime.now().replace(microsecond=0).isoformat(),
         "run_id": payload.get("run_id"),
+        "test_id": payload.get("test_id"),
         "selected_lane": payload.get("selected_lane"),
         "preview_only": bool(payload.get("preview_only")),
+        "execution_mode": payload.get("execution_mode"),
+        "trigger": payload.get("trigger"),
         "source_brief_json": str(Path(source_path)),
         "preview_path": str(Path(preview_path)),
         "cards": cards,

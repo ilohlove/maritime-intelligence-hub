@@ -1,4 +1,5 @@
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -150,6 +151,10 @@ class VisualBriefRendererTests(unittest.TestCase):
 
             self.assertTrue(output_path.exists())
             self.assertGreater(output_path.stat().st_size, 0)
+            with output_path.open("rb") as rendered:
+                header = rendered.read(24)
+            self.assertEqual(header[:8], b"\x89PNG\r\n\x1a\n")
+            self.assertEqual(struct.unpack(">II", header[16:24]), (1080, 1350))
 
     def test_card_html_keeps_long_text_and_avoids_text_clipping(self):
         payload = _brief_payload()

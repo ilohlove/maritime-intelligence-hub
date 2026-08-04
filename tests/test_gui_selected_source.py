@@ -833,8 +833,31 @@ class GuiSelectedSourceTests(unittest.TestCase):
         result = AppGUI._task_generate_and_send_combined_cards(app)
 
         self.assertEqual(result, ("coordinated", True))
-        app._task_run_scheduled_brief.assert_called_once_with("morning")
+        app._task_run_scheduled_brief.assert_called_once_with("morning", trigger="gui_manual")
         app._refresh_app_source_if_selected.assert_not_called()
+
+    def test_program_news_test_ignores_schedule_and_forces_preview(self):
+        app = _gui_stub()
+        app.card_limit_var = _Var("12")
+        app.card_limit_max_var = _Var(False)
+        app._optional_limit = lambda variable, maximum: int(variable.get()) if not maximum.get() else None
+        app._exclude_vietnam_sources = Mock(return_value=False)
+        app._visual_settings = Mock(return_value={"source_mode": "sheet"})
+        app._save_settings = Mock()
+        app._run_background = Mock()
+        result = {
+            "status": "SUCCEEDED",
+            "test_id": "test-1",
+            "brief_path": "preview.json",
+            "source_stats": {"source_mode": "sheet", "selected_total": 1},
+            "cards_result": {"items": 1, "output_dir": "visual", "manifest_path": "manifest", "preview_path": "preview"},
+        }
+        with patch("app.gui.run_program_news_test", return_value=result) as run_test:
+            output, ok = AppGUI._task_run_program_news_test(app)
+
+        self.assertTrue(ok)
+        self.assertIn("test-1", output)
+        run_test.assert_called_once()
 
     def test_scheduled_resume_publishing_does_not_rebuild_brief(self):
         app = _gui_stub()
@@ -871,6 +894,40 @@ class GuiSelectedSourceTests(unittest.TestCase):
         self.assertTrue(ok)
         app._resume_orchestrated_cards_result.assert_called_once_with(decision, "morning")
         app._generate_orchestrated_cards_result.assert_not_called()
+
+    def test_scheduled_normal_render_passes_trigger_to_generator(self):
+        app = _gui_stub()
+        app.settings = {"orchestration": {}}
+        app.sheet_url_var = _Var("sheet")
+        app._schedule_now = Mock(return_value=datetime(2026, 8, 1, 8, 0))
+        app._schedule_times = Mock(return_value=["07:15", "19:15"])
+        app.active_news_run = None
+        app._generate_orchestrated_cards_result = Mock(return_value=_selected_result())
+        app._run_selected_completion_actions = Mock(return_value=([], True))
+        decision = {
+            "run_id": "2026-08-01:morning",
+            "owner": "worker-a",
+            "lane": "primary",
+            "state": "PRIMARY_SELECTED",
+            "action": "selected",
+            "reason": "completed",
+        }
+
+        with patch("app.gui.select_scheduled_lane", return_value=decision):
+            with patch("app.gui.maintain_news_run_lease", return_value=nullcontext()):
+                with patch("app.gui.update_scheduled_run"):
+                    _output, ok = AppGUI._task_run_scheduled_brief(
+                        app,
+                        "morning",
+                        trigger="gui_auto",
+                    )
+
+        self.assertTrue(ok)
+        app._generate_orchestrated_cards_result.assert_called_once_with(
+            decision,
+            "morning",
+            trigger="gui_auto",
+        )
 
     def test_reconciled_failed_run_is_healthy_in_gui(self):
         app = _gui_stub()

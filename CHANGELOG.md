@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v1.1.6 - 2026-08-04
+
+- Make Google Sheets the authoritative primary lane with target/grace deadlines, two-read stability verification, immutable lane selection, and no mixed briefs.
+- Accept ISO or `HH:MM` L1/M1 markers, treat N1:Q1 as diagnostics, and block stale replay with separate content and snapshot fingerprints.
+- Preserve all valid Sheet rows in source order, including Vietnamese sources, without item limits, AI rewriting, backup ranking, or semantic dedupe.
+- Improve Vietnamese quality checks for substantive one-sentence summaries and dotted numeric values; add an isolated preview-only news test outside the schedule.
+- Remove the visible impact label while retaining its content block, and fix scheduled GUI trigger propagation plus coordinator status diagnostics.
+
 ## v1.1.5 - 2026-08-02
 
 - Enforce Vietnamese title, summary, and why-important quality gates for primary and backup lanes; production no longer publishes mock AI output.
